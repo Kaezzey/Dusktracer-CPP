@@ -86,15 +86,3 @@ Notes:
 - If backface masking artifacts appear, double-sided masking is automatically enabled when alpha is present.
 
 ---
-
-## Build / Run (Windows, PowerShell)
-- Configure & generate build:
-  - mkdir build; cd build
-  - cmake .. -DCMAKE_BUILD_TYPE=Release
-- Build:
-  - cmake --build . --config Release
-  or
-  - msbuild Dusktracer.sln /p:Configuration=Release
-- Run the editor (from build\Release or appropriate output folder).
-
----
