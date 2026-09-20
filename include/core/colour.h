@@ -9,15 +9,11 @@
 // Alias
 using colour = vec3;
 
-// Gamma correction helper (gamma 2.0)
+// Linear-light to sRGB display encoding (legacy function name retained).
 inline double linear_to_gamma(double linear_component) {
-    // Guard against NaNs/Infs and negative values. Clamp extremely large
-    // values to avoid producing huge gammas that overflow later stages.
-    if (!std::isfinite(linear_component) || linear_component <= 0.0) return 0.0;
-    const double MAX_LINEAR = 1e6; // allow HDR but bound it
-    double v = linear_component;
-    if (v > MAX_LINEAR) v = MAX_LINEAR;
-    return std::sqrt(v);
+    if (!std::isfinite(linear_component) || linear_component <= 0) return 0;
+    return linear_component <= .0031308 ? 12.92*linear_component
+        : 1.055*std::pow(linear_component,1/2.4)-.055;
 }
 
 // Simple clamp to [0.0, 0.999]

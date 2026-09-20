@@ -192,7 +192,8 @@ public:
         // Interpolate normal (smooth)
         vec3 interpN = w * n0 + u * n1 + v * n2;
         interpN = unit_vector(interpN);
-        rec.set_face_normal(r, interpN);
+        rec.set_face_normal(r, safe_unit_vector(cross(edge1,edge2)));
+        rec.set_shading_normal(interpN);
 
         // Alpha Mask: previously we sometimes discarded hits here to
         // implement stochastic transparency. For visibility/shadow rays we
@@ -205,38 +206,7 @@ public:
         vec3 interpT = w * t0 + u * t1 + v * t2;
         vec3 interpB = w * b0 + u * b1 + v * b2;
 
-        // Gram–Schmidt once per hit to keep T orthogonal to N
-        vec3 T = interpT;
-        if (!T.near_zero()) {
-            T = T - dot(T, rec.normal) * rec.normal;
-            T = unit_vector(T);
-        } else {
-            // Fallback if degenerate
-            vec3 up = (std::fabs(rec.normal.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-            T = unit_vector(cross(up, rec.normal));
-        }
-
-        vec3 B = interpB;
-        if (!B.near_zero()) {
-            B = B - dot(B, rec.normal) * rec.normal;
-            B = unit_vector(B);
-        } else {
-            B = cross(rec.normal, T);
-        }
-
-        // Final safety: if B ended up degenerate, rebuild it from N and T
-        if (B.near_zero()) {
-            B = cross(rec.normal, T);
-            if (B.near_zero()) {
-                // absolute worst case fallback
-                vec3 up = (std::fabs(rec.normal.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-                T = unit_vector(cross(up, rec.normal));
-                B = cross(rec.normal, T);
-            }
-        }
-
-        rec.tangent   = T;
-        rec.bitangent = B;
+        rec.set_tangent_frame(interpT,interpB);
         rec.mat       = mat;
 
         return true;

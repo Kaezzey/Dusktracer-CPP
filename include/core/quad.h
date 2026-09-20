@@ -73,6 +73,15 @@ class quad : public hittable {
         return true;
     }
 
+    bool sample_surface(double a, double b, double, hit_record& rec, double& pdf) const override {
+        rec.p = Q+a*u+b*v; rec.u = a; rec.v = b; rec.mat = mat;
+        rec.normal = rec.geometric_normal = normal; rec.front_face = true;
+        rec.set_tangent_frame(u,v); pdf = surface_pdf(rec); return pdf > 0;
+    }
+    double surface_pdf(const hit_record&) const override {
+        double area = cross(u,v).length(); return area > 0 ? 1/area : 0;
+    }
+
     virtual bool is_interior(double a, double b, hit_record& rec) const {
         interval unit_interval = interval(0, 1);
         // Given the hit point in plane coordinates, return false if it is outside the

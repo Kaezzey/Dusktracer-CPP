@@ -110,6 +110,12 @@ static float g_camera_look_sens  = 0.002f;  // radians per pixel
 static int g_selected_object = -1;
 static int g_selected_material = -1; // Selected material in the asset viewer for editing
 static bool g_materials_dirty = false;
+static std::chrono::steady_clock::time_point g_materials_last_edit;
+static void MarkMaterialsDirty() {
+    g_materials_dirty = true;
+    g_materials_last_edit = std::chrono::steady_clock::now();
+}
+
 static int g_selected_mesh_asset = -1; // Selected mesh asset in the asset viewer for editing
 
 // Files dropped this frame
@@ -124,18 +130,6 @@ static std::unordered_map<std::string, GLuint> g_texture_thumb_cache;
 static int g_thumb_budget_per_frame = 4;
 static int g_thumb_budget_default = 4;
 static int g_thumbs_created_this_frame = 0;
-
-// CPU-side preload cache for textures. Background thread will fill this with
-// decoded RGBA8 pixel data so the main thread can upload to GL without doing
-// slow file IO on the UI thread.
-struct CpuImage {
-    int w = 0, h = 0, comp = 4;
-    std::vector<unsigned char> pixels;
-};
-static std::unordered_map<std::string, CpuImage> g_texture_cpu_cache;
-static std::mutex g_texture_cpu_cache_mutex;
-static std::atomic<bool> g_asset_preloader_running{false};
-static std::thread g_asset_preloader_thread;
 
 static ImFont* TryLoadFont(ImGuiIO& io, const std::initializer_list<const char*>& candidates, float size, const ImFontConfig* cfg = nullptr)
 {
@@ -302,209 +296,7 @@ static void DrawInfoChip(const char* label)
     ImGui::Dummy(ImVec2(end.x - start.x, end.y - start.y));
 }
 
-static GLuint CreateTextureThumbnail(const std::string& path)
-{
-    int w = 0, h = 0, comp = 0;
-    stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
-    if (!pixels || w <= 0 || h <= 0) {
-        if (pixels) stbi_image_free(pixels);
-        return 0;
-    }
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    stbi_image_free(pixels);
-
-    g_texture_thumb_cache[path] = tex;
-    return tex;
-}
-
-static GLuint GetOrCreateTextureThumbnail(const std::string& path)
-{
-    // If GL texture already exists, return it
-    auto it = g_texture_thumb_cache.find(path);
-    if (it != g_texture_thumb_cache.end()) return it->second;
-
-    // If we have preloaded CPU pixels, upload them (respecting per-frame budget)
-    {
-        std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
-        auto it2 = g_texture_cpu_cache.find(path);
-        if (it2 != g_texture_cpu_cache.end()) {
-            if (g_thumbs_created_this_frame >= g_thumb_budget_per_frame) return 0;
-            // create GL texture from CPU pixels
-            CpuImage img = std::move(it2->second);
-            g_texture_cpu_cache.erase(it2);
-            GLuint tex = 0;
-            glGenTextures(1, &tex);
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.w, img.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.pixels.data());
-            glBindTexture(GL_TEXTURE_2D, 0);
-            g_texture_thumb_cache[path] = tex;
-            ++g_thumbs_created_this_frame;
-            return tex;
-        }
-    }
-
-    // Fallback: load synchronously (rare path). Respect budget as well.
-    if (g_thumbs_created_this_frame >= g_thumb_budget_per_frame) return 0;
-    GLuint tex = CreateTextureThumbnail(path);
-    if (tex) ++g_thumbs_created_this_frame;
-    return tex;
-}
-
-// Background thread: preload texture files into CPU memory (RGBA8)
-static void AssetPreloaderThreadMain()
-{
-    g_asset_preloader_running.store(true);
-    // iterate over scene textures once
-    for (const auto& t : g_scene.textures) {
-        const std::string& path = t.path;
-        {
-            std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
-            if (g_texture_thumb_cache.find(path) != g_texture_thumb_cache.end()) continue; // already uploaded
-            if (g_texture_cpu_cache.find(path) != g_texture_cpu_cache.end()) continue; // already preloaded
-        }
-
-        int w=0,h=0,comp=0;
-        stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
-        if (!pixels || w <= 0 || h <= 0) {
-            if (pixels) stbi_image_free(pixels);
-            continue;
-        }
-        CpuImage img;
-        img.w = w; img.h = h; img.comp = 4;
-        img.pixels.assign(pixels, pixels + (size_t)w * (size_t)h * 4);
-        stbi_image_free(pixels);
-
-        {
-            std::lock_guard<std::mutex> lk(g_texture_cpu_cache_mutex);
-            g_texture_cpu_cache[path] = std::move(img);
-        }
-
-        // small sleep to avoid saturating disk on very large lists
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
-    }
-
-    g_asset_preloader_running.store(false);
-}
-
-// Model thumbnail cache: mesh_index -> GL texture
-
-// Material thumbnail cache and rendering infrastructure
-static std::unordered_map<int, GLuint> g_material_thumb_cache;
-static GLuint g_material_preview_fbo = 0;
-static GLuint g_material_preview_tex = 0;
-static GLuint g_material_preview_depth = 0;
-static constexpr int MATERIAL_THUMB_SIZE = 128;
-
-// Simple sphere mesh for material preview (generated once)
-struct SphereMeshGL {
-    GLuint vao = 0, vbo = 0, ibo = 0;
-    int num_indices = 0;
-    bool initialized = false;
-};
-static SphereMeshGL g_preview_sphere;
-
-static void InitMaterialPreviewSphere() {
-    if (g_preview_sphere.initialized) return;
-
-    // Generate a UV sphere with 32 segments and 16 rings
-    const int segments = 32, rings = 16;
-    std::vector<float> vertices; // x,y,z,nx,ny,nz,u,v
-    std::vector<unsigned int> indices;
-
-    for (int r = 0; r <= rings; ++r) {
-        float v = (float)r / rings;
-        float phi = v * 3.14159265f;
-        for (int s = 0; s <= segments; ++s) {
-            float u = (float)s / segments;
-            float theta = u * 2.0f * 3.14159265f;
-            float x = std::sin(phi) * std::cos(theta);
-            float y = std::cos(phi);
-            float z = std::sin(phi) * std::sin(theta);
-            vertices.push_back(x); vertices.push_back(y); vertices.push_back(z);
-            vertices.push_back(x); vertices.push_back(y); vertices.push_back(z); // normal
-            vertices.push_back(u); vertices.push_back(v);
-        }
-    }
-
-    for (int r = 0; r < rings; ++r) {
-        for (int s = 0; s < segments; ++s) {
-            unsigned int i0 = r * (segments + 1) + s;
-            unsigned int i1 = i0 + 1;
-            unsigned int i2 = (r + 1) * (segments + 1) + s;
-            unsigned int i3 = i2 + 1;
-            indices.push_back(i0); indices.push_back(i2); indices.push_back(i1);
-            indices.push_back(i1); indices.push_back(i2); indices.push_back(i3);
-        }
-    }
-
-    glGenVertexArrays(1, &g_preview_sphere.vao);
-    glGenBuffers(1, &g_preview_sphere.vbo);
-    glGenBuffers(1, &g_preview_sphere.ibo);
-
-    glBindVertexArray(g_preview_sphere.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_preview_sphere.vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
-
-    // Position (0)
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    // Normal (1)
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    // UV (2)
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_preview_sphere.ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-
-    glBindVertexArray(0);
-
-    g_preview_sphere.num_indices = (int)indices.size();
-    g_preview_sphere.initialized = true;
-}
-
-static void InitMaterialPreviewFBO() {
-    if (g_material_preview_fbo) return;
-
-    glGenFramebuffers(1, &g_material_preview_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_material_preview_fbo);
-
-    glGenTextures(1, &g_material_preview_tex);
-    glBindTexture(GL_TEXTURE_2D, g_material_preview_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_material_preview_tex, 0);
-
-    glGenRenderbuffers(1, &g_material_preview_depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, g_material_preview_depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_material_preview_depth);
-
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        std::printf("Material preview FBO incomplete: %d\n", status);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
+#include "editor_previews.inl"
 
 // Persist mesh -> default material slot assignments between launches.
 static const char* kMeshMatDefaultsFile = "mesh_material_defaults.txt";
@@ -555,91 +347,6 @@ static void LoadMeshMaterialDefaults()
             break;
         }
     }
-}
-
-static GLuint GetOrCreateMaterialThumbnail(int material_idx) {
-    // Check cache
-    auto it = g_material_thumb_cache.find(material_idx);
-    if (it != g_material_thumb_cache.end()) return it->second;
-
-    if (material_idx < 0 || material_idx >= (int)g_scene.materials.size()) return 0;
-
-    InitMaterialPreviewSphere();
-    InitMaterialPreviewFBO();
-
-    const auto& mat = g_scene.materials[material_idx];
-    colour base = mat.base_color;
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    // If material has an albedo texture, use it for the preview
-    if (mat.albedo_tex >= 0 && mat.albedo_tex < (int)g_scene.textures.size()) {
-        const std::string& tex_path = g_scene.textures[mat.albedo_tex].path;
-        int w = 0, h = 0, comp = 0;
-        stbi_uc* pixels = stbi_load(tex_path.c_str(), &w, &h, &comp, 4);
-        if (pixels && w > 0 && h > 0) {
-            // Resize to thumbnail size if needed
-            std::vector<unsigned char> resized_pixels;
-            if (w != MATERIAL_THUMB_SIZE || h != MATERIAL_THUMB_SIZE) {
-                resized_pixels.resize(MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE * 4);
-                // Simple nearest-neighbor resize
-                for (int y = 0; y < MATERIAL_THUMB_SIZE; ++y) {
-                    for (int x = 0; x < MATERIAL_THUMB_SIZE; ++x) {
-                        int src_x = (x * w) / MATERIAL_THUMB_SIZE;
-                        int src_y = (y * h) / MATERIAL_THUMB_SIZE;
-                        int src_idx = (src_y * w + src_x) * 4;
-                        int dst_idx = (y * MATERIAL_THUMB_SIZE + x) * 4;
-                        resized_pixels[dst_idx+0] = pixels[src_idx+0];
-                        resized_pixels[dst_idx+1] = pixels[src_idx+1];
-                        resized_pixels[dst_idx+2] = pixels[src_idx+2];
-                        resized_pixels[dst_idx+3] = pixels[src_idx+3];
-                    }
-                }
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, resized_pixels.data());
-            } else {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-            }
-            stbi_image_free(pixels);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            g_material_thumb_cache[material_idx] = tex;
-            return tex;
-        }
-        if (pixels) stbi_image_free(pixels);
-        // Fall through to solid color if texture failed to load
-    }
-
-    // Fall back to solid color preview based on base_color
-    std::vector<unsigned char> pixels(MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE * 4);
-    unsigned char r = (unsigned char)(std::min(1.0, base.x()) * 255.0);
-    unsigned char g = (unsigned char)(std::min(1.0, base.y()) * 255.0);
-    unsigned char b = (unsigned char)(std::min(1.0, base.z()) * 255.0);
-    for (int i = 0; i < MATERIAL_THUMB_SIZE * MATERIAL_THUMB_SIZE; ++i) {
-        pixels[i*4+0] = r;
-        pixels[i*4+1] = g;
-        pixels[i*4+2] = b;
-        pixels[i*4+3] = 255;
-    }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MATERIAL_THUMB_SIZE, MATERIAL_THUMB_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    g_material_thumb_cache[material_idx] = tex;
-    return tex;
-}
-
-// Invalidate (delete) a cached material thumbnail so it will be regenerated
-static void InvalidateMaterialThumbnail(int material_idx)
-{
-    auto it = g_material_thumb_cache.find(material_idx);
-    if (it == g_material_thumb_cache.end()) return;
-    GLuint tex = it->second;
-    if (tex) glDeleteTextures(1, &tex);
-    g_material_thumb_cache.erase(it);
 }
 
 // Update camera's MNEE sphere parameters by scanning the current scene for
@@ -1052,6 +759,7 @@ static void export_scene_as_cpp(const scene& scn, const std::string& path)
         out << "scn.materials.back().metallic = " << m.metallic << ";\n";
         out << "scn.materials.back().roughness = " << m.roughness << ";\n";
         out << "scn.materials.back().ior = " << m.ior << ";\n";
+        if (!m.graph.nodes.empty()) out << "deserialize_material_graph(\"" << serialize_material_graph(m.graph) << "\", scn.materials.back().graph);\n";
         out << "scn.materials.back().emission = vec3(" << m.emission.x() << ", " << m.emission.y() << ", " << m.emission.z() << ");\n";
         out << "\n";
     }
@@ -2206,7 +1914,15 @@ static void SaveMaterialsManifest()
         out << m.emission_intensity << "|";
         out << m.dielectric_F0.x() << "," << m.dielectric_F0.y() << "," << m.dielectric_F0.z() << "|";
         out << m.normal_strength << "|";
-        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "|" << (m.unreal_pbr?1:0) << "\n";
+        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "|" << (m.unreal_pbr?1:0) << "|" << serialize_material_graph(m.graph) << "\n";
+    }
+}
+
+// Batch persistence after editing settles; shutdown still flushes pending edits.
+static void TickMaterialPersistence() {
+    if (g_materials_dirty && !ImGui::IsAnyItemActive()
+        && std::chrono::steady_clock::now()-g_materials_last_edit >= std::chrono::milliseconds(350)) {
+        SaveMaterialsManifest(); g_materials_dirty = false;
     }
 }
 
@@ -2215,6 +1931,7 @@ static void LoadMaterialsManifest()
     const char* fname = "materials.txt";
     std::ifstream in(fname);
     if (!in) return;
+    std::vector<scene_material> loaded;
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
@@ -2223,6 +1940,7 @@ static void LoadMaterialsManifest()
         std::string tok;
         while (std::getline(ss, tok, '|')) toks.push_back(tok);
         if (toks.size() < 3) continue;
+        try {
         scene_material m;
         m.name = toks[0];
         try {
@@ -2231,7 +1949,7 @@ static void LoadMaterialsManifest()
         } catch(...) { m.model = scene_material_model::pbr; }
         // base color
         try {
-            std::stringstream sb(toks[2]); double r,g,b; char c;
+            std::stringstream sb(toks[2]); double r = 0.8, g = 0.8, b = 0.8; char c;
             sb >> r >> c >> g >> c >> b; m.base_color = vec3(r,g,b);
         } catch(...) {}
         size_t idx = 3;
@@ -2240,7 +1958,7 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) m.fuzz = std::stod(toks[idx++]);
         if (idx < toks.size()) m.ior = std::stod(toks[idx++]);
         if (idx < toks.size()) {
-            try { std::stringstream se(toks[idx++]); double er,eg,eb; char c; se >> er >> c >> eg >> c >> eb; m.emission = vec3(er,eg,eb); } catch(...) {}
+            try { std::stringstream se(toks[idx++]); double er = 0, eg = 0, eb = 0; char c; se >> er >> c >> eg >> c >> eb; m.emission = vec3(er,eg,eb); } catch(...) {}
         }
         if (idx < toks.size()) m.use_sss = (std::stoi(toks[idx++]) != 0);
         if (idx < toks.size()) m.sss_strength = std::stod(toks[idx++]);
@@ -2251,11 +1969,11 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) m.sss_eta = std::stod(toks[idx++]);
         if (idx < toks.size()) m.sss_color_override_enabled = (std::stoi(toks[idx++]) != 0);
         if (idx < toks.size()) {
-            try { std::stringstream sc(toks[idx++]); double cr,cg,cb; char c; sc >> cr >> c >> cg >> c >> cb; m.sss_color_override_color = vec3(cr,cg,cb); } catch(...) {}
+            try { std::stringstream sc(toks[idx++]); double cr = 1, cg = 1, cb = 1; char c; sc >> cr >> c >> cg >> c >> cb; m.sss_color_override_color = vec3(cr,cg,cb); } catch(...) {}
         }
         if (idx < toks.size()) m.emission_intensity = std::stod(toks[idx++]);
         if (idx < toks.size()) {
-            try { std::stringstream sf(toks[idx++]); double fr,fg,fb; char c; sf >> fr >> c >> fg >> c >> fb; m.dielectric_F0 = vec3(fr,fg,fb); } catch(...) {}
+            try { std::stringstream sf(toks[idx++]); double fr = 0.04, fg = 0.04, fb = 0.04; char c; sf >> fr >> c >> fg >> c >> fb; m.dielectric_F0 = vec3(fr,fg,fb); } catch(...) {}
         }
         if (idx < toks.size()) m.normal_strength = std::stod(toks[idx++]);
         if (idx < toks.size()) m.albedo_tex = std::stoi(toks[idx++]);
@@ -2267,8 +1985,14 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) m.alpha_cutoff = std::stod(toks[idx++]);
         if (idx < toks.size()) m.unreal_pbr = (std::stoi(toks[idx++]) != 0);
 
-        g_scene.materials.push_back(std::move(m));
+        if (idx < toks.size()) deserialize_material_graph(toks[idx], m.graph);
+        loaded.push_back(std::move(m));
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "Invalid material manifest; keeping the current scene materials.\n");
+            return;
+        }
     }
+    if (!loaded.empty()) { g_scene.materials = std::move(loaded); InvalidateAllMaterialThumbnails(); }
 }
 
 // -----------------------------------------------------------------------------
@@ -2714,6 +2438,7 @@ static void init_engine_once()
         return;
 
     build_default_scene(g_scene);
+    LoadMaterialsManifest();
     // Load persisted mesh default material assignments (if present)
     LoadMeshMaterialDefaults();
     // Load persisted imported assets (textures / meshes)
@@ -2733,9 +2458,10 @@ static void init_engine_once()
     g_camera.background        = colour(0.0, 0.0, 0.0);
     to_shirley_camera(g_editor_cam, g_camera);
 
-    // MNEE (specular caustics) will be auto-enabled when sun is present
+    // Keep approximate caustics opt-in; the default path uses BSDF/NEE transport.
     g_camera.enable_mnee = false;
-    g_camera.enable_mis = false;  // Disable MIS / NEE (removed)
+    g_camera.enable_mis = true;
+    g_camera.direct_light_samples = 1;
     UpdateMNEEFromScene();
 
     // Add a default sun to the scene and mirror into the preview camera (nice default lighting)
@@ -2748,9 +2474,8 @@ static void init_engine_once()
         sun.angular_radius_deg = 0.53; // approximate sun
         g_scene.lights.push_back(sun);
 
-        // Mirror into camera preview defaults and enable MNEE for sun caustics
+        // Mirror into camera preview defaults.
         g_camera.use_sun = true;
-        g_camera.enable_mnee = true;
         g_camera.sun_dir = -sun.direction; // camera expects scene->sun
         g_camera.sun_radiance = colour(sun.radiance.x(), sun.radiance.y(), sun.radiance.z());
         g_camera.sun_angular_radius = sun.angular_radius_deg;
@@ -2762,16 +2487,6 @@ static void init_engine_once()
     BuildRasterShader();
     BuildPickShader();
     BuildLineShader();
-
-    // Start asset preloader (background CPU-side image decode)
-    if (!g_asset_preloader_running.load()) {
-        try {
-            g_asset_preloader_thread = std::thread(AssetPreloaderThreadMain);
-            g_asset_preloader_thread.detach();
-        } catch (...) {
-            // non-fatal if thread can't be started
-        }
-    }
 
     // Create gizmo VAO/VBO (6 verts: 3 axes, each a line of 2 verts)
     // Vertex format: pos.xyz, color.xyz
@@ -2895,11 +2610,9 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
     // Mirror scene lights into the RT camera for preview rendering.
     g_camera.point_lights.clear();
     g_camera.use_sun = false;
-    g_camera.enable_mnee = false;  // Disable MNEE, re-enable if sun or point light present
     for (const auto& L : g_scene.lights) {
         if (L.type == scene_light_type::directional) {
             g_camera.use_sun = true;
-            g_camera.enable_mnee = true;  // Auto-enable MNEE when sun is present
             // In UI 'Add Sun' we set sun_dir = -sl.direction, so mirror that here.
             g_camera.sun_dir = -L.direction;
             g_camera.sun_radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
@@ -2910,9 +2623,7 @@ static void sync_camera_from_editor(float viewport_width, float viewport_height)
             pl.radiance = colour((float)L.radiance.x(), (float)L.radiance.y(), (float)L.radiance.z());
             pl.range = L.range;
             g_camera.point_lights.push_back(pl);
-            // Auto-enable MNEE when point lights are present (MNEE works for point lights too)
-            g_camera.enable_mnee = true;
-        }
+            }
     }
 }
 
@@ -3239,7 +2950,7 @@ static void stop_progress_window_thread()
 static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index, bool include_texture_bindings = true)
 {
     // Snapshot original material so we can detect changes and invalidate thumbnails
-    scene_material orig = mat;
+    scene_material_parameters orig = mat;
     // editable material name buffer (persist across frames keyed by material index)
     static std::unordered_map<int, std::string> s_mat_name_bufs;
     auto& name_buf = s_mat_name_bufs[mat_index];
@@ -3319,6 +3030,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
     }
 
     DrawSectionLabel("Material Parameters");
+    if (!mat.graph.nodes.empty()) ImGui::TextWrapped("Connected graph inputs override the values below. Unconnected inputs use these defaults.");
 
     {
         float base[3] = {
@@ -3383,7 +3095,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 
     case scene_material_model::pbr:
     {
-        ImGui::TextDisabled("PBR GGX (your custom shader).");
+        ImGui::TextDisabled("PBR / GGX surface");
 
         float metallic_f  = (float)mat.metallic;
         float roughness_f = (float)mat.roughness;
@@ -3488,7 +3200,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         }
 
         ImGui::Separator();
-        if (include_texture_bindings) {
+        if (include_texture_bindings && mat.graph.nodes.empty()) {
             ImGui::Text("PBR Texture Maps (drag from Textures window)");
 
             auto draw_tex_slot = [&](const char* label, int& tex_index)
@@ -3532,14 +3244,16 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             draw_tex_slot("Normal",    mat.normal_tex);
             draw_tex_slot("Opacity Mask (optional)", mat.alpha_tex);
             ImGui::TextDisabled("If Opacity Mask is empty, the albedo's alpha channel will be used.");
-            ImGui::TextDisabled("build_world_from_scene must hook these into pbr_material.");
+
         } else {
             ImGui::TextDisabled("Texture inputs are edited in the Material Graph.");
         }
 
-        // Unreal-style packed PBR textures (G=roughness, B=metallic)
-        if (ImGui::Checkbox("Unreal PBR (G=roughness, B=metallic)", &mat.unreal_pbr)) {
-            g_world_dirty = true;
+        // Graphs express packed maps explicitly through their channel outputs.
+        if (mat.graph.nodes.empty()) {
+            if (ImGui::Checkbox("Unreal PBR (G=roughness, B=metallic)", &mat.unreal_pbr)) g_world_dirty = true;
+        } else {
+            ImGui::TextDisabled("Packed maps: connect G to Roughness, B to Metallic.");
         }
     } break;
 
@@ -3579,7 +3293,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 
     if (material_changed) {
         InvalidateMaterialThumbnail(mat_index);
-        g_materials_dirty = true;
+        MarkMaterialsDirty();
         g_world_dirty = true;
     }
 
@@ -3587,674 +3301,15 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
     ImGui::TextDisabled("Edit transform/material/textures, then re-render.");
 }
 
-enum class material_graph_input_slot : int {
-    albedo = 0,
-    metallic,
-    roughness,
-    normal,
-    opacity,
-    count
-};
-
-struct material_graph_editor_state {
-    ImVec2 canvas_pan = ImVec2(0.0f, 0.0f);
-    std::unordered_map<int, ImVec2> texture_node_positions;
-    std::vector<int> visible_texture_nodes;
-    ImVec2 output_node_position = ImVec2(760.0f, 140.0f);
-    int selected_texture_index = -1;
-    bool link_active = false;
-    int link_texture_index = -1;
-    int popup_target_slot = 0;
-    ImVec2 popup_screen_pos = ImVec2(0.0f, 0.0f);
-    ImVec2 popup_spawn_local = ImVec2(140.0f, 120.0f);
-    char texture_picker_search[256] = {};
-};
-
-static constexpr int k_material_graph_input_slot_count =
-    static_cast<int>(material_graph_input_slot::count);
-
-struct material_graph_input_desc {
-    material_graph_input_slot slot;
-    const char* label;
-};
-
-static int& MaterialGraphTextureRef(scene_material& mat, material_graph_input_slot slot)
-{
-    switch (slot) {
-        case material_graph_input_slot::albedo:    return mat.albedo_tex;
-        case material_graph_input_slot::metallic:  return mat.metallic_tex;
-        case material_graph_input_slot::roughness: return mat.roughness_tex;
-        case material_graph_input_slot::normal:    return mat.normal_tex;
-        case material_graph_input_slot::opacity:   return mat.alpha_tex;
-        default:                                   return mat.albedo_tex;
-    }
-}
-
-static const char* MaterialGraphSlotLabel(material_graph_input_slot slot)
-{
-    switch (slot) {
-        case material_graph_input_slot::albedo:    return "Base Color";
-        case material_graph_input_slot::metallic:  return "Metallic";
-        case material_graph_input_slot::roughness: return "Roughness";
-        case material_graph_input_slot::normal:    return "Normal";
-        case material_graph_input_slot::opacity:   return "Opacity";
-        default:                                   return "Input";
-    }
-}
-
-static ImU32 MaterialGraphSlotColor(material_graph_input_slot slot)
-{
-    switch (slot) {
-        case material_graph_input_slot::albedo:    return IM_COL32(88, 180, 208, 255);
-        case material_graph_input_slot::metallic:  return IM_COL32(176, 209, 120, 255);
-        case material_graph_input_slot::roughness: return IM_COL32(232, 180, 108, 255);
-        case material_graph_input_slot::normal:    return IM_COL32(140, 170, 255, 255);
-        case material_graph_input_slot::opacity:   return IM_COL32(194, 154, 236, 255);
-        default:                                   return IM_COL32(180, 180, 180, 255);
-    }
-}
-
-static std::vector<material_graph_input_desc> GetMaterialGraphActiveInputs(const scene_material& mat)
-{
-    switch (mat.model) {
-        case scene_material_model::lambert:
-            return { { material_graph_input_slot::albedo, "Base Color" } };
-        case scene_material_model::metal:
-            return { { material_graph_input_slot::albedo, "Reflection Tint" } };
-        case scene_material_model::dielectric:
-            return { { material_graph_input_slot::albedo, "Transmission Tint" } };
-        case scene_material_model::diffuse_light:
-            return { { material_graph_input_slot::albedo, "Emission" } };
-        case scene_material_model::isotropic:
-            return { { material_graph_input_slot::albedo, "Scattering Color" } };
-        case scene_material_model::pbr:
-            return {
-                { material_graph_input_slot::albedo,    "Base Color" },
-                { material_graph_input_slot::metallic,  "Metallic" },
-                { material_graph_input_slot::roughness, "Roughness" },
-                { material_graph_input_slot::normal,    "Normal" },
-                { material_graph_input_slot::opacity,   "Opacity" }
-            };
-        default:
-            return { { material_graph_input_slot::albedo, "Base Color" } };
-    }
-}
-
-static ImVec2 DefaultMaterialGraphTextureNodePos(int texture_index)
-{
-    const int col = texture_index / 6;
-    const int row = texture_index % 6;
-    return ImVec2(40.0f + (float)col * 230.0f, 40.0f + (float)row * 110.0f);
-}
-
-static void DrawMaterialGraphEditor(scene_material& mat, scene& scn, int material_index)
-{
-    static std::unordered_map<int, material_graph_editor_state> s_graph_states;
-    material_graph_editor_state& state = s_graph_states[material_index];
-    const std::vector<material_graph_input_desc> active_inputs = GetMaterialGraphActiveInputs(mat);
-
-    ImGui::TextUnformatted("Material Graph");
-    ImGui::TextDisabled("Right-click the graph to search all textures. Output sockets follow the current shading model, and only this material's connected textures appear as nodes.");
-
-    std::string child_id = std::string("MaterialGraphCanvas##") + std::to_string(material_index);
-    ImGui::BeginChild(child_id.c_str(), ImVec2(0.0f, 0.0f), true,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
-    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
-    if (canvas_size.x < 80.0f || canvas_size.y < 80.0f) {
-        ImGui::TextDisabled("Material graph area is too small.");
-        ImGui::EndChild();
-        return;
-    }
-
-    std::string canvas_id = std::string("##material_graph_canvas_hit_") + std::to_string(material_index);
-    ImGui::InvisibleButton(canvas_id.c_str(), canvas_size, ImGuiButtonFlags_MouseButtonMiddle);
-    const bool canvas_hovered = ImGui::IsItemHovered();
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImVec2 canvas_end(canvas_origin.x + canvas_size.x, canvas_origin.y + canvas_size.y);
-    draw_list->AddRectFilled(canvas_origin, canvas_end, IM_COL32(14, 18, 24, 240), 0.0f);
-    draw_list->AddRect(canvas_origin, canvas_end, IM_COL32(56, 72, 86, 160), 0.0f);
-
-    if (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
-        state.canvas_pan.x += ImGui::GetIO().MouseDelta.x;
-        state.canvas_pan.y += ImGui::GetIO().MouseDelta.y;
-    }
-
-    const float grid_step = 32.0f;
-    float grid_offset_x = std::fmod(state.canvas_pan.x, grid_step);
-    float grid_offset_y = std::fmod(state.canvas_pan.y, grid_step);
-    for (float x = canvas_origin.x + grid_offset_x; x < canvas_end.x; x += grid_step) {
-        draw_list->AddLine(ImVec2(x, canvas_origin.y), ImVec2(x, canvas_end.y), IM_COL32(28, 36, 46, 120));
-    }
-    for (float y = canvas_origin.y + grid_offset_y; y < canvas_end.y; y += grid_step) {
-        draw_list->AddLine(ImVec2(canvas_origin.x, y), ImVec2(canvas_end.x, y), IM_COL32(28, 36, 46, 120));
-    }
-
-    auto to_screen = [&](const ImVec2& local) {
-        return ImVec2(canvas_origin.x + state.canvas_pan.x + local.x,
-                      canvas_origin.y + state.canvas_pan.y + local.y);
-    };
-    auto to_local = [&](const ImVec2& screen) {
-        return ImVec2(screen.x - canvas_origin.x - state.canvas_pan.x,
-                      screen.y - canvas_origin.y - state.canvas_pan.y);
-    };
-
-    auto mark_graph_changed = [&]() {
-        g_world_dirty = true;
-        g_cached_world.reset();
-        g_materials_dirty = true;
-        InvalidateMaterialThumbnail(material_index);
-    };
-
-    auto ensure_texture_node_position = [&](int texture_index, const ImVec2& preferred_local) {
-        if (texture_index < 0 || texture_index >= (int)scn.textures.size()) {
-            return;
-        }
-        auto [it, inserted] = state.texture_node_positions.emplace(texture_index, preferred_local);
-        if (inserted) {
-            it->second = preferred_local;
-        }
-    };
-
-    auto ensure_visible_texture_node = [&](int texture_index) {
-        if (texture_index < 0 || texture_index >= (int)scn.textures.size()) {
-            return;
-        }
-        if (std::find(state.visible_texture_nodes.begin(), state.visible_texture_nodes.end(), texture_index) ==
-            state.visible_texture_nodes.end())
-        {
-            state.visible_texture_nodes.push_back(texture_index);
-        }
-    };
-
-    auto assign_texture_to_slot = [&](material_graph_input_slot slot, int texture_index, const ImVec2* preferred_local = nullptr) {
-        int normalized_index = texture_index;
-        if (normalized_index < 0 || normalized_index >= (int)scn.textures.size()) {
-            normalized_index = -1;
-        }
-        if (normalized_index >= 0 && preferred_local) {
-            ensure_texture_node_position(normalized_index, *preferred_local);
-        }
-        if (normalized_index >= 0) {
-            ensure_visible_texture_node(normalized_index);
-        }
-        int& tex_ref = MaterialGraphTextureRef(mat, slot);
-        if (tex_ref == normalized_index) {
-            return false;
-        }
-        tex_ref = normalized_index;
-        mark_graph_changed();
-        return true;
-    };
-
-    auto remove_texture_node_from_graph = [&](int texture_index) {
-        if (texture_index < 0 || texture_index >= (int)scn.textures.size()) {
-            return false;
-        }
-
-        bool removed_visible_node = false;
-        auto visible_it = std::remove(state.visible_texture_nodes.begin(), state.visible_texture_nodes.end(), texture_index);
-        if (visible_it != state.visible_texture_nodes.end()) {
-            state.visible_texture_nodes.erase(visible_it, state.visible_texture_nodes.end());
-            removed_visible_node = true;
-        }
-
-        state.texture_node_positions.erase(texture_index);
-        if (state.selected_texture_index == texture_index) {
-            state.selected_texture_index = -1;
-        }
-        if (state.link_texture_index == texture_index) {
-            state.link_active = false;
-            state.link_texture_index = -1;
-        }
-
-        bool removed_connections = false;
-        for (int slot_idx = 0; slot_idx < k_material_graph_input_slot_count; ++slot_idx) {
-            material_graph_input_slot slot = static_cast<material_graph_input_slot>(slot_idx);
-            int& tex_ref = MaterialGraphTextureRef(mat, slot);
-            if (tex_ref == texture_index) {
-                tex_ref = -1;
-                removed_connections = true;
-            }
-        }
-
-        if (removed_connections) {
-            mark_graph_changed();
-        }
-
-        return removed_visible_node || removed_connections;
-    };
-
-    auto is_active_slot = [&](material_graph_input_slot slot) {
-        for (const auto& input : active_inputs) {
-            if (input.slot == slot) return true;
-        }
-        return false;
-    };
-
-    if (!active_inputs.empty() &&
-        !is_active_slot(static_cast<material_graph_input_slot>(state.popup_target_slot))) {
-        state.popup_target_slot = static_cast<int>(active_inputs.front().slot);
-    }
-
-    const ImVec2 texture_node_size(210.0f, 82.0f);
-    const float output_node_height =
-        48.0f +
-        std::max(1, (int)active_inputs.size() - 1) * 34.0f +
-        28.0f +
-        28.0f;
-    const ImVec2 output_node_size(320.0f, output_node_height);
-    const float  pin_radius = 7.0f;
-    const float  texture_title_height = 24.0f;
-    const float  output_title_height = 30.0f;
-    const float  output_row_height = 28.0f;
-    const float  output_row_spacing = 34.0f;
-    const float  texture_output_strip_width = 42.0f;
-
-    std::vector<int> visible_texture_indices;
-    visible_texture_indices.reserve(state.visible_texture_nodes.size() + active_inputs.size());
-    for (int tex_idx : state.visible_texture_nodes) {
-        if (tex_idx >= 0 &&
-            tex_idx < (int)scn.textures.size() &&
-            std::find(visible_texture_indices.begin(), visible_texture_indices.end(), tex_idx) == visible_texture_indices.end())
-        {
-            visible_texture_indices.push_back(tex_idx);
-        }
-    }
-    for (const auto& input : active_inputs) {
-        int tex_idx = MaterialGraphTextureRef(mat, input.slot);
-        if (tex_idx >= 0 &&
-            tex_idx < (int)scn.textures.size() &&
-            std::find(visible_texture_indices.begin(), visible_texture_indices.end(), tex_idx) == visible_texture_indices.end())
-        {
-            visible_texture_indices.push_back(tex_idx);
-        }
-        if (tex_idx >= 0 && tex_idx < (int)scn.textures.size()) {
-            ensure_visible_texture_node(tex_idx);
-        }
-    }
-    state.visible_texture_nodes = visible_texture_indices;
-    if (state.selected_texture_index >= 0 &&
-        std::find(visible_texture_indices.begin(), visible_texture_indices.end(), state.selected_texture_index) == visible_texture_indices.end())
-    {
-        state.selected_texture_index = -1;
-    }
-
-    std::vector<ImVec2> output_input_pins(active_inputs.size());
-    for (size_t slot_idx = 0; slot_idx < active_inputs.size(); ++slot_idx) {
-        output_input_pins[slot_idx] = ImVec2(
-            state.output_node_position.x + 12.0f,
-            state.output_node_position.y + 66.0f + (float)slot_idx * output_row_spacing
-        );
-    }
-
-    std::unordered_map<int, ImVec2> texture_output_pins;
-    texture_output_pins.reserve(visible_texture_indices.size());
-    for (int tex_idx : visible_texture_indices) {
-        auto [it, inserted] = state.texture_node_positions.emplace(tex_idx, DefaultMaterialGraphTextureNodePos(tex_idx));
-        if (inserted) {
-            // Keep newly discovered textures in a simple readable grid.
-            it->second = DefaultMaterialGraphTextureNodePos(tex_idx);
-        }
-
-        texture_output_pins[tex_idx] = ImVec2(
-            it->second.x + texture_node_size.x - 10.0f,
-            it->second.y + texture_node_size.y * 0.5f
-        );
-    }
-
-    draw_list->PushClipRect(canvas_origin, canvas_end, true);
-
-    auto draw_link = [&](const ImVec2& src_local, const ImVec2& dst_local, ImU32 color) {
-        ImVec2 p0 = to_screen(src_local);
-        ImVec2 p1 = to_screen(dst_local);
-        ImVec2 c0(p0.x + 80.0f, p0.y);
-        ImVec2 c1(p1.x - 80.0f, p1.y);
-        draw_list->AddBezierCubic(p0, c0, c1, p1, color, 3.0f);
-    };
-
-    for (size_t slot_idx = 0; slot_idx < active_inputs.size(); ++slot_idx) {
-        const material_graph_input_desc& input = active_inputs[slot_idx];
-        int tex_idx = MaterialGraphTextureRef(mat, input.slot);
-        auto it = texture_output_pins.find(tex_idx);
-        if (tex_idx >= 0 && it != texture_output_pins.end()) {
-            draw_link(it->second, output_input_pins[slot_idx], MaterialGraphSlotColor(input.slot));
-        }
-    }
-
-    if (state.link_active && state.link_texture_index >= 0) {
-        auto it = texture_output_pins.find(state.link_texture_index);
-        if (it != texture_output_pins.end()) {
-            ImVec2 p0 = to_screen(it->second);
-            ImVec2 p1 = ImGui::GetIO().MousePos;
-            ImVec2 c0(p0.x + 80.0f, p0.y);
-            ImVec2 c1(p1.x - 80.0f, p1.y);
-            draw_list->AddBezierCubic(p0, c0, c1, p1, IM_COL32(112, 214, 198, 255), 3.0f);
-        }
-    }
-
-    ImVec2 output_screen = to_screen(state.output_node_position);
-    ImGui::SetCursorScreenPos(output_screen);
-    std::string output_drag_id = std::string("##material_graph_output_node_") + std::to_string(material_index);
-    ImGui::InvisibleButton(output_drag_id.c_str(), ImVec2(output_node_size.x, output_title_height));
-    bool output_title_hovered = ImGui::IsItemHovered();
-    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && !state.link_active) {
-        state.output_node_position.x += ImGui::GetIO().MouseDelta.x;
-        state.output_node_position.y += ImGui::GetIO().MouseDelta.y;
-    }
-
-    draw_list->AddRectFilled(output_screen, ImVec2(output_screen.x + output_node_size.x, output_screen.y + output_node_size.y),
-                             IM_COL32(24, 30, 38, 245), 0.0f);
-    draw_list->AddRect(output_screen, ImVec2(output_screen.x + output_node_size.x, output_screen.y + output_node_size.y),
-                       IM_COL32(82, 112, 130, 220), 0.0f, 0, 2.0f);
-    draw_list->AddRectFilled(output_screen, ImVec2(output_screen.x + output_node_size.x, output_screen.y + 30.0f),
-                             IM_COL32(31, 44, 56, 255), 0.0f);
-    draw_list->AddText(ImVec2(output_screen.x + 14.0f, output_screen.y + 8.0f), IM_COL32(230, 236, 242, 255), "Material Output");
-
-    bool link_consumed = false;
-    bool graph_item_hovered = output_title_hovered;
-    bool request_popup = false;
-    material_graph_input_slot popup_slot = active_inputs.empty() ? material_graph_input_slot::albedo : active_inputs.front().slot;
-    ImVec2 popup_screen_pos = ImGui::GetIO().MousePos;
-    ImVec2 popup_spawn_local = to_local(popup_screen_pos);
-
-    auto make_spawn_local = [&](int slot_index, const ImVec2& mouse_screen) {
-        ImVec2 local = to_local(mouse_screen);
-        local.x -= texture_node_size.x * 0.5f;
-        local.y -= texture_node_size.y * 0.5f;
-        float suggested_x = state.output_node_position.x - texture_node_size.x - 140.0f;
-        float suggested_y = state.output_node_position.y + 12.0f + (float)slot_index * (texture_node_size.y + 14.0f);
-        if (local.x > state.output_node_position.x - 60.0f) local.x = suggested_x;
-        if (local.x < -state.canvas_pan.x) local.x = suggested_x;
-        if (local.y < -state.canvas_pan.y) local.y = suggested_y;
-        return local;
-    };
-
-    for (size_t slot_idx = 0; slot_idx < active_inputs.size(); ++slot_idx) {
-        const material_graph_input_desc& input = active_inputs[slot_idx];
-        int& tex_ref = MaterialGraphTextureRef(mat, input.slot);
-        const char* connected_name = "<none>";
-        if (tex_ref >= 0 && tex_ref < (int)scn.textures.size()) {
-            connected_name = scn.textures[tex_ref].name.c_str();
-        }
-
-        ImVec2 pin_local = output_input_pins[slot_idx];
-        ImVec2 pin_screen = to_screen(pin_local);
-        float line_y = output_screen.y + 58.0f + (float)slot_idx * 34.0f;
-        ImVec2 row_min(output_screen.x + 8.0f, output_screen.y + 48.0f + (float)slot_idx * output_row_spacing);
-        ImVec2 row_size(output_node_size.x - 16.0f, output_row_height);
-        ImVec2 preferred_spawn_local = make_spawn_local((int)slot_idx, ImGui::GetIO().MousePos);
-
-        std::string row_id = std::string("##material_graph_input_row_") + std::to_string(material_index) + "_" + std::to_string(slot_idx);
-        ImGui::SetCursorScreenPos(row_min);
-        ImGui::InvisibleButton(row_id.c_str(), row_size);
-        bool row_hovered = ImGui::IsItemHovered();
-        graph_item_hovered = graph_item_hovered || row_hovered;
-        bool row_drag_drop_handled = false;
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("TEXTURE_ASSET_ID")) {
-                int dropped_tex_idx = *(const int*)payload->Data;
-                assign_texture_to_slot(input.slot, dropped_tex_idx, &preferred_spawn_local);
-                row_drag_drop_handled = true;
-            }
-            ImGui::EndDragDropTarget();
-        }
-
-        if (row_hovered || tex_ref >= 0) {
-            ImU32 row_color = tex_ref >= 0 ? IM_COL32(35, 48, 60, 220) : IM_COL32(27, 35, 44, 180);
-            if (row_hovered) row_color = IM_COL32(44, 58, 72, 240);
-            draw_list->AddRectFilled(row_min, ImVec2(row_min.x + row_size.x, row_min.y + row_size.y), row_color, 0.0f);
-        }
-
-        draw_list->AddCircleFilled(pin_screen, pin_radius, tex_ref >= 0 ? MaterialGraphSlotColor(input.slot) : IM_COL32(56, 70, 82, 255));
-        draw_list->AddText(ImVec2(output_screen.x + 28.0f, line_y), IM_COL32(222, 228, 234, 255), input.label);
-        draw_list->AddText(ImVec2(output_screen.x + 164.0f, line_y), IM_COL32(132, 146, 160, 255), connected_name);
-
-        if (row_hovered) {
-            draw_list->AddCircle(pin_screen, pin_radius + 4.0f, MaterialGraphSlotColor(input.slot), 0, 2.0f);
-        }
-        if (!row_drag_drop_handled &&
-            state.link_active &&
-            row_hovered &&
-            ImGui::IsMouseReleased(ImGuiMouseButton_Left))
-        {
-            assign_texture_to_slot(input.slot, state.link_texture_index);
-            state.link_active = false;
-            state.link_texture_index = -1;
-            link_consumed = true;
-        }
-        if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            if (tex_ref >= 0) {
-                assign_texture_to_slot(input.slot, -1);
-            } else {
-                request_popup = true;
-                popup_slot = input.slot;
-                popup_screen_pos = ImGui::GetIO().MousePos;
-                popup_spawn_local = preferred_spawn_local;
-                state.link_active = false;
-                state.link_texture_index = -1;
-            }
-        }
-    }
-
-    if (visible_texture_indices.empty()) {
-        draw_list->AddText(ImVec2(canvas_origin.x + 34.0f, canvas_origin.y + 28.0f),
-                           IM_COL32(145, 156, 168, 255),
-                           "No texture nodes yet. Drag a texture asset from the Content Drawer onto a material input.");
-    }
-
-    for (int tex_idx : visible_texture_indices) {
-        ImVec2& node_local = state.texture_node_positions[tex_idx];
-        ImVec2 node_screen = to_screen(node_local);
-        GLuint thumb = GetOrCreateTextureThumbnail(scn.textures[tex_idx].path);
-        ImVec2 output_strip_min(node_screen.x + texture_node_size.x - texture_output_strip_width, node_screen.y + texture_title_height);
-        ImVec2 output_strip_max(node_screen.x + texture_node_size.x - 8.0f, node_screen.y + texture_node_size.y - 8.0f);
-        bool node_selected = (state.selected_texture_index == tex_idx);
-
-        ImGui::SetCursorScreenPos(node_screen);
-        std::string node_drag_id = std::string("##material_graph_tex_node_") + std::to_string(material_index) + "_" + std::to_string(tex_idx);
-        ImGui::InvisibleButton(node_drag_id.c_str(), ImVec2(texture_node_size.x - texture_output_strip_width - 6.0f, texture_node_size.y));
-        bool node_drag_hovered = ImGui::IsItemHovered();
-        graph_item_hovered = graph_item_hovered || node_drag_hovered;
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-            state.selected_texture_index = tex_idx;
-        }
-        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && !state.link_active) {
-            node_local.x += ImGui::GetIO().MouseDelta.x;
-            node_local.y += ImGui::GetIO().MouseDelta.y;
-        }
-
-        draw_list->AddRectFilled(node_screen, ImVec2(node_screen.x + texture_node_size.x, node_screen.y + texture_node_size.y),
-                                 IM_COL32(26, 32, 41, 245), 0.0f);
-        draw_list->AddRect(node_screen, ImVec2(node_screen.x + texture_node_size.x, node_screen.y + texture_node_size.y),
-                           IM_COL32(72, 98, 116, 220), 0.0f, 0, 2.0f);
-        if (node_selected) {
-            draw_list->AddRect(node_screen, ImVec2(node_screen.x + texture_node_size.x, node_screen.y + texture_node_size.y),
-                               IM_COL32(118, 216, 198, 255), 0.0f, 0, 3.0f);
-        }
-        draw_list->AddRectFilled(node_screen, ImVec2(node_screen.x + texture_node_size.x, node_screen.y + 24.0f),
-                                 IM_COL32(33, 45, 58, 255), 0.0f);
-        draw_list->AddText(ImVec2(node_screen.x + 12.0f, node_screen.y + 5.0f), IM_COL32(230, 236, 242, 255), "Texture");
-
-        ImVec2 thumb_min(node_screen.x + 10.0f, node_screen.y + 30.0f);
-        ImVec2 thumb_max(node_screen.x + 58.0f, node_screen.y + 78.0f);
-        if (thumb != 0) {
-            draw_list->AddImage((ImTextureID)(intptr_t)thumb, thumb_min, thumb_max, ImVec2(0, 1), ImVec2(1, 0));
-        } else {
-            draw_list->AddRectFilled(thumb_min, thumb_max, IM_COL32(36, 44, 54, 255), 0.0f);
-            draw_list->AddText(ImVec2(thumb_min.x + 10.0f, thumb_min.y + 15.0f), IM_COL32(144, 156, 168, 255), "No");
-        }
-
-        draw_list->AddText(ImVec2(node_screen.x + 68.0f, node_screen.y + 36.0f), IM_COL32(222, 228, 234, 255), scn.textures[tex_idx].name.c_str());
-
-        ImVec2 pin_local = texture_output_pins[tex_idx];
-        ImVec2 pin_screen = to_screen(pin_local);
-
-        std::string pin_id = std::string("##material_graph_tex_pin_") + std::to_string(material_index) + "_" + std::to_string(tex_idx);
-        ImGui::SetCursorScreenPos(output_strip_min);
-        ImGui::InvisibleButton(pin_id.c_str(), ImVec2(output_strip_max.x - output_strip_min.x, output_strip_max.y - output_strip_min.y));
-        bool output_hovered = ImGui::IsItemHovered();
-        graph_item_hovered = graph_item_hovered || output_hovered;
-
-        ImU32 strip_color = IM_COL32(28, 44, 52, 220);
-        if (state.link_active && state.link_texture_index == tex_idx) strip_color = IM_COL32(38, 78, 84, 255);
-        else if (output_hovered) strip_color = IM_COL32(34, 67, 72, 255);
-        draw_list->AddRectFilled(output_strip_min, output_strip_max, strip_color, 0.0f);
-
-        draw_list->AddCircleFilled(pin_screen, pin_radius, IM_COL32(112, 214, 198, 255));
-        draw_list->AddCircle(pin_screen, pin_radius + 1.5f, IM_COL32(24, 28, 34, 255), 0, 2.0f);
-        if (output_hovered || (state.link_active && state.link_texture_index == tex_idx)) {
-            draw_list->AddCircle(pin_screen, pin_radius + 4.0f, IM_COL32(112, 214, 198, 255), 0, 2.0f);
-        }
-        if (output_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            state.selected_texture_index = tex_idx;
-            state.link_active = true;
-            state.link_texture_index = tex_idx;
-        }
-    }
-
-    if (state.link_active && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        state.link_active = false;
-        state.link_texture_index = -1;
-    }
-
-    if (state.link_active && !link_consumed && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        state.link_active = false;
-        state.link_texture_index = -1;
-    }
-
-    bool graph_window_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    draw_list->PopClipRect();
-    ImGui::EndChild();
-
-    bool graph_child_hovered = ImGui::IsItemHovered();
-
-    if (graph_child_hovered &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        !graph_item_hovered)
-    {
-        state.selected_texture_index = -1;
-    }
-
-    if (state.selected_texture_index >= 0 &&
-        graph_window_focused &&
-        ImGui::IsKeyPressed(ImGuiKey_Delete) &&
-        !ImGui::IsAnyItemActive())
-    {
-        remove_texture_node_from_graph(state.selected_texture_index);
-    }
-
-    if (!request_popup &&
-        graph_child_hovered &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
-        !graph_item_hovered &&
-        !active_inputs.empty())
-    {
-        request_popup = true;
-        popup_slot = active_inputs.front().slot;
-        popup_screen_pos = ImGui::GetIO().MousePos;
-        popup_spawn_local = make_spawn_local(0, popup_screen_pos);
-        state.link_active = false;
-        state.link_texture_index = -1;
-    }
-
-    std::string popup_id = std::string("MaterialGraphTexturePicker##") + std::to_string(material_index);
-    if (request_popup) {
-        state.popup_target_slot = static_cast<int>(popup_slot);
-        state.popup_screen_pos = popup_screen_pos;
-        state.popup_spawn_local = popup_spawn_local;
-        state.texture_picker_search[0] = '\0';
-        ImGui::OpenPopup(popup_id.c_str());
-    }
-
-    if (!active_inputs.empty() &&
-        !is_active_slot(static_cast<material_graph_input_slot>(state.popup_target_slot))) {
-        state.popup_target_slot = static_cast<int>(active_inputs.front().slot);
-    }
-
-    ImGui::SetNextWindowPos(state.popup_screen_pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 430.0f), ImGuiCond_Appearing);
-    if (ImGui::BeginPopup(popup_id.c_str())) {
-        ImGui::TextUnformatted("Connect Texture");
-        ImGui::TextDisabled("Search any imported texture and assign it to a shader input.");
-
-        ImGui::InputTextWithHint("##graph_texture_picker_search", "Search textures...", state.texture_picker_search, sizeof(state.texture_picker_search));
-
-        if (active_inputs.size() > 1) {
-            const char* current_label = active_inputs.front().label;
-            material_graph_input_slot target_slot = static_cast<material_graph_input_slot>(state.popup_target_slot);
-            for (const auto& input : active_inputs) {
-                if (input.slot == target_slot) {
-                    current_label = input.label;
-                    break;
-                }
-            }
-
-            if (ImGui::BeginCombo("Target Input", current_label)) {
-                for (const auto& input : active_inputs) {
-                    bool selected = (input.slot == static_cast<material_graph_input_slot>(state.popup_target_slot));
-                    if (ImGui::Selectable(input.label, selected)) {
-                        state.popup_target_slot = static_cast<int>(input.slot);
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-        } else if (!active_inputs.empty()) {
-            ImGui::TextDisabled("Target Input: %s", active_inputs.front().label);
-        }
-
-        std::string query = state.texture_picker_search;
-        std::transform(query.begin(), query.end(), query.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-
-        ImGui::Separator();
-        ImGui::BeginChild("MaterialGraphTexturePickerList", ImVec2(0.0f, 290.0f), true);
-
-        int matched = 0;
-        for (int tex_idx = 0; tex_idx < (int)scn.textures.size(); ++tex_idx) {
-            const auto& tex = scn.textures[tex_idx];
-            std::string tex_name = tex.name;
-            std::string lowered = tex_name;
-            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            if (!query.empty() && lowered.find(query) == std::string::npos) {
-                continue;
-            }
-
-            ++matched;
-            ImGui::PushID(tex_idx);
-            if (ImGui::Selectable(tex.name.c_str(), false)) {
-                material_graph_input_slot target_slot = static_cast<material_graph_input_slot>(state.popup_target_slot);
-                assign_texture_to_slot(target_slot, tex_idx, &state.popup_spawn_local);
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::PopID();
-        }
-
-        if (scn.textures.empty()) {
-            ImGui::TextDisabled("No textures have been imported yet.");
-        } else if (matched == 0) {
-            ImGui::TextDisabled("No textures match the current search.");
-        }
-
-        ImGui::EndChild();
-
-        if (ImGui::Button("Close")) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-}
+#include "material_graph_editor.inl"
 
 // -----------------------------------------------------------------------------
 // File-drop
 // -----------------------------------------------------------------------------
 
-static void glfw_drop_callback(GLFWwindow* /*window*/, int count, const char** paths)
+static void glfw_drop_callback(GLFWwindow* window, int count, const char** paths)
 {
+    CaptureMaterialGraphFileDrop(window);
     for (int i = 0; i < count; ++i) {
         if (paths[i]) {
             g_dropped_files.emplace_back(paths[i]);
@@ -4295,7 +3350,9 @@ static void process_dropped_files()
             has_extension_ci(full_path, ".jpg")  ||
             has_extension_ci(full_path, ".jpeg") ||
             has_extension_ci(full_path, ".tga")  ||
-            has_extension_ci(full_path, ".bmp"))
+            has_extension_ci(full_path, ".bmp")  ||
+            has_extension_ci(full_path, ".hdr")  ||
+            has_extension_ci(full_path, ".ppm"))
         {
             // Copy into textures/
             ensure_dir("textures");
@@ -4309,6 +3366,7 @@ static void process_dropped_files()
             tex.path = dest;
 
             g_scene.textures.push_back(std::move(tex));
+            MaterialGraphImportedTexture((int)g_scene.textures.size() - 1);
 
             std::printf("Imported texture: %s (%s)\n",
                         g_scene.textures.back().name.c_str(),
@@ -4401,6 +3459,7 @@ static void process_dropped_files()
     }
 
     g_dropped_files.clear();
+    g_graph_file_drop_material = -1;
 
     if (imported_any) {
         g_world_dirty = true;
@@ -4550,17 +3609,17 @@ int main()
         static bool s_prev_ctrlz = false;
         static bool s_prev_ctrly = false;
         static bool s_prev_ctrlspace = false;
-        bool ctrl_down = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
-        bool z_down    = (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS);
-        bool y_down    = (glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS);
-        bool space_down = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
-        bool cur_ctrlz = ctrl_down && z_down;
-        bool cur_ctrly = ctrl_down && y_down;
+        bool ctrl_down = io.KeyCtrl;
+        bool z_down = ImGui::IsKeyDown(ImGuiKey_Z);
+        bool y_down = ImGui::IsKeyDown(ImGuiKey_Y);
+        bool space_down = ImGui::IsKeyDown(ImGuiKey_Space);
+        bool cur_ctrlz = ctrl_down && z_down && !io.KeyShift;
+        bool cur_ctrly = ctrl_down && (y_down || (io.KeyShift && z_down));
         bool cur_ctrlspace = ctrl_down && space_down;
-        if (cur_ctrlz && !s_prev_ctrlz) {
+        if (cur_ctrlz && !s_prev_ctrlz && !io.WantTextInput) {
             UndoManager::Instance().undo();
         }
-        if (cur_ctrly && !s_prev_ctrly) {
+        if (cur_ctrly && !s_prev_ctrly && !io.WantTextInput) {
             UndoManager::Instance().redo();
         }
         if (cur_ctrlspace && !s_prev_ctrlspace) {
@@ -5242,13 +4301,13 @@ int main()
                     g_selected_material = new_idx;
                     g_world_dirty = true;
                     g_cached_world.reset();
-                    g_materials_dirty = true;
+                    MarkMaterialsDirty();
                     
                     // Undo support
                     UndoManager::Instance().push(std::make_unique<LambdaAction>(
                         [new_idx]() {
                             if (new_idx >= 0 && new_idx < (int)g_scene.materials.size()) {
-                                g_scene.materials.erase(g_scene.materials.begin() + new_idx);
+                                g_scene.materials.erase(g_scene.materials.begin() + new_idx); InvalidateAllMaterialThumbnails();
                                 if (g_selected_material == new_idx) g_selected_material = -1;
                                 g_world_dirty = true; g_cached_world.reset();
                             }
@@ -5257,7 +4316,7 @@ int main()
                             if (new_idx < 0) return;
                             int insert_at = new_idx;
                             if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
-                            g_scene.materials.insert(g_scene.materials.begin() + insert_at, new_mat);
+                            g_scene.materials.insert(g_scene.materials.begin() + insert_at, new_mat); InvalidateAllMaterialThumbnails();
                             g_selected_material = insert_at;
                             g_world_dirty = true; g_cached_world.reset();
                         },
@@ -5394,9 +4453,8 @@ int main()
             sl.angular_radius_deg = 0.53; // approximate real sun radius in degrees
             g_scene.lights.push_back(sl);
 
-            // Mirror into camera preview defaults and enable MNEE
+            // Mirror into camera preview defaults.
             g_camera.use_sun = true;
-            g_camera.enable_mnee = true;
             g_camera.sun_dir = -sl.direction;
             g_camera.sun_radiance = colour(sl.radiance.x(), sl.radiance.y(), sl.radiance.z());
             g_camera.sun_angular_radius = sl.angular_radius_deg;
@@ -5499,9 +4557,8 @@ int main()
                         L.direction = -new_sun_dir; // store as light -> scene
                         g_world_dirty = true; g_cached_world.reset();
 
-                        // Mirror into camera sun parameters and ensure MNEE is enabled
+                        // Mirror into camera sun parameters.
                         g_camera.use_sun = true;
-                        g_camera.enable_mnee = true;
                         g_camera.sun_dir = new_sun_dir; // scene -> sun
                         g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
                     }
@@ -5548,7 +4605,7 @@ int main()
         // Moved here: Specular caustics (MNEE) controls live under the Lights tab
         {
             bool prev = g_camera.enable_mnee;
-            ImGui::Checkbox("Specular Caustics (MNEE)", &g_camera.enable_mnee);
+            ImGui::Checkbox("Approximate caustics (experimental)", &g_camera.enable_mnee);
             if (g_camera.enable_mnee && !prev) {
                 UpdateMNEEFromScene();
             }
@@ -6437,7 +5494,7 @@ int main()
                 UndoManager::Instance().push(std::make_unique<LambdaAction>(
                     [new_mat_idx]() {
                         if (new_mat_idx >= 0 && new_mat_idx < (int)g_scene.materials.size()) {
-                            g_scene.materials.erase(g_scene.materials.begin() + new_mat_idx);
+                            g_scene.materials.erase(g_scene.materials.begin() + new_mat_idx); InvalidateAllMaterialThumbnails();
                             g_world_dirty = true;
                             g_cached_world.reset();
                         }
@@ -6446,7 +5503,7 @@ int main()
                         int insert_at = new_mat_idx;
                         if (insert_at < 0) insert_at = 0;
                         if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
-                        g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
+                        g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot); InvalidateAllMaterialThumbnails();
                         g_world_dirty = true;
                         g_cached_world.reset();
                     },
@@ -6629,6 +5686,7 @@ int main()
                     ImGui::BeginChild("MaterialEditorDetails", ImVec2(0.0f, 0.0f), false);
                     if (g_selected_material >= 0 && g_selected_material < (int)g_scene.materials.size()) {
                         auto& mat = g_scene.materials[g_selected_material];
+                        DrawMaterialGraphDetails(mat, g_scene, g_selected_material);
                         DrawMaterialInspector(mat, g_scene, g_selected_material, false);
                         ImGui::Separator();
                         if (ImGui::Button("Delete Material")) {
@@ -6638,7 +5696,7 @@ int main()
                             UndoManager::Instance().push(std::make_unique<LambdaAction>(
                                 [del_idx]() {
                                     if (del_idx >= 0 && del_idx < (int)g_scene.materials.size()) {
-                                        g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                                        g_scene.materials.erase(g_scene.materials.begin() + del_idx); InvalidateAllMaterialThumbnails();
                                         if (g_selected_material == del_idx) g_selected_material = -1;
                                         g_world_dirty = true; g_cached_world.reset();
                                     }
@@ -6647,18 +5705,18 @@ int main()
                                     if (del_idx < 0) return;
                                     int insert_at = del_idx;
                                     if (insert_at > (int)g_scene.materials.size()) insert_at = (int)g_scene.materials.size();
-                                    g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot);
+                                    g_scene.materials.insert(g_scene.materials.begin() + insert_at, snapshot); InvalidateAllMaterialThumbnails();
                                     g_selected_material = insert_at;
                                     g_world_dirty = true; g_cached_world.reset();
                                 },
                                 "Delete Material"
                             ));
 
-                            g_scene.materials.erase(g_scene.materials.begin() + del_idx);
+                            g_scene.materials.erase(g_scene.materials.begin() + del_idx); InvalidateAllMaterialThumbnails();
                             g_selected_material = -1;
                             g_world_dirty = true;
                             g_cached_world.reset();
-                            g_materials_dirty = true;
+                            MarkMaterialsDirty();
                             material_deleted = true;
 
                             // Invalidate thumbnail cache for this material
@@ -6796,7 +5854,7 @@ int main()
                             // Build caustics photon map once before render. Build when
                             // we have either a sun or point lights so point-light
                             // caustics are captured even if the sun is disabled.
-                            if (cam_copy.use_sun || !cam_copy.point_lights.empty()) {
+                            if (cam_copy.enable_mnee && (cam_copy.use_sun || !cam_copy.point_lights.empty())) {
                                 caustics_config cfg;
                                 cfg.photon_count   = (int)std::clamp<size_t>(pixel_count / 3, 150000, 750000);
                                 cfg.max_bounces    = std::max(2, std::min(8, cam_copy.max_depth));
@@ -7284,18 +6342,20 @@ int main()
         {
             GLFWwindow* backup_current_context = glfwGetCurrentContext();
             ImGui::UpdatePlatformWindows();
+            for (auto* viewport : ImGui::GetPlatformIO().Viewports)
+                if (viewport->PlatformHandle) glfwSetDropCallback(static_cast<GLFWwindow*>(viewport->PlatformHandle), glfw_drop_callback);
             ImGui::RenderPlatformWindowsDefault();
             glfwMakeContextCurrent(backup_current_context);
         }
 
         // Auto-save materials if modified
-        if (g_materials_dirty) {
-            SaveMaterialsManifest();
-            g_materials_dirty = false;
-        }
+        TickMaterialPersistence();
 
         glfwSwapBuffers(window);
     }
+
+    g_editor_previews.stop();
+    if (g_materials_dirty) SaveMaterialsManifest();
 
     // Cleanup
     if (g_render_in_progress && g_render_thread.joinable()) {
@@ -7337,6 +6397,9 @@ int main()
     if (g_lineShader)     glDeleteProgram(g_lineShader);
     if (g_gizmoVBO)       glDeleteBuffers(1, &g_gizmoVBO);
     if (g_gizmoVAO)       glDeleteVertexArrays(1, &g_gizmoVAO);
+
+    for (auto& item : g_material_thumb_cache) if (item.second) glDeleteTextures(1,&item.second);
+    g_material_thumb_cache.clear();
 
     // Cleanup texture thumbnail cache
     for (auto& kv : g_texture_thumb_cache) {

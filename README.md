@@ -21,7 +21,7 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 
 ## Features
 ### Rendering
-- GGX PBR with metallic/roughness workflow  
+- GGX PBR with metallic/roughness workflow ([model, audit, and validation](docs/pbr-validation.md))
 - Dielectric Fresnel (Schlick/Shirley) & microfacet sampling  
 - Correct inverse-transpose normals under non-uniform scale  
 - Unified transform wrapper for spheres, cubes, and meshes  
@@ -33,7 +33,7 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Embree path UV interpolation fix to ensure correct texture sampling on hardware-accelerated geometry
 
 ### Editor Features
-- Unreal-like shader graph editor
+- Persistent material graph with texture drops, searchable nodes, editable wires, CPU shader evaluation, and asynchronous previews ([guide and performance checks](docs/material-graph.md))
 - Content Drawer (ctrl + spacebar)
 - GPU-based picking via RGB8 ID buffer  
 - Screen-space gizmo: axis translation with closest-point ray math  

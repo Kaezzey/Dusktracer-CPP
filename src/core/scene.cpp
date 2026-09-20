@@ -34,29 +34,22 @@ static bool has_extension_ci(const std::string& path, const char* ext)
 // ------------------------------------------------------------
 // Texture cache: map file path + sample-space -> shared_ptr<texture>
 // ------------------------------------------------------------
-static std::shared_ptr<texture> load_scene_texture(const scene& scn, int tex_index,
-                                                   texture_sample_space sample_space = texture_sample_space::srgb_color)
-{
-    if (tex_index < 0 || tex_index >= (int)scn.textures.size())
-        return nullptr;
-
-    const auto& t = scn.textures[tex_index];
-
-    // Cache by path
-    static std::unordered_map<std::string, std::weak_ptr<texture>> tex_cache;
-
-    std::string cache_key = t.path + ((sample_space == texture_sample_space::srgb_color) ? "|srgb" : "|linear");
-
-    auto it = tex_cache.find(cache_key);
-    if (it != tex_cache.end()) {
-        if (auto existing = it->second.lock()) {
-            return existing;
-        }
-    }
-
-    std::shared_ptr<texture> tex = std::make_shared<image_texture>(t.path.c_str(), sample_space);
-    tex_cache[cache_key] = tex;
-    return tex;
+static std::shared_ptr<texture> load_texture_path(const std::string& path, texture_sample_space space) {
+    // Preview and scene compilation use independent caches; immutable decoded
+    // pixels are shared by the sRGB and linear wrappers in each cache.
+    thread_local std::unordered_map<std::string,std::weak_ptr<texture>> textures;
+    thread_local std::unordered_map<std::string,std::weak_ptr<rtw_image>> images;
+    std::string key = path + (space == texture_sample_space::srgb_color ? "|srgb" : "|linear");
+    if (auto texture = textures[key].lock()) return texture;
+    auto image = images[path].lock();
+    if (!image) { image = std::make_shared<rtw_image>(path.c_str()); images[path] = image; }
+    auto result = std::make_shared<image_texture>(std::move(image),space);
+    textures[key] = result;
+    return result;
+}
+static std::shared_ptr<texture> load_scene_texture(const scene& scn, int index,
+        texture_sample_space space = texture_sample_space::srgb_color) {
+    return index < 0 || index >= (int)scn.textures.size() ? nullptr : load_texture_path(scn.textures[index].path,space);
 }
 
 // ------------------------------------------------------------
@@ -99,11 +92,24 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         );
     };
 
+    auto graph_loader = [&](const graph_node& node, bool srgb) -> std::shared_ptr<texture> {
+        auto space = srgb ? texture_sample_space::srgb_color : texture_sample_space::linear_data;
+        // Paths survive manifest reloads and asset index changes.
+        if (!node.texture_path.empty()) {
+            return load_texture_path(node.texture_path,space);
+        }
+        return load_scene_texture(scn, node.texture_index, space);
+    };
+    auto input_texture = [&](int slot, int legacy, texture_sample_space space) {
+        if (!m.graph.nodes.empty()) return compile_material_graph(m.graph, slot, graph_loader);
+        return load_scene_texture(scn, legacy, space);
+    };
+
     switch (m.model) {
 
     case scene_material_model::lambert:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
 
@@ -112,7 +118,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::metal:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
 
@@ -121,7 +127,7 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
     case scene_material_model::dielectric:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         if (tex) {
             return std::make_shared<dielectric>(m.ior, tex);
         }
@@ -146,42 +152,42 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
         vec3 emit_col = base_emit * (float)m.emission_intensity;
 
-        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> emit_tex =
             tex ? tex : make_base_colour(emit_col);
 
-        return std::make_shared<diffuse_light>(emit_tex);
+        return std::make_shared<diffuse_light>(emit_tex,tex ? m.emission_intensity : 1.0);
     }
 
     case scene_material_model::pbr:
     {
         // Base albedo
-        auto base_tex_loaded = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto base_tex_loaded = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             base_tex_loaded ? base_tex_loaded : make_base_colour(m.base_color);
 
         // Metallic scalar -> greyscale texture if no texture bound
-        auto metal_tex_loaded = load_scene_texture(scn, m.metallic_tex, texture_sample_space::linear_data);
+        auto metal_tex_loaded = input_texture(1, m.metallic_tex, texture_sample_space::linear_data);
         std::shared_ptr<texture> metallic_tex =
             metal_tex_loaded ? metal_tex_loaded : make_grey(m.metallic);
 
         // Roughness scalar -> greyscale texture if no texture bound
-        auto rough_tex_loaded = load_scene_texture(scn, m.roughness_tex, texture_sample_space::linear_data);
+        auto rough_tex_loaded = input_texture(2, m.roughness_tex, texture_sample_space::linear_data);
         std::shared_ptr<texture> roughness_tex =
             rough_tex_loaded ? rough_tex_loaded : make_grey(m.roughness);
 
         // Normal map (tangent-space)
         std::shared_ptr<texture> normal_tex =
-            load_scene_texture(scn, m.normal_tex, texture_sample_space::linear_data); // can be nullptr
+            input_texture(3, m.normal_tex, texture_sample_space::linear_data); // can be nullptr
 
         // Alpha map (optional)
         std::shared_ptr<texture> alpha_tex =
-            load_scene_texture(scn, m.alpha_tex, texture_sample_space::linear_data); // can be nullptr
+            input_texture(4, m.alpha_tex, texture_sample_space::linear_data); // can be nullptr
 
         // Force double-sided masking if either an explicit alpha map is
         // provided or the albedo texture contains an alpha channel.
         bool effective_double_sided = m.alpha_double_sided;
-        if (alpha_tex) effective_double_sided = true;
+        if (alpha_tex || !m.graph.nodes.empty()) effective_double_sided = true;
         else {
             // If base_tex is an image_texture, query whether it has alpha.
             if (auto img_tex = std::dynamic_pointer_cast<image_texture>(base_tex)) {
@@ -219,14 +225,14 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             (float)m.sss_color_override_color.z()
         );
         // Unreal PBR packing flag
-        mat->use_unreal_pbr = m.unreal_pbr;
+        mat->use_unreal_pbr = m.graph.nodes.empty() && m.unreal_pbr;
 
         return mat;
     }
 
     case scene_material_model::isotropic:
     {
-        auto tex = load_scene_texture(scn, m.albedo_tex, texture_sample_space::srgb_color);
+        auto tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
         return std::make_shared<isotropic>(base_tex);
@@ -428,79 +434,34 @@ hittable_list build_world_from_scene(const scene& scn)
 void build_emissive_surfaces(const scene& scn, camera& cam)
 {
     std::vector<camera::emissive_surface> surfaces;
-
+    auto add = [&](std::shared_ptr<hittable> geometry) {
+        hit_record sample; double pdf;
+        if (!geometry->sample_surface(.37,.63,0,sample,pdf) || pdf <= 0) return;
+        camera::emissive_surface light;
+        light.geometry = std::move(geometry); light.area = 1/pdf;
+        light.emission = sample.mat->emitted(sample.u,sample.v,sample.p);
+        surfaces.push_back(std::move(light));
+    };
     for (const auto& obj : scn.objects) {
-        int mat_idx = obj.material_index;
-        if (mat_idx < 0 || mat_idx >= (int)scn.materials.size())
-            continue;
-
-        const auto& mat = scn.materials[mat_idx];
-        if (mat.model != scene_material_model::diffuse_light)
-            continue;
-
-        // Compute emission (use emission field or base_color as fallback)
-        vec3 base_emit = (mat.emission.x() != 0.0 ||
-                          mat.emission.y() != 0.0 ||
-                          mat.emission.z() != 0.0)
-                         ? mat.emission
-                         : mat.base_color;
-
-        vec3 emit_col = base_emit * (float)mat.emission_intensity;
-        colour emission(emit_col.x(), emit_col.y(), emit_col.z());
-
-        // Skip if emission is essentially zero
-        double lum = 0.2126 * emission.x() + 0.7152 * emission.y() + 0.0722 * emission.z();
-        if (lum < 1e-6) continue;
-
-        // Collect geometry data based on object type
+        if (obj.material_index < 0 || obj.material_index >= (int)scn.materials.size()) continue;
+        const auto& description = scn.materials[obj.material_index];
+        if (description.model != scene_material_model::diffuse_light) continue;
+        auto mat = build_rt_material(scn,description);
+        vec3 translation = obj.translation+obj.center;
         if (obj.type == scene_object_type::sphere) {
-            // Sphere: use center + transformed radius for area
-            double s = obj.scale.x();
-            if (s <= 0.0) s = 1.0;
-            double radius = obj.radius * s;
-            double area = 4.0 * pi * radius * radius;
-
-            vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-            point3 center = point3(translation.x(), translation.y(), translation.z());
-            
-            // For sphere, normal points outward from center (we'll use average normal = up)
-            vec3 normal(0, 1, 0);
-
-            camera::emissive_surface surf;
-            surf.position = center;
-            surf.normal = normal;
-            surf.area = area;
-            surf.emission = emission;
-            surfaces.push_back(surf);
+            double scale = (obj.scale.x() > 0 ? obj.scale.x() : 1)*obj.radius;
+            if (scale <= 0) continue;
+            add(std::make_shared<transform>(std::make_shared<sphere>(point3(),1,mat),
+                translation,obj.rotation_deg,vec3(scale,scale,scale)));
+        } else if (obj.type == scene_object_type::cube) {
+            vec3 scale = obj.scale;
+            for (int i = 0; i < 3; ++i) if (scale[i] <= 0) scale[i] = 1;
+            auto faces = box(point3(-.5,-.5,-.5),point3(.5,.5,.5),mat);
+            for (const auto& face : faces->objects)
+                add(std::make_shared<transform>(face,translation,obj.rotation_deg,scale));
         }
-        else if (obj.type == scene_object_type::cube) {
-            // Cube: 6 faces, each face has area = side^2
-            vec3 scl = obj.scale;
-            if (scl.x() <= 0.0) scl = vec3(1.0, scl.y(), scl.z());
-            if (scl.y() <= 0.0) scl = vec3(scl.x(), 1.0, scl.z());
-            if (scl.z() <= 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
-
-            double side_x = scl.x();
-            double side_y = scl.y();
-            double side_z = scl.z();
-
-            // Total surface area = 2*(xy + yz + xz)
-            double total_area = 2.0 * (side_x * side_y + side_y * side_z + side_x * side_z);
-
-            vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-            point3 center = point3(translation.x(), translation.y(), translation.z());
-            vec3 normal(0, 1, 0); // approximate
-
-            camera::emissive_surface surf;
-            surf.position = center;
-            surf.normal = normal;
-            surf.area = total_area;
-            surf.emission = emission;
-            surfaces.push_back(surf);
-        }
-        // TODO: mesh instances with emissive materials (requires triangle extraction)
+        // Emissive mesh triangles remain reachable through BSDF sampling. Do
+        // not invent a center-point distribution for unsampleable geometry.
     }
-
     cam.set_emissive_surfaces(surfaces);
 }
-

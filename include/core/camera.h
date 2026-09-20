@@ -55,7 +55,7 @@ class camera {
     bool   use_sun = false;
     vec3   sun_dir = vec3(0,0,0);
     colour sun_radiance = colour(0,0,0);
-    double sun_angular_radius = 0.0;
+    double sun_angular_radius = 0.0; // degrees; zero is a delta directional light
     int    sun_shadow_samples = 8; // number of shadow samples for soft sun (0 = off)
 
     // Point lights copied from the editor scene. Simple point lights with
@@ -70,17 +70,15 @@ class camera {
 
     // Emissive area lights (surfaces with emissive materials)
     struct emissive_surface {
-        point3 position;     // sample point (center for spheres/quads)
-        vec3   normal;       // surface normal
-        double area;         // surface area
-        colour emission;     // emitted radiance
-        // For advanced sampling: could add triangle vertices, quad corners, etc.
+        std::shared_ptr<hittable> geometry;
+        double area = 0;
+        colour emission; // Power estimate for selection; samples evaluate the material.
     };
     std::vector<emissive_surface> emissive_surfaces;
     std::vector<double> emissive_cdf; // Importance sampling CDF (by power = emission*area)
 
     // MNEE single-sphere caustics toggle and parameters (populated by editor)
-    bool   enable_mnee = true;
+    bool   enable_mnee = false;
     bool   mnee_has_sphere = false;
     point3 mnee_sphere_center = point3(0,0,0);
     double mnee_sphere_radius = 0.0;
@@ -94,8 +92,8 @@ class camera {
     int    mnee_sun_samples       = 4;
     double mnee_gain_scale        = 1.0;
 
-    // NEE + MIS for diffuse materials (reduces noise at low SPP)
-    int    direct_light_samples   = 0;  // samples per diffuse hit (0 = disabled)
+    // NEE + MIS for continuous BSDF lobes (diffuse and glossy).
+    int    direct_light_samples   = 1;  // samples per diffuse hit (0 = disabled)
     bool   enable_mis             = true; // Multiple Importance Sampling
 
     void render(const hittable& world, std::ostream& out = std::cout){
@@ -353,7 +351,7 @@ class camera {
         for (size_t i = 0; i < surfaces.size(); ++i) {
             const auto& surf = surfaces[i];
             double lum = 0.2126 * surf.emission.x() + 0.7152 * surf.emission.y() + 0.0722 * surf.emission.z();
-            double power = lum * surf.area;
+            double power = std::max(1e-3,lum) * surf.area;
             total_power += power;
             emissive_cdf[i] = total_power;
         }
@@ -385,8 +383,8 @@ class camera {
         if (pl.range > 0.0 && dist > pl.range) return 0.0;
 
         vec3 Ldir = unit_vector(to_light);
-        double NdotL = dot(normal, Ldir);
-        if (NdotL <= 0.0) return 0.0;
+        // Retain support for normal maps and thin transmission on either side.
+        double NdotL = std::max(0.05,std::abs(dot(normal,Ldir)));
 
         double att = 1.0 / std::max(1e-4, dist * dist);
         return att * NdotL * colour_luminance(pl.radiance);
@@ -431,70 +429,81 @@ class camera {
         return true;
     }
 
-    // Optionally returns the first-hit surface albedo and normal via out parameters
-    colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr, vec3* out_normal = nullptr, const hit_record* prehit = nullptr, const colour* precomputed_direct = nullptr) const {
-        ray    current_ray = r0;
-        colour throughput(1.0, 1.0, 1.0);
-        colour result(0,0,0);
-
-        for (int depth = 0; depth < max_depth; ++depth) {
-
+    static double power_weight(double a, double b) {
+        if (a <= 0) return 0;
+        double ratio = b/a; return 1/(1+ratio*ratio);
+    }
+    double sun_solid_angle() const {
+        double angle = degrees_to_radians(std::clamp(sun_angular_radius,0.0,90.0));
+        return 4*pi*std::pow(std::sin(.5*angle),2);
+    }
+    double sun_pdf(const vec3& direction) const {
+        double omega = sun_solid_angle();
+        if (!use_sun || omega <= 1e-12) return 0;
+        return dot(safe_unit_vector(direction),safe_unit_vector(sun_dir)) >= 1-omega/(2*pi) ? 1/omega : 0;
+    }
+    // PDF of selecting and sampling this visible emitter point, in solid angle.
+    double emitter_pdf(const point3& origin, const hit_record& hit, double time) const {
+        vec3 delta = hit.p-origin; double distance2 = delta.length_squared();
+        if (distance2 <= 1e-12) return 0;
+        vec3 direction = delta/std::sqrt(distance2); double pdf = 0;
+        for (size_t i = 0; i < emissive_surfaces.size(); ++i) {
+            const auto& light = emissive_surfaces[i]; if (!light.geometry) continue;
+            hit_record sampled;
+            if (!light.geometry->hit(ray(origin,direction,time),interval(.001,std::sqrt(distance2)+.002),sampled)) continue;
+            if ((sampled.p-hit.p).length_squared() > 1e-6) continue;
+            double cosine = std::abs(dot(sampled.geometry_normal(),-direction));
+            double pick = emissive_cdf[i]-(i ? emissive_cdf[i-1] : 0);
+            if (cosine > 1e-12) pdf += pick*light.geometry->surface_pdf(sampled)*distance2/cosine;
+        }
+        return pdf;
+    }
+    // The editor's directional-light strength is integrated incident radiance.
+    // Finite sun discs divide it by their solid angle, consistently for NEE and
+    // BSDF hits, so changing the angular size does not change total brightness.
+    colour ray_colour(const ray& r0, int max_depth, const hittable& world, colour* out_albedo = nullptr,
+                      vec3* out_normal = nullptr, const hit_record* prehit = nullptr,
+                      const colour* precomputed_direct = nullptr) const {
+        (void)precomputed_direct; // The retired ISPC prepass cannot supply MIS-aware lighting.
+        ray current_ray = r0;
+        colour throughput(1,1,1), result(0,0,0);
+        point3 previous_point;
+        double previous_pdf = 0;
+        int previous_samples = 0, previous_sun_samples = 0, null_events = 0;
+        bool previous_delta = true, first_intersection = true;
+        auto hit_weight = [&](double light_pdf, int samples) {
+            if (previous_delta || samples == 0 || light_pdf <= 0) return 1.0;
+            return enable_mis ? power_weight(previous_pdf,samples*light_pdf) : 0.0;
+        };
+        for (int depth = 0; depth <= max_depth; ++depth) {
             hit_record rec;
-
-            // If caller supplied a precomputed first-hit record, use it for the first depth
-            bool have_prehit = (prehit != nullptr && depth == 0);
-            bool did_hit = false;
-            if (have_prehit) {
-                rec = *prehit;
-                did_hit = true;
-            } else {
-                // Miss: accumulate environment background (optionally sun disc) and stop
-                if (!world.hit(current_ray, interval(0.001, infinity), rec)) {
-                    did_hit = false;
-                } else {
-                    did_hit = true;
-                }
-            }
-
+            bool did_hit;
+            if (prehit && first_intersection) { rec = *prehit; did_hit = true; }
+            else did_hit = world.hit(current_ray,interval(.001,infinity),rec);
+            first_intersection = false;
             if (!did_hit) {
-                colour env = background;
-
-                // If sun is enabled, add environment sun radiance when ray
-                // points toward the sun disc. This lets path-traced rays
-                // pick up sun light like emissive backgrounds.
-                if (use_sun) {
-                    vec3 w = unit_vector(current_ray.direction());   // from camera into scene
-                    vec3 to_sun = unit_vector(sun_dir);               // scene -> sun
-
-                    double ang_rad = degrees_to_radians(sun_angular_radius);
-                    double cos_max = std::cos(std::max(0.0, ang_rad));
-                    double cos_theta = dot(w, to_sun);
-                    if (cos_theta >= cos_max) {
-                        // Soft edge weighting: map cosθ in [cos_max, 1] to [0,1]
-                        double t = (cos_theta - cos_max) / std::max(1e-6, (1.0 - cos_max));
-                        t = std::clamp(t, 0.0, 1.0);
-                        env += sun_radiance * (float)t;
-                    }
-                }
-
-                result += throughput * env;
+                result += throughput*background;
+                double pdf = sun_pdf(current_ray.direction());
+                if (pdf > 0) result += throughput*sun_radiance*(pdf*hit_weight(pdf,previous_sun_samples));
                 break;
             }
-
-            // On the first surface hit, optionally return albedo and normal for AOVs
-            if (depth == 0 && did_hit) {
-                if (out_albedo) {
-                    if (rec.mat) *out_albedo = rec.mat->albedo(rec);
-                    else *out_albedo = colour(0,0,0);
-                }
-                if (out_normal) {
-                    *out_normal = rec.normal;
-                }
+            if (!rec.mat) break;
+            bsdf_sample sample;
+            bool scattered = rec.mat->sample_bsdf(current_ray,rec,sample);
+            if (scattered && sample.passthrough) {
+                if (++null_events > 1024) break;
+                current_ray = sample.scattered; --depth; continue;
             }
-
-            // Emission at the hit point
-            colour emitted = rec.mat->emitted(rec.u, rec.v, rec.p);
-            result += throughput * emitted;
+            if (depth == 0) {
+                if (out_albedo) *out_albedo = rec.mat->albedo(rec);
+                if (out_normal) *out_normal = rec.normal;
+            }
+            colour emitted = rec.mat->emitted(rec.u,rec.v,rec.p);
+            if (emitted.length_squared() > 0) {
+                double pdf = previous_delta || previous_samples == 0 ? 0 : emitter_pdf(previous_point,rec,current_ray.time());
+                result += throughput*emitted*hit_weight(pdf,previous_samples);
+            }
+            if (depth == max_depth || (!scattered && emitted.length_squared() > 0)) break;
 
             // Caustics lookup on diffuse receivers.
             // Since the photon map stores only caustic photons (paths that
@@ -534,318 +543,84 @@ class camera {
                 }
             }
 
-            // Scatter
-            ray    scattered;
-            colour attenuation;
-            double pdf_bsdf = 1.0;
-
-            if (!rec.mat->scatter(current_ray, rec, attenuation, scattered)) {
-                // No scattering (pure light or absorption) – we're done
-                break;
-            }
-
-            // For non-specular materials, do explicit light sampling (NEE) with MIS
-            bool did_nee = false;
-            if (!rec.mat->is_specular() && enable_mis) {
-                vec3 V = -unit_vector(current_ray.direction());
-                int num_direct_samples = std::max(0, direct_light_samples);
-
-                // Sample sun with NEE+MIS (only if sampling enabled)
-                if (num_direct_samples > 0 && use_sun) {
-                    for (int ls = 0; ls < num_direct_samples; ++ls) {
-                        vec3 Lc = unit_vector(sun_dir);
-                        double ang_rad = degrees_to_radians(sun_angular_radius);
-                        double cos_theta_max = std::cos(ang_rad);
-                        
-                        // Sample direction within sun disc
-                        vec3 Ls = Lc;
-                        if (ang_rad > 0.0) {
-                            double u = random_double();
-                            double v = random_double();
-                            double cos_theta = (1.0 - u) + u * cos_theta_max;
-                            double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
-                            double phi = 2.0 * pi * v;
-                            
-                            double x = sin_theta * std::cos(phi);
-                            double y = sin_theta * std::sin(phi);
-                            double z = cos_theta;
-                            
-                            vec3 w_s = Lc;
-                            vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
-                            vec3 u_s = unit_vector(cross(a, w_s));
-                            vec3 v_s = cross(w_s, u_s);
-                            Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
-                        }
-                        
-                        ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
-                        double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
-                        if (tr > 0.0) {
-                            colour Li = sun_radiance * (float)tr;
-                            colour direct = rec.mat->shade_direct(rec, V, Ls, Li, world);
-                            colour sss = rec.mat->shade_sss(rec, V, Ls, Li, world);
-
-                            double sample_weight = 1.0 / num_direct_samples;
-                            double solid_angle = 2.0 * pi * (1.0 - cos_theta_max);
-                            if (solid_angle > 1e-10) {
-                                double pdf_light = 1.0 / solid_angle;
-                                double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ls);
-                                double w_light = (pdf_light * pdf_light) /
-                                                (pdf_light * pdf_light + pdf_bsdf_light * pdf_bsdf_light);
-                                sample_weight = w_light / (pdf_light * num_direct_samples);
-                            }
-
-                            result += throughput * (direct + sss) * (float)sample_weight;
-                            did_nee = true;
-                        }
+            vec3 view = safe_unit_vector(-current_ray.direction());
+            int count = std::max(0,direct_light_samples);
+            // Surface and subsurface hooks are conditional on an accepted opaque
+            // hit. A null-opacity event above receives no direct surface lighting.
+            auto add_light = [&](const vec3& direction, const colour& radiance, double max_distance,
+                                 double weight, double surface_mis) {
+                vec3 origin = rec.p+rec.geometry_normal()*(dot(direction,rec.geometry_normal()) >= 0 ? .001 : -.001);
+                double visibility = compute_transmittance(ray(origin,direction,current_ray.time()),max_distance,world);
+                if (visibility <= 0) return;
+                colour direct = rec.mat->shade_direct(rec,view,direction,radiance,world,visibility);
+                colour subsurface = rec.mat->shade_sss(rec,view,direction,radiance,world,visibility);
+                // The approximate SSS hook has no competing BSDF sampler.
+                result += throughput*(direct*surface_mis+subsurface)*weight;
+            };
+            if (use_sun) {
+                double omega = sun_solid_angle();
+                int samples = omega <= 1e-12 ? 1 : count > 0 ? std::max(1,sun_shadow_samples) : 0;
+                pbr::frame sun_frame(safe_unit_vector(sun_dir));
+                for (int i = 0; i < samples; ++i) {
+                    vec3 direction = sun_frame.n;
+                    double weight = 1.0/samples, mis = 1;
+                    colour radiance = sun_radiance;
+                    if (omega > 1e-12) {
+                        double z = 1-random_double()*omega/(2*pi), phi = 2*pi*random_double();
+                        double radius = std::sqrt(std::max(0.0,1-z*z));
+                        direction = sun_frame.world(vec3(radius*std::cos(phi),radius*std::sin(phi),z));
+                        double pdf = 1/omega;
+                        mis = enable_mis ? power_weight(samples*pdf,rec.mat->bsdf_pdf(rec,view,direction)) : 1;
+                        radiance *= pdf; weight /= pdf;
                     }
-                }
-                
-                // Sample point lights with NEE+MIS
-                // OPTIMIZATION: Sample ONE random light per bounce (weighted by contribution)
-                // and multiply by N to get unbiased result at O(1) cost instead of O(N)
-                if (num_direct_samples > 0 && !point_lights.empty()) {
-                    double total_weight = total_point_light_sampling_weight(rec.p, rec.normal);
-                    if (total_weight > 1e-10) {
-                        for (int ls = 0; ls < num_direct_samples; ++ls) {
-                            const point_light* sampled_light = nullptr;
-                            double pick_prob = 0.0;
-                            if (!sample_point_light(rec.p, rec.normal, total_weight, sampled_light, pick_prob)) continue;
-
-                            const auto& pl = *sampled_light;
-                            vec3 toLight = pl.position - rec.p;
-                            double dist = toLight.length();
-                            vec3 Ldir = unit_vector(toLight);
-                            ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                            double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                            if (tr <= 0.0) continue;
-
-                            double att = 1.0 / std::max(1e-4, dist * dist);
-                            colour Li = pl.radiance * (float)(att * tr);
-
-                            colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                            result += throughput * (direct + sss) * (float)(1.0 / (num_direct_samples * pick_prob));
-                            did_nee = true;
-                        }
-                    }
-                }
-                
-                // Sample emissive area lights with NEE+MIS
-                if (num_direct_samples > 0 && !emissive_surfaces.empty() && !emissive_cdf.empty()) {
-                    for (int ls = 0; ls < num_direct_samples; ++ls) {
-                        // Importance sample one emissive surface by power
-                        double r = random_double();
-                        int sampled_idx = 0;
-                        for (size_t i = 0; i < emissive_cdf.size(); ++i) {
-                            if (r <= emissive_cdf[i]) {
-                                sampled_idx = (int)i;
-                                break;
-                            }
-                        }
-                        
-                        const auto& surf = emissive_surfaces[sampled_idx];
-                        double pick_prob = (sampled_idx == 0) 
-                            ? emissive_cdf[0] 
-                            : (emissive_cdf[sampled_idx] - emissive_cdf[sampled_idx - 1]);
-                        
-                        if (pick_prob <= 1e-10) continue;
-                        
-                        // Sample a point on the emissive surface (for now use center; improve with random sampling later)
-                        point3 light_pos = surf.position;
-                        vec3 light_normal = surf.normal;
-                        
-                        vec3 toLight = light_pos - rec.p;
-                        double dist = toLight.length();
-                        if (dist <= 1e-6) continue;
-                        
-                        vec3 Ldir = unit_vector(toLight);
-                        double NdotL = dot(rec.normal, Ldir);
-                        if (NdotL <= 0.0) continue;
-                        
-                        double NdotL_light = dot(light_normal, -Ldir);
-                        if (NdotL_light <= 0.0) continue; // backfacing
-                        
-                        // Visibility test
-                        ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                        double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                        if (tr <= 0.0) continue;
-                        
-                        // PDF for light sampling: 1 / area (uniform sampling on surface)
-                        double pdf_light = 1.0 / std::max(1e-10, surf.area);
-                        
-                        // Convert to solid angle PDF: pdf_omega = pdf_area * r^2 / (N_light · -L)
-                        double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
-                        double pdf_light_omega_total = pdf_light_omega * pick_prob;
-                        
-                        double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ldir);
-                        
-                        // MIS balance heuristic weight
-                        double w_light = (pdf_light_omega_total * pdf_light_omega_total) / 
-                                        (pdf_light_omega_total * pdf_light_omega_total + pdf_bsdf_light * pdf_bsdf_light);
-                        
-                        colour Li = surf.emission * (float)((NdotL_light / std::max(1e-4, dist * dist)) * tr);
-                        colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                        colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                        result += throughput * (direct + sss) * (float)(w_light / (pdf_light * pick_prob * num_direct_samples));
-                        did_nee = true;
-                    }
+                    add_light(direction,radiance,infinity,weight,mis);
                 }
             }
-
-            // If direct lighting is disabled (direct_light_samples==0), SSS would otherwise never
-            // show up for emissive/area lights. Do a single light-sample for SSS-only.
-            if (direct_light_samples <= 0 && !emissive_surfaces.empty() && !emissive_cdf.empty()) {
-                // Only bother if material actually has SSS enabled.
-                const pbr_material* pbr = dynamic_cast<const pbr_material*>(rec.mat.get());
-                const bool do_sss = (pbr && pbr->sss_strength > 0.0 && pbr->sss_model != SSS_NONE);
-                if (do_sss) {
-                    // Importance sample one emissive surface by power
-                    double r = random_double();
-                    int sampled_idx = 0;
-                    for (size_t i = 0; i < emissive_cdf.size(); ++i) {
-                        if (r <= emissive_cdf[i]) { sampled_idx = (int)i; break; }
-                    }
-
-                    const auto& surf = emissive_surfaces[sampled_idx];
-                    double pick_prob = (sampled_idx == 0)
-                        ? emissive_cdf[0]
-                        : (emissive_cdf[sampled_idx] - emissive_cdf[sampled_idx - 1]);
-                    if (pick_prob > 1e-10) {
-                        point3 light_pos = surf.position;
-                        vec3 light_normal = surf.normal;
-
-                        vec3 toLight = light_pos - rec.p;
-                        double dist = toLight.length();
-                        if (dist > 1e-6) {
-                            vec3 Ldir = unit_vector(toLight);
-                            double NdotL = dot(rec.normal, Ldir);
-                            double NdotL_light = dot(light_normal, -Ldir);
-                            if (NdotL > 0.0 && NdotL_light > 0.0) {
-                                ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                                double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                                if (tr > 0.0) {
-                                    double pdf_light = 1.0 / std::max(1e-10, surf.area);
-                                    double pdf_light_omega = pdf_light * dist * dist / std::max(1e-10, NdotL_light);
-                                    vec3 V = -unit_vector(current_ray.direction());
-                                    double pdf_light_omega_total = pdf_light_omega * pick_prob;
-                                    double pdf_bsdf_light = rec.mat->bsdf_pdf(rec, V, Ldir);
-                                    double w_light = (pdf_light_omega_total * pdf_light_omega_total) /
-                                                    (pdf_light_omega_total * pdf_light_omega_total + pdf_bsdf_light * pdf_bsdf_light);
-
-                                    colour Li = surf.emission * (float)((NdotL_light / std::max(1e-4, dist * dist)) * tr);
-                                    colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                                    result += throughput * sss * (float)(w_light / (pdf_light * pick_prob));
-                                }
-                            }
-                        }
-                    }
-                }
+            // Delta lights cannot be reached by BSDF sampling: no MIS weight.
+            double total = total_point_light_sampling_weight(rec.p,rec.geometry_normal());
+            int point_samples = std::max(1,count);
+            for (int i = 0; total > 0 && i < point_samples; ++i) {
+                const point_light* light; double pick;
+                if (!sample_point_light(rec.p,rec.geometry_normal(),total,light,pick)) continue;
+                vec3 delta = light->position-rec.p; double distance = delta.length();
+                if (distance <= .002) continue;
+                add_light(delta/distance,light->radiance/(distance*distance),distance-.002,1/(pick*point_samples),1);
             }
-
-            // Directional sun (camera-mirrored) support: sample soft sun/shadows if enabled.
-            // By default we only do this for specular materials or if MIS is disabled.
-            // However, SSS needs an explicit direct-light evaluation to be visible.
-            if (use_sun && (rec.mat->is_specular() || !enable_mis || direct_light_samples <= 0)) {
-                // central sun direction (FROM scene toward sun)
-                vec3 Lc = unit_vector(sun_dir);
-                int samples = std::max(1, sun_shadow_samples);
-                double ang_rad = degrees_to_radians(sun_angular_radius);
-                double cos_theta_max = std::cos(ang_rad);
-
-                double vis = 0.0;
-                for (int si = 0; si < samples; ++si) {
-                    vec3 Ls = Lc;
-                    if (ang_rad > 0.0 && samples > 1) {
-                        // sample a direction within the spherical cap around Lc
-                        double u = random_double();
-                        double v = random_double();
-                        double cos_theta = (1.0 - u) + u * cos_theta_max; // mix in [1, cos_theta_max]
-                        double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
-                        double phi = 2.0 * pi * v;
-
-                        double x = sin_theta * std::cos(phi);
-                        double y = sin_theta * std::sin(phi);
-                        double z = cos_theta;
-
-                        // build orthonormal basis around Lc
-                        vec3 w_s = Lc;
-                        vec3 a = (std::fabs(w_s.x()) > 0.1) ? vec3(0,1,0) : vec3(1,0,0);
-                        vec3 u_s = unit_vector(cross(a, w_s));
-                        vec3 v_s = cross(w_s, u_s);
-
-                        Ls = unit_vector(u_s * (float)x + v_s * (float)y + w_s * (float)z);
-                    }
-
-                    // Shadow ray transmittance regardless of N⋅L sign so dielectrics can transmit
-                    ray shadow_ray(rec.p + rec.normal * 0.001, Ls, current_ray.time());
-                    double tr = compute_transmittance(shadow_ray, std::numeric_limits<double>::infinity(), world);
-                    vis += tr;
-                }
-
-                vis /= double(samples);
-                if (vis > 0.0) {
-                    vec3 V = -unit_vector(current_ray.direction());
-
-                    colour direct = rec.mat->shade_direct(rec, V, Lc, sun_radiance, world);
-                    colour sss = rec.mat->shade_sss(rec, V, Lc, sun_radiance, world);
-                    result += throughput * ((direct + sss) * (float)vis);
-                }
+            for (int i = 0; i < count && !emissive_cdf.empty(); ++i) {
+                auto it = std::lower_bound(emissive_cdf.begin(),emissive_cdf.end(),random_double());
+                size_t index = std::min((size_t)(it-emissive_cdf.begin()),emissive_surfaces.size()-1);
+                const auto& light = emissive_surfaces[index];
+                double pick = emissive_cdf[index]-(index ? emissive_cdf[index-1] : 0), area_pdf;
+                hit_record light_hit;
+                if (!light.geometry || pick <= 0 || !light.geometry->sample_surface(random_double(),random_double(),current_ray.time(),light_hit,area_pdf)) continue;
+                vec3 delta = light_hit.p-rec.p; double distance2 = delta.length_squared(), distance = std::sqrt(distance2);
+                if (distance <= .002) continue;
+                vec3 direction = delta/distance;
+                double cosine = std::abs(dot(light_hit.geometry_normal(),-direction));
+                if (cosine <= 1e-12 || area_pdf <= 0) continue;
+                double pdf = pick*area_pdf*distance2/cosine;
+                double mis = enable_mis ? power_weight(count*pdf,rec.mat->bsdf_pdf(rec,view,direction)) : 1;
+                colour radiance = light_hit.mat ? light_hit.mat->emitted(light_hit.u,light_hit.v,light_hit.p) : colour(0,0,0);
+                add_light(direction,radiance,distance-.002,1/(count*pdf),mis);
             }
-
-            // Point lights: simple single-sample point lights with inverse-square falloff
-            // If the caller supplied a precomputed direct contribution (for depth==0), use it instead of computing here.
-            // Skip if we already did NEE+MIS above for non-specular materials
-            if (depth == 0 && precomputed_direct) {
-                result += throughput * (*precomputed_direct);
+            // A rejected BSDF sample must not discard the independent NEE estimate.
+            if (!scattered) break;
+            previous_point = rec.p; previous_pdf = sample.pdf;
+            previous_delta = sample.delta; previous_samples = count;
+            previous_sun_samples = count > 0 ? std::max(1,sun_shadow_samples) : 0;
+            throughput = throughput*sample.weight;
+            current_ray = sample.scattered;
+            if (!sample.passthrough) {
+                vec3 direction = safe_unit_vector(current_ray.direction());
+                double side = dot(direction,rec.geometry_normal()) >= 0 ? 1 : -1;
+                current_ray = ray(rec.p+side*.001*rec.geometry_normal(),direction,current_ray.time());
             }
-
-            // Point lights: sample one random point light. We normally only do this for
-            // specular materials or if MIS is disabled, but SSS needs explicit direct-light
-            // evaluation even when MIS is enabled.
-            if ((rec.mat->is_specular() || !enable_mis || direct_light_samples <= 0) && !point_lights.empty()) {
-                double total_weight = total_point_light_sampling_weight(rec.p, rec.normal);
-                if (total_weight > 1e-10) {
-                    const point_light* sampled_light = nullptr;
-                    double pick_prob = 0.0;
-                    if (sample_point_light(rec.p, rec.normal, total_weight, sampled_light, pick_prob)) {
-                        const auto& pl = *sampled_light;
-                        vec3 toLight = pl.position - rec.p;
-                        double dist = toLight.length();
-                        vec3 Ldir = unit_vector(toLight);
-
-                        ray shadow_ray(rec.p + rec.normal * 0.001, Ldir, current_ray.time());
-                        double tr = compute_transmittance(shadow_ray, dist - 0.001, world);
-                        if (tr > 0.0) {
-                            double att = 1.0 / std::max(1e-4, dist * dist);
-                            colour Li = pl.radiance * (float)(att * tr);
-
-                            vec3 V = -unit_vector(current_ray.direction());
-
-                            colour direct = rec.mat->shade_direct(rec, V, Ldir, Li, world);
-                            colour sss = rec.mat->shade_sss(rec, V, Ldir, Li, world);
-                            result += throughput * (direct + sss) * (float)(1.0 / pick_prob);
-                        }
-                    }
-                }
-            }
-
-            // Update throughput & ray
-            throughput = throughput * attenuation;
-            current_ray = scattered;
-
-            // Russian roulette after some depth
             if (depth >= 8) {
-                double luminance = colour_luminance(throughput);
-
-                double p = std::min(std::max(luminance, 0.1), 0.95);
-
-                if (random_double() > p)
-                    break;
-
-                throughput /= p;
+                double survival = std::clamp(std::max({throughput.x(),throughput.y(),throughput.z()}),.05,.95);
+                if (random_double() >= survival) break;
+                throughput /= survival;
             }
         }
-
         return result;
     }
 

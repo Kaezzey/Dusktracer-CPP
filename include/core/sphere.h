@@ -60,7 +60,7 @@ class sphere : public hittable {
             vec3 n = rec.normal;
 
             // Prefer analytical longitude direction when valid
-            vec3 t = vec3(-n.z(), 0.0, n.x());
+            vec3 t = vec3(n.z(), 0.0, -n.x());
 
             // If tangent is degenerate (poles), pick a stable perpendicular
             if (t.length_squared() < 1e-8) {
@@ -77,6 +77,19 @@ class sphere : public hittable {
 
             rec.mat = mat;
             return true;
+        }
+
+        bool sample_surface(double u, double v, double time, hit_record& rec, double& pdf) const override {
+            if (radius <= 0) return false;
+            double y = 1-2*u, r = std::sqrt(std::max(0.0,1-y*y)), phi = 2*pi*v;
+            rec.normal = rec.geometric_normal = vec3(r*std::cos(phi),y,r*std::sin(phi));
+            rec.front_face = true; rec.p = centre.at(time)+radius*rec.normal; rec.mat = mat;
+            get_sphere_uv(rec.normal,rec.u,rec.v);
+            rec.set_tangent_frame(vec3(rec.normal.z(),0,-rec.normal.x()),vec3());
+            pdf = surface_pdf(rec); return true;
+        }
+        double surface_pdf(const hit_record&) const override {
+            return radius > 0 ? 1/(4*pi*radius*radius) : 0;
         }
 
         aabb bounding_box() const override {
@@ -115,7 +128,7 @@ class sphere : public hittable {
 
                 // Tangent/bitangent similar to scalar path
                 vec3 n = rec.normal;
-                vec3 t = vec3(-n.z(), 0.0, n.x());
+                vec3 t = vec3(n.z(), 0.0, -n.x());
                 if (t.length_squared() < 1e-8) {
                     vec3 up = (std::fabs(n.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
                     t = unit_vector(cross(up, n));

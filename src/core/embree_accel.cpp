@@ -98,7 +98,7 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
 {
     if (!scene) return false;
 
-    RTCRayHit rh;
+    RTCRayHit rh{};
     rh.ray.org_x = (float)r.origin().x();
     rh.ray.org_y = (float)r.origin().y();
     rh.ray.org_z = (float)r.origin().z();
@@ -107,7 +107,7 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
     rh.ray.dir_z = (float)r.direction().z();
     rh.ray.tnear = (float)ray_t.min;
     rh.ray.tfar  = (float)ray_t.max;
-    rh.ray.time = 0.0f;
+    rh.ray.time = (float)r.time();
     rh.ray.mask = -1;
     rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
     rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
@@ -153,33 +153,14 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
         // Interpolate smooth normal
         vec3 interpN = (td.n0 * (float)w) + (td.n1 * (float)u) + (td.n2 * (float)v);
         interpN = unit_vector(interpN);
-        rec.set_face_normal(r, interpN);
+        rec.set_face_normal(r, safe_unit_vector(vec3(rh.hit.Ng_x,rh.hit.Ng_y,rh.hit.Ng_z)));
+        rec.set_shading_normal(interpN);
 
         // Interpolate tangent & bitangent and Gram-Schmidt them to normal
         vec3 interpT = (td.t0 * (float)w) + (td.t1 * (float)u) + (td.t2 * (float)v);
         vec3 interpB = (td.b0 * (float)w) + (td.b1 * (float)u) + (td.b2 * (float)v);
 
-        if (!interpT.near_zero()) {
-            interpT = interpT - interpN * dot(interpT, interpN);
-            interpT = unit_vector(interpT);
-        } else {
-            vec3 up = (std::fabs(interpN.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-            interpT = unit_vector(cross(up, interpN));
-        }
-
-        if (!interpB.near_zero()) {
-            interpB = interpB - interpN * dot(interpB, interpN);
-            interpB = unit_vector(interpB);
-        } else {
-            interpB = cross(interpN, interpT);
-        }
-
-        if (interpB.near_zero()) {
-            interpB = cross(interpN, interpT);
-        }
-
-        rec.tangent = interpT;
-        rec.bitangent = interpB;
+        rec.set_tangent_frame(interpT,interpB);
 
         rec.mat = td.mat;
         // Note: do not early-discard masked-transparent hits here. We want
@@ -200,6 +181,7 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
 
 bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const interval& ray_t, std::array<hit_record,4>& out_recs) const
 {
+    out_recs.fill(hit_record{});
     if (!scene) return false;
 
 #if defined(RTC_VERSION_MAJOR) && (RTC_VERSION_MAJOR >= 4)
@@ -225,8 +207,10 @@ bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const inte
     struct RTCIntersectArguments args;
     rtcInitIntersectArguments(&args);
 
-    int valid = (1<<4) - 1; // all 4 lanes valid
-    rtcIntersect4(&valid, scene, &rh4, &args);
+    // Embree expects one 32-bit -1/0 mask per lane, not a packed bitmask.
+    // Passing a single int also makes the API read beyond that stack object.
+    alignas(16) int valid[4] = {-1,-1,-1,-1};
+    rtcIntersect4(valid, scene, &rh4, &args);
 
     bool any_hit = false;
     for (int i = 0; i < 4; ++i) {
@@ -252,32 +236,13 @@ bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const inte
 
             vec3 interpN = (td.n0 * (float)w) + (td.n1 * (float)u) + (td.n2 * (float)v);
             interpN = unit_vector(interpN);
-            rec.set_face_normal(rays[i], interpN);
+            rec.set_face_normal(rays[i], safe_unit_vector(vec3(rh4.hit.Ng_x[i],rh4.hit.Ng_y[i],rh4.hit.Ng_z[i])));
+            rec.set_shading_normal(interpN);
 
             vec3 interpT = (td.t0 * (float)w) + (td.t1 * (float)u) + (td.t2 * (float)v);
             vec3 interpB = (td.b0 * (float)w) + (td.b1 * (float)u) + (td.b2 * (float)v);
 
-            if (!interpT.near_zero()) {
-                interpT = interpT - interpN * dot(interpT, interpN);
-                interpT = unit_vector(interpT);
-            } else {
-                vec3 up = (std::fabs(interpN.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-                interpT = unit_vector(cross(up, interpN));
-            }
-
-            if (!interpB.near_zero()) {
-                interpB = interpB - interpN * dot(interpB, interpN);
-                interpB = unit_vector(interpB);
-            } else {
-                interpB = cross(interpN, interpT);
-            }
-
-            if (interpB.near_zero()) {
-                interpB = cross(interpN, interpT);
-            }
-
-            rec.tangent = interpT;
-            rec.bitangent = interpB;
+            rec.set_tangent_frame(interpT,interpB);
             rec.mat = td.mat;
         } else {
             vec3 Ng((double)rh4.hit.Ng_x[i], (double)rh4.hit.Ng_y[i], (double)rh4.hit.Ng_z[i]);

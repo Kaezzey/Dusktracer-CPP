@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "vec3.h"  // for vec3 / point3
+#include "material_graph.h"
 
 // Forward declarations
 class material;
@@ -40,7 +41,7 @@ struct scene_texture {
 // ----------------------------------------
 // Editor-facing material description
 // ----------------------------------------
-struct scene_material {
+struct scene_material_parameters {
     std::string          name;
     scene_material_model model = scene_material_model::lambert;
 
@@ -83,6 +84,10 @@ struct scene_material {
     int alpha_tex     = -1;   // alpha mask index into scene.textures
     bool alpha_double_sided = true;
     double alpha_cutoff = 0.5;
+};
+
+struct scene_material : scene_material_parameters {
+    material_graph graph;
 };
 
 // Convert an editor-facing scene_material into a runtime material*

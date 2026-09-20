@@ -128,6 +128,11 @@ inline vec3 unit_vector(const vec3& v){
     return v / v.length();
 }
 
+inline vec3 safe_unit_vector(const vec3& v, const vec3& fallback = vec3(0,0,1)) {
+    double length2 = v.length_squared();
+    return length2 > 1e-20 && std::isfinite(length2) ? v / std::sqrt(length2) : fallback;
+}
+
 // Faster approximate normalization path using SSE on floats.
 // Converts to float, normalizes with SSE, converts back to double.
 inline vec3 unit_vector_fast(const vec3& v) {
@@ -183,4 +188,4 @@ inline vec3 reflect(const vec3& v, const vec3& n) {
 }
 
 // VEC3_H
-#endif 
+#endif

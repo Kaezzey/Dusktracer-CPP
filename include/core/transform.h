@@ -66,6 +66,7 @@ public:
         double inv_scale_x = 1.0 / scale_x;
         double inv_scale_y = 1.0 / scale_y;
         double inv_scale_z = 1.0 / scale_z;
+        area_determinant = std::abs(scale_x*scale_y*scale_z);
 
         // The raster `make_model_trs` constructs a column-major matrix where
         // the linear part is effectively (for element m_{row,col}):
@@ -132,32 +133,35 @@ public:
         // Point → world
         rec.p = apply(M, rec.p) + t;
 
-        // Frame → world
-            // Normals must be transformed by the inverse-transpose of the linear part
-            vec3 n_world = unit_vector(apply_transpose(M_inv, rec.normal));
-            // Tangent/bitangent (direction vectors) transform by the forward linear matrix
-            vec3 t_world = unit_vector(apply(M, rec.tangent));
-            vec3 b_world = unit_vector(apply(M, rec.bitangent));
-
-        rec.normal    = n_world;
-        rec.tangent   = t_world;
-        rec.bitangent = b_world;
-
-        rec.set_face_normal(r_in, rec.normal);
-
-        // Re-orthogonalise tangent frame
-        vec3 N = rec.normal;
-        rec.tangent = rec.tangent - dot(rec.tangent, N) * N;
-
-        if (rec.tangent.length_squared() < 1e-6) {
-            vec3 up = (fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-            rec.tangent = cross(up, N);
-        }
-
-        rec.tangent   = unit_vector(rec.tangent);
-        rec.bitangent = cross(N, rec.tangent);
+        // Preserve the original outward orientation. Re-facing an already
+        // face-forward normal incorrectly classifies every exit as an entry.
+        vec3 outward_n = rec.front_face ? rec.normal : -rec.normal;
+        vec3 outward_g = rec.front_face ? rec.geometry_normal() : -rec.geometry_normal();
+        vec3 t_world = apply(M,rec.tangent), b_world = apply(M,rec.bitangent);
+        rec.set_face_normal(r_in,safe_unit_vector(apply_transpose(M_inv,outward_g)));
+        rec.set_shading_normal(safe_unit_vector(apply_transpose(M_inv,outward_n)));
+        rec.set_tangent_frame(t_world,b_world);
 
         return true;
+    }
+
+    bool sample_surface(double u, double v, double time, hit_record& rec, double& pdf) const override {
+        if (!ptr->sample_surface(u,v,time,rec,pdf)) return false;
+        vec3 g = apply_transpose(M_inv,rec.geometry_normal());
+        double jacobian = area_determinant*g.length();
+        if (jacobian <= 0) return false;
+        rec.p = apply(M,rec.p)+t;
+        vec3 tangent = apply(M,rec.tangent), bitangent = apply(M,rec.bitangent);
+        rec.normal = safe_unit_vector(apply_transpose(M_inv,rec.normal));
+        rec.geometric_normal = safe_unit_vector(g); rec.set_tangent_frame(tangent,bitangent);
+        pdf /= jacobian; return true;
+    }
+    double surface_pdf(const hit_record& rec) const override {
+        hit_record local = rec;
+        local.p = apply(M_inv,rec.p-t);
+        local.geometric_normal = safe_unit_vector(apply_transpose(M,rec.geometry_normal()));
+        double jacobian = area_determinant*apply_transpose(M_inv,local.geometric_normal).length();
+        return jacobian > 0 ? ptr->surface_pdf(local)/jacobian : 0;
     }
 
     aabb bounding_box() const override {
@@ -167,6 +171,7 @@ public:
 private:
     std::shared_ptr<hittable> ptr;
     vec3 t;
+    double area_determinant = 1;
     double M[3][3];
     double M_inv[3][3];
     aabb bbox_world;

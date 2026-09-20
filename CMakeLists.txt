@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(dusktracer LANGUAGES CXX)
 
+option(DUSK_BUILD_GRAPH_TESTS "Build material graph evaluation and ImGui interaction tests" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -419,4 +421,35 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/external/embree/bin")
             "${CMAKE_SOURCE_DIR}/external/embree/bin"
             "$<TARGET_FILE_DIR:Dusktracer>"
     )
+endif()
+
+if (DUSK_BUILD_GRAPH_TESTS)
+    enable_testing()
+    add_executable(DuskPreviewWorkerTests tests/preview_worker_tests.cpp)
+    add_test(NAME preview_worker_scheduling COMMAND DuskPreviewWorkerTests)
+    add_executable(DuskGraphTests tests/material_graph_tests.cpp
+        src/core/material_graph.cpp src/core/scene.cpp src/core/dusk_image.cpp
+        src/core/interval.cpp src/core/aabb.cpp src/core/materials/sss.cpp)
+    target_include_directories(DuskGraphTests PRIVATE ${ASSIMP_INCLUDE_DIR})
+    target_link_libraries(DuskGraphTests PRIVATE ${ASSIMP_LIB_RELEASE})
+    add_test(NAME material_graph_evaluation COMMAND DuskGraphTests)
+
+    add_executable(DuskGraphEditorTests tests/material_graph_editor_tests.cpp
+        src/core/material_graph.cpp src/core/dusk_image.cpp src/core/interval.cpp src/core/undo.cpp)
+    target_link_libraries(DuskGraphEditorTests PRIVATE imgui ${GLFW_LIB_PATH} ${GLEW_LIB_PATH} OpenGL::GL)
+    add_test(NAME material_graph_interactions COMMAND DuskGraphEditorTests "${CMAKE_BINARY_DIR}/material-graph-preview.png")
+
+    add_executable(DuskGraphIntegrationTests tests/material_graph_integration_tests.cpp ${DUSK_SOURCES})
+    add_executable(DuskPbrTests tests/pbr_tests.cpp ${DUSK_SOURCES})
+    foreach(test_target DuskGraphIntegrationTests DuskPbrTests)
+        target_include_directories(${test_target} PRIVATE $<TARGET_PROPERTY:Dusktracer,INCLUDE_DIRECTORIES>)
+        target_compile_definitions(${test_target} PRIVATE $<TARGET_PROPERTY:Dusktracer,COMPILE_DEFINITIONS>)
+        target_link_libraries(${test_target} PRIVATE $<TARGET_PROPERTY:Dusktracer,LINK_LIBRARIES>)
+        if (TARGET ispc_kernels)
+            target_sources(${test_target} PRIVATE ${ISPC_OBJ})
+            add_dependencies(${test_target} ispc_kernels)
+        endif()
+    endforeach()
+    add_test(NAME pbr_transport_correctness COMMAND DuskPbrTests "${CMAKE_BINARY_DIR}/pbr-validation.png")
+    add_test(NAME material_graph_editor_integration COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/graph-integration")
 endif()

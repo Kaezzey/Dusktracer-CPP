@@ -4,6 +4,7 @@
 #include "../hittable.h"
 #include "texture.h"
 #include "sss.h"
+#include "pbr_bsdf.h"
 #include <cstdio>
 #include <limits>
 
@@ -38,28 +39,10 @@ inline vec3 schlick_fresnel(double cosTheta, const vec3& F0) {
     return F0 + (vec3(1.0,1.0,1.0) - F0) * pow5(x);
 }
 
-// Map perceptual roughness in [0,1] to GGX alpha
+// Perceptual roughness is shared by direct and indirect evaluation.
 inline double perceptual_to_alpha(double roughness) {
     roughness = clamp01(roughness);
-    roughness = roughness * roughness;  // square for a more perceptual curve
-    // No floor - allow roughness=1 to be truly diffuse (alpha=1.0)
-    // For numerical stability in division, we clamp in the GGX functions themselves if needed
-    return roughness;
-}
-
-// Sample GGX VNDF (approx) in local space (around +Z) – simple version
-inline vec3 sample_ggx_half_vector(double alpha, double xi1, double xi2) {
-    double a2 = alpha * alpha;
-
-    double cosTheta = sqrt((1.0 - xi2) / (1.0 + (a2 - 1.0) * xi2));
-    double sinTheta = sqrt(std::max(0.0, 1.0 - cosTheta * cosTheta));
-    double phi = 2.0 * pi * xi1;
-
-    double x = sinTheta * cos(phi);
-    double y = sinTheta * sin(phi);
-    double z = cosTheta;
-
-    return vec3(x, y, z); // local space
+    return roughness * roughness;
 }
 
 // Cosine-weighted hemisphere sampling around +Z
@@ -78,6 +61,14 @@ inline double luminance(const colour& c) {
     return clamp01(0.2126*c.x() + 0.7152*c.y() + 0.0722*c.z());
 }
 
+struct bsdf_sample {
+    ray scattered;
+    colour weight;
+    double pdf = 0;
+    bool delta = false;
+    bool passthrough = false;
+};
+
 class material {
   public:
     virtual ~material() = default;
@@ -91,6 +82,15 @@ class material {
         const ray& r_in, const hit_record& rec, colour& attenuation, ray& scattered
     ) const {
         return false;
+    }
+
+    // The integrator needs the event type as well as f*cos/pdf: delta and
+    // opacity-continuation events cannot be assigned a continuous BSDF PDF.
+    virtual bool sample_bsdf(const ray& incoming, const hit_record& rec, bsdf_sample& sample) const {
+        if (!scatter(incoming,rec,sample.weight,sample.scattered)) return false;
+        sample.delta = is_specular();
+        sample.pdf = sample.delta ? 0 : bsdf_pdf(rec,-unit_vector(incoming.direction()),sample.scattered.direction());
+        return true;
     }
 
     // By default materials are not purely specular. Override in materials
@@ -268,7 +268,7 @@ class dielectric : public material {
 
         // Reflections stay untinted. Refracted paths can carry stained-glass colour.
         attenuation = reflected ? colour(1.0, 1.0, 1.0)
-                                : tex->value(rec.u, rec.v, rec.p);
+                                : tex->value(rec.u, rec.v, rec.p) * (etai_over_etat*etai_over_etat);
 
         // normalize outgoing direction to avoid non-normalized rays later
         scattered = ray(origin, dir_norm, r_in.time());
@@ -278,53 +278,10 @@ class dielectric : public material {
     bool is_specular() const override { return true; }
     bool is_dielectric() const override { return true; }
 
-    // Direct shading for dielectrics: only add the reflective lobe.
-    // Refractive focusing / caustics are handled by the specular transport,
-    // photon map, and optional MNEE paths rather than a fake direct-light term.
-    colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& /*world*/, double vis = 1.0) const override {
-        vec3 N = rec.normal;
-        vec3 L = unit_vector(Ldir);
-        vec3 Vn = unit_vector(V);
-
-        double NdotL = std::max(0.0, dot(N, L));
-        double NdotV = std::max(0.0, dot(N, Vn));
-        if (NdotL <= 0.0 || NdotV <= 0.0) return colour(0,0,0);
-
-        vec3 Hsum = L + Vn;
-        if (Hsum.length_squared() <= 1e-12) return colour(0,0,0);
-        vec3 H = unit_vector(Hsum);
-        double NdotH = std::max(0.0001, dot(N, H));
-        double VdotH = std::max(0.0001, dot(Vn, H));
-
-        // Keep direct-light highlights sharp for clear glass while avoiding
-        // purely singular direct terms against analytic lights.
-        double rough = 0.02;
-        double alpha = rough * rough;
-
-        // GGX / Trowbridge-Reitz D term
-        double a2 = alpha * alpha;
-        double denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-        double D = (a2) / (pi * denom * denom + 1e-12);
-
-        double k = rough + 1.0;
-        k = (k * k) * 0.125;
-        auto geometry_schlick_ggx = [](double NdotX, double k_val) {
-            return NdotX / (NdotX * (1.0 - k_val) + k_val);
-        };
-        double G = geometry_schlick_ggx(NdotV, k) * geometry_schlick_ggx(NdotL, k);
-
-        // Fresnel using Schlick with F0 from IOR
-        double etai = 1.0;
-        double etat = refraction_index;
-        if (!rec.front_face) std::swap(etai, etat);
-        // compute F0
-        double r0 = (etai - etat) / (etai + etat);
-        r0 = r0 * r0;
-        colour F0((float)r0, (float)r0, (float)r0);
-        colour F = schlick_fresnel(std::max(0.0, VdotH), F0);
-        colour spec = F * (float)((D * G) / std::max(1e-6, 4.0 * NdotV * NdotL));
-        return spec * Li * (float)(NdotL * vis);
-    }
+    // A perfect dielectric is a delta BSDF. Analytic-light highlights require
+    // a rough dielectric model; inventing a finite GGX lobe double-counts energy.
+    colour shade_direct(const hit_record&, const vec3&, const vec3&, const colour&,
+                        const hittable&, double = 1) const override { return colour(0,0,0); }
 
     colour albedo(const hit_record& rec) const override {
         return colour(1.0, 1.0, 1.0);
@@ -334,23 +291,26 @@ class dielectric : public material {
     double refraction_index;
     shared_ptr<texture> tex;
 
-    // Fresnel (Schlick) using explicit incident/transmitted indices
+    // Exact unpolarized dielectric Fresnel, including total internal reflection.
     static double reflectance(double cosine, double etai, double etat) {
-        // compute F0 from indices
-        double r0 = (etai - etat) / (etai + etat);
-        r0 = r0 * r0;
-        double x = 1.0 - std::clamp(cosine, 0.0, 1.0);
-        return r0 + (1.0 - r0) * std::pow(x, 5.0);
+        cosine = std::clamp(cosine,0.0,1.0);
+        double sin2 = (etai/etat)*(etai/etat)*(1-cosine*cosine);
+        if (sin2 >= 1) return 1;
+        double transmitted = std::sqrt(1-sin2);
+        double parallel = (etat*cosine-etai*transmitted)/(etat*cosine+etai*transmitted);
+        double perpendicular = (etai*cosine-etat*transmitted)/(etai*cosine+etat*transmitted);
+        return .5*(parallel*parallel+perpendicular*perpendicular);
     }
+
 };
 
 class diffuse_light : public material {
   public:
-    diffuse_light(shared_ptr<texture> tex) : tex(tex) {}
+    diffuse_light(shared_ptr<texture> tex, double intensity = 1) : tex(tex), intensity(intensity) {}
     diffuse_light(const colour& emit) : tex(make_shared<solid_colour>(emit)) {}
 
     colour emitted(double u, double v, const point3& p) const override {
-        return tex->value(u, v, p);
+        return tex->value(u, v, p)*intensity;
     }
 
     colour albedo(const hit_record& rec) const override {
@@ -359,6 +319,7 @@ class diffuse_light : public material {
 
   private:
     shared_ptr<texture> tex;
+    double intensity = 1;
 };
 
 class isotropic : public material {
@@ -372,6 +333,10 @@ class isotropic : public material {
         attenuation = tex->value(rec.u, rec.v, rec.p);
         return true;
     }
+
+    double bsdf_pdf(const hit_record&, const vec3&, const vec3&) const override { return 1/(4*pi); }
+    colour shade_direct(const hit_record& rec, const vec3&, const vec3&, const colour& radiance,
+                        const hittable&, double vis = 1) const override { return albedo(rec)*radiance*(vis/(4*pi)); }
 
     colour albedo(const hit_record& rec) const override {
         return tex->value(rec.u, rec.v, rec.p);
@@ -496,7 +461,7 @@ public:
     }
 
     double specular_sampling_probability(const colour& F0, double metallic) const {
-        if (metallic >= 0.999) return 1.0;
+        if (metallic >= 1.0) return 1.0;
         double f0_peak = std::max(F0.x(), std::max(F0.y(), F0.z()));
         return std::clamp(f0_peak, 0.05, 0.98);
     }
@@ -563,379 +528,115 @@ public:
                         : colour(1,1,1);
     }
 
-    // Core scatter
-    virtual bool scatter(
-        const ray& r_in,
-        const hit_record& rec,
-        colour& attenuation,
-        ray& scattered
-    ) const override {
+  private:
+    struct surface {
+        colour base, f0;
+        vec3 n, geometry;
+        double metallic, alpha, specular_probability;
+        bool smooth;
+    };
+    surface prepare_surface(const hit_record& rec) const {
+        surface s; double rough;
+        sample_surface_params(rec,s.base,s.metallic,rough);
+        s.base = pbr::reflectance(s.base);
+        s.f0 = (1-s.metallic)*pbr::reflectance(dielectric_F0)+s.metallic*s.base;
+        s.alpha = perceptual_to_alpha(rough); s.smooth = s.alpha < 1e-4;
+        s.specular_probability = specular_sampling_probability(s.f0,s.metallic);
+        s.geometry = safe_unit_vector(rec.geometry_normal());
+        s.n = safe_unit_vector(rec.normal,s.geometry);
+        if (normal_tex) {
+            hit_record frame = rec; frame.normal = s.n; frame.set_tangent_frame(rec.tangent,rec.bitangent);
+            colour texel = normal_tex->value(rec.u,rec.v,rec.p);
+            vec3 tangent((2*texel.x()-1)*normal_strength,(2*texel.y()-1)*normal_strength,2*texel.z()-1);
+            vec3 mapped = safe_unit_vector(tangent.x()*frame.tangent+tangent.y()*frame.bitangent+tangent.z()*s.n,s.n);
+            if (dot(mapped,s.geometry) > 0) s.n = mapped;
+        }
+        return s;
+    }
+    static bool above_surface(const surface& s, const vec3& v, const vec3& l) {
+        return dot(s.geometry,v) > 0 && dot(s.geometry,l) > 0 && dot(s.n,v) > 0 && dot(s.n,l) > 0;
+    }
+    static colour evaluate_surface(const surface& s, const vec3& v, const vec3& l) {
+        if (!above_surface(s,v,l)) return colour(0,0,0);
+        double nv = std::clamp(dot(s.n,v),0.0,1.0), nl = std::clamp(dot(s.n,l),0.0,1.0);
+        // A diffuse substrate loses light on both entry and exit through its
+        // dielectric interface. Do not add a full Lambert lobe on top of GGX.
+        colour transmission_v = colour(1,1,1)-schlick_fresnel(nv,s.f0);
+        colour transmission_l = colour(1,1,1)-schlick_fresnel(nl,s.f0);
+        colour f = s.base*((1-s.metallic)/pi)*transmission_v*transmission_l;
+        if (!s.smooth) {
+            vec3 h = safe_unit_vector(v+l,s.n);
+            double d = pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha);
+            f += schlick_fresnel(dot(v,h),s.f0)*(d*pbr::visibility(nv,nl,s.alpha));
+        }
+        return f;
+    }
+    static double surface_pdf(const surface& s, const vec3& v, const vec3& l) {
+        if (!above_surface(s,v,l)) return 0;
+        double nv = dot(s.n,v), nl = dot(s.n,l);
+        double pdf = (1-s.specular_probability)*nl/pi;
+        if (!s.smooth) {
+            vec3 h = safe_unit_vector(v+l,s.n);
+            pdf += s.specular_probability*pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha)
+                *pbr::masking(nv,s.alpha)/(4*nv);
+        }
+        return pdf;
+    }
 
-        // Alpha mask: if present and indicates transparent, behave as if no hit.
-        // For triangle/Embree paths this is already checked at intersection time
-        // via is_masked_transparent(). For other primitives (quads/spheres) we
-        // need to continue the ray through the surface when masked instead of
-        // terminating the path. We implement that by spawning a continuation
-        // ray in the same direction and returning 'true' with neutral
-        // attenuation so the renderer treats it as a miss.
-        // Resolve alpha: prefer explicit alpha map, otherwise fall back to
-        // the base/albedo texture's alpha channel (if any).
-        auto resolve_alpha = [&](const hit_record& hrec) {
-            if (alpha_tex) return alpha_tex->mask_alpha_at(hrec.u, hrec.v, hrec.p);
-            if (base_tex) return base_tex->alpha_at(hrec.u, hrec.v, hrec.p);
-            return 1.0;
-        };
-
-        double a_res = resolve_alpha(rec);
-        if (alpha_double_sided || rec.front_face) {
-            // Fast-path fully transparent or opaque
-            if (a_res <= 0.0 || a_res < alpha_cutoff) {
-                scattered = ray(rec.p + r_in.direction() * 0.001, r_in.direction(), r_in.time());
-                attenuation = colour(1.0, 1.0, 1.0);
+  public:
+    // Exposed deterministic variates support reproducible sampler validation.
+    bool sample_surface(const ray& incoming, const hit_record& rec, double lobe, double u, double v, bsdf_sample& sample) const {
+        sample = {};
+        surface s = prepare_surface(rec);
+        vec3 view = safe_unit_vector(-incoming.direction());
+        if (dot(s.geometry,view) <= 0 || dot(s.n,view) <= 0) return false;
+        pbr::frame frame(s.n);
+        vec3 direction;
+        if (lobe < s.specular_probability) {
+            if (s.smooth) {
+                direction = reflect(-view,s.n);
+                if (!above_surface(s,view,direction)) return false;
+                sample.delta = true; sample.pdf = 0;
+                sample.weight = schlick_fresnel(dot(view,s.n),s.f0)/s.specular_probability;
+                sample.scattered = ray(rec.p,direction,incoming.time());
                 return true;
             }
-
-            if (a_res >= 1.0) {
-                // fully opaque, continue into regular scattering
-            } else {
-                // Stochastic alpha: treat the hit as opaque with probability a_res,
-                // otherwise continue the ray (transparent). This produces soft
-                // alpha edges when averaged across multiple samples.
-                if (random_double() > a_res) {
-                    scattered = ray(rec.p + r_in.direction() * 0.001, r_in.direction(), r_in.time());
-                    attenuation = colour(1.0, 1.0, 1.0);
-                    return true;
-                }
-            }
-        }
-
-        // ----------------
-        // Fetch parameters
-        // ----------------
-        colour baseColor(1,1,1);
-        double metallic = 0.0;
-        double rough = 0.5;
-        sample_surface_params(rec, baseColor, metallic, rough);
-
-        double alpha = perceptual_to_alpha(rough);
-
-        // Fresnel base reflectivity: mix between dielectric F0 and baseColornormal_strength_in
-        colour F0 = (vec3(1.0,1.0,1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0
-                    + vec3(metallic, metallic, metallic) * baseColor;
-
-        // ----------------
-        // Build world-space normal from normal map (if present)
-        // ----------------
-        vec3 Ngeom = rec.normal;
-        vec3 N = Ngeom;
-
-        // Use tangent & bitangent from hit_record as the ONB everywhere
-        vec3 T = rec.tangent;
-        vec3 B = rec.bitangent;
-
-        if (normal_tex) {
-            colour n_tex = normal_tex->value(rec.u, rec.v, rec.p);
-
-            // Decode tangent-space normal from [0,1] → [-1,1]
-            vec3 n_tan_raw(
-                2.0 * n_tex.x() - 1.0,
-                2.0 * n_tex.y() - 1.0,
-                2.0 * n_tex.z() - 1.0
-            );
-
-            // Apply intensity (only to X and Y)
-            vec3 n_tan(
-                n_tan_raw.x() * normal_strength,
-                n_tan_raw.y() * normal_strength,
-                n_tan_raw.z()
-            );
-
-            n_tan = unit_vector(n_tan);
-
-            // Transform into world space using T,B,Ngeom
-            N = unit_vector_fast(
-                n_tan.x() * T +
-                n_tan.y() * B +
-                n_tan.z() * Ngeom
-            );
-        }
-
-        // --- NEW FIX: GRAZING ANGLE DAMPING ---
-        // As the view angle gets shallower, we fade the normal map out.
-        // This prevents the "Impossible Reflection" paradox before it happens.
-        
-        vec3 view_dir = -unit_vector(r_in.direction());
-        
-        // Calculate how much we are facing the geometry (0.0 = edge, 1.0 = center)
-        double NdotV = std::max(0.0, dot(Ngeom, view_dir));
-        
-        // Fade factor: Start fading when within the last 20% of the edge.
-        // smoothstep helps make it look organic.
-        double strength = NdotV * 5.0; 
-        strength = std::clamp(strength, 0.0, 1.0);
-
-        // Blend the Bumpy Normal (N) into the Safe Geometry Normal (Ngeom)
-        N = unit_vector(N * strength + Ngeom * (1.0 - strength));
-
-        vec3 wo = -unit_vector(r_in.direction()); // view dir in world space
-
-        // ---------------
-        // Lobe selection
-        // ---------------
-        // Sampling probability should track specular energy, not arbitrarily zero out
-        // rough specular. Otherwise mixed metal/rough materials collapse toward diffuse.
-        double spec_prob = specular_sampling_probability(F0, metallic);
-
-        double xi_lobe = random_double();
-
-        vec3 wi;        // scattered direction
-        colour weight;  // BRDF-ish weight used as attenuation
-
-        if (xi_lobe < spec_prob) {
-            // 1. Generate GGX Sample
-            double xi1 = random_double();
-            double xi2 = random_double();
-            vec3 h_local = sample_ggx_half_vector(alpha, xi1, xi2);
-            vec3 h = unit_vector_fast(h_local.x() * T + h_local.y() * B + h_local.z() * N);
-
-            // 2. Calculate Reflection Direction
-            wi = reflect(-wo, h);
-
-            // --- HORIZON LIFTING FIX ---
-            
-            // Check: Is this ray pointing "underground" relative to the REAL geometry?
-            double dot_geom = dot(wi, rec.normal);
-            double geometry_shadowing = 1.0; // Default to keeping all light
-
-            if (dot_geom < 0.0) {
-                // 1. Always Lift the ray to avoid pitch-black artifacts
-                // Subtract the underground component so it skids along the surface
-                wi = wi - (dot_geom * rec.normal);
-                wi = unit_vector(wi);
-                
-                // 2. Penalize the energy based on Roughness
-                // The deeper the ray was pointing (dot_geom), the more we darken it.
-                // If Roughness is 0.0 (Mirror), we don't darken at all.
-                // If Roughness is 1.0 (Matte), we darken significantly.
-                
-                // This creates a "Soft Shadow" that removes the dark spots 
-                // but keeps the matte look at the bottom.
-                double lift_amount = -dot_geom; 
-                geometry_shadowing = 1.0 - (rough * lift_amount);
-                geometry_shadowing = std::clamp(geometry_shadowing, 0.0, 1.0);
-            }
-            // -------------------------------------------
-
-              // Safety Check (for the shading normal)
-              if (dot(wi, N) <= 0.0) {
-                  wi = reflect(-wo, N);
-                  if (dot(wi, N) <= 0.0) return false;
-              }
-
-            // Standard Fresnel & Weight
-            double cosTheta = std::max(0.0, dot(wi, N));
-            colour F = schlick_fresnel(std::max(0.0, dot(h, wo)), F0);
-            
-            weight = F * (1.0 / std::max(0.001, spec_prob));
-            
-            // 3. Apply the Soft Shadowing Factor
-            weight *= geometry_shadowing;
-        } else {
-            // --------------------------
-            // Diffuse (Lambertian) lobe
-            // --------------------------
-            double xi1 = random_double();
-            double xi2 = random_double();
-
-            vec3 d_local = sample_cosine_hemisphere(xi1, xi2);
-
-            wi = unit_vector(
-                  d_local.x() * T
-                + d_local.y() * B
-                + d_local.z() * N
-            );
-
-            // Default-lit real-time workflows use baseColor * (1 - metallic) for the
-            // diffuse lobe and leave Fresnel energy handling to the direct BRDF.
-            colour kd = baseColor * (1.0 - metallic);
-            weight = kd / std::max(0.05, 1.0 - spec_prob);
-        }
-
-        scattered   = ray(rec.p, wi, r_in.time());
-        attenuation = weight;
-
+            vec3 h = frame.world(pbr::visible_normal(frame.local(view),s.alpha,u,v));
+            direction = reflect(-view,h);
+        } else direction = frame.world(sample_cosine_hemisphere(u,v));
+        // Samples below the real surface are absorption events. Redirecting or
+        // retrying them would change the distribution without changing its PDF.
+        if (!above_surface(s,view,direction)) return false;
+        sample.pdf = surface_pdf(s,view,direction);
+        if (sample.pdf <= 0) return false;
+        sample.weight = evaluate_surface(s,view,direction)*(dot(s.n,direction)/sample.pdf);
+        sample.scattered = ray(rec.p,direction,incoming.time());
         return true;
     }
-
-    // Proper PBR direct shading using GGX microfacet BRDF (energy-conserving)
-    virtual colour shade_direct(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& world, double vis = 1.0) const override {
-        (void)world;
-        double a_ds = 1.0;
-        if (alpha_tex) a_ds = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
-        else if (base_tex) a_ds = base_tex->alpha_at(rec.u, rec.v, rec.p);
-        if (alpha_double_sided || rec.front_face) {
-            if (a_ds <= 0.0 || a_ds < alpha_cutoff) return colour(0,0,0);
-            a_ds = clamp01(a_ds);
-        } else {
-            a_ds = 1.0;
+    bool sample_bsdf(const ray& incoming, const hit_record& rec, bsdf_sample& sample) const override {
+        double opacity = opacity_at(rec);
+        if (opacity <= 0 || (opacity < 1 && random_double() >= opacity)) {
+            vec3 direction = safe_unit_vector(incoming.direction());
+            sample.scattered = ray(rec.p+direction*.001,direction,incoming.time());
+            sample.weight = colour(1,1,1); sample.delta = true; sample.passthrough = true;
+            return true;
         }
-        // Reconstruct the shading normal from the normal map (if present)
-        vec3 Ngeom = rec.normal;
-        vec3 N = Ngeom;
-
-        // Use tangent & bitangent from hit_record as the ONB
-        vec3 T = rec.tangent;
-        vec3 B = rec.bitangent;
-
-        if (normal_tex) {
-            colour n_tex = normal_tex->value(rec.u, rec.v, rec.p);
-            vec3 n_tan_raw(
-                2.0 * n_tex.x() - 1.0,
-                2.0 * n_tex.y() - 1.0,
-                2.0 * n_tex.z() - 1.0
-            );
-
-            vec3 n_tan(
-                n_tan_raw.x() * normal_strength,
-                n_tan_raw.y() * normal_strength,
-                n_tan_raw.z()
-            );
-
-            n_tan = unit_vector(n_tan);
-
-            N = unit_vector(
-                n_tan.x() * T +
-                n_tan.y() * B +
-                n_tan.z() * Ngeom
-            );
-        }
-
-        // Same normal-map fade used in scatter: fade normal map at grazing angles
-        vec3 view_dir = unit_vector(V);
-        double NdotV_geo = std::max(0.0, dot(Ngeom, view_dir));
-        double strength = NdotV_geo * 5.0;
-        strength = std::clamp(strength, 0.0, 1.0);
-        N = unit_vector_fast(N * strength + Ngeom * (1.0 - strength));
-        vec3 L = unit_vector(Ldir);
-        vec3 Vn = unit_vector(V);
-
-        double NdotL = std::max(0.0, dot(N, L));
-        double NdotV = std::max(0.0, dot(N, Vn));
-        if (NdotL <= 0.0 || NdotV <= 0.0) return colour(0,0,0);
-
-        // Fetch material parameters at this shading point
-        colour baseColor(1,1,1);
-        double metallic = 0.0;
-        double rough = 0.5;
-        sample_surface_params(rec, baseColor, metallic, rough);
-        double alpha = perceptual_to_alpha(rough);
-
-        // F0 mix between dielectric F0 and baseColor for metals
-        colour F0 = (vec3(1.0,1.0,1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0
-                    + vec3(metallic, metallic, metallic) * baseColor;
-
-        vec3 Hsum = L + Vn;
-        if (Hsum.length_squared() <= 1e-12) return colour(0,0,0);
-        vec3 H = unit_vector(Hsum);
-        double NdotH = std::max(1e-6, dot(N, H));
-        double VdotH = std::max(1e-6, dot(Vn, H));
-
-        // Microfacet D term (GGX)
-        double a2 = alpha * alpha;
-        double denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-        double D = (a2) / (pi * denom * denom + 1e-12);
-
-        // Analytic-light roughness remap used by common real-time GGX implementations.
-        double k = rough + 1.0;
-        k = (k * k) * 0.125;
-        auto geometry_schlick = [&](double NdotX) {
-            return NdotX / (NdotX * (1.0 - k) + k);
-        };
-        double G = geometry_schlick(NdotV) * geometry_schlick(NdotL);
-
-        // Fresnel
-        colour F = schlick_fresnel(std::max(0.0, VdotH), F0);
-
-        // Specular BRDF value
-        colour spec = F * (float)((D * G) / (4.0 * NdotV * NdotL + 1e-12));
-
-        // Default-lit PBR diffuse: baseColor for dielectrics, black for metals.
-        colour kd = baseColor * (1.0 - metallic);
-
-        colour brdf = kd * (float)(1.0 / pi) + spec;
-
-        // Final outgoing radiance: f * Li * cosθ
-        colour direct = brdf * Li * (float)NdotL;
-
-        // SSS is handled separately via `shade_sss()` to allow the renderer
-        // to compute the main BRDF using the fast ISPC path and then add
-        // the SSS contribution afterwards. See `shade_sss()` implementation
-        // below in pbr_material.
-
-        return direct * (float)(a_ds * vis);
+        return sample_surface(incoming,rec,random_double(),random_double(),random_double(),sample);
     }
-
-    virtual double bsdf_pdf(const hit_record& rec, const vec3& V, const vec3& Ldir) const override {
-        double a_ds = 1.0;
-        if (alpha_tex) a_ds = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
-        else if (base_tex) a_ds = base_tex->alpha_at(rec.u, rec.v, rec.p);
-        if ((alpha_double_sided || rec.front_face) && (a_ds <= 0.0 || a_ds < alpha_cutoff)) {
-            return 0.0;
-        }
-
-        vec3 Ngeom = rec.normal;
-        vec3 N = Ngeom;
-        vec3 T = rec.tangent;
-        vec3 B = rec.bitangent;
-
-        if (normal_tex) {
-            colour n_tex = normal_tex->value(rec.u, rec.v, rec.p);
-            vec3 n_tan(
-                (2.0 * n_tex.x() - 1.0) * normal_strength,
-                (2.0 * n_tex.y() - 1.0) * normal_strength,
-                2.0 * n_tex.z() - 1.0
-            );
-            n_tan = unit_vector(n_tan);
-            N = unit_vector_fast(
-                n_tan.x() * T +
-                n_tan.y() * B +
-                n_tan.z() * Ngeom
-            );
-        }
-
-        vec3 Vn = unit_vector(V);
-        double NdotV_geo = std::max(0.0, dot(Ngeom, Vn));
-        double strength = std::clamp(NdotV_geo * 5.0, 0.0, 1.0);
-        N = unit_vector_fast(N * strength + Ngeom * (1.0 - strength));
-        vec3 L = unit_vector(Ldir);
-
-        double NdotL = std::max(0.0, dot(N, L));
-        double NdotV = std::max(0.0, dot(N, Vn));
-        if (NdotL <= 0.0 || NdotV <= 0.0) return 0.0;
-
-        colour baseColor(1,1,1);
-        double metallic = 0.0;
-        double rough = 0.5;
-        sample_surface_params(rec, baseColor, metallic, rough);
-
-        colour F0 = (vec3(1.0,1.0,1.0) - vec3(metallic, metallic, metallic)) * dielectric_F0
-                    + vec3(metallic, metallic, metallic) * baseColor;
-        double spec_prob = specular_sampling_probability(F0, metallic);
-
-        double diffuse_pdf = NdotL / pi;
-        double alpha = perceptual_to_alpha(rough);
-        vec3 Hsum = L + Vn;
-        if (Hsum.length_squared() <= 1e-12) return diffuse_pdf;
-
-        vec3 H = unit_vector(Hsum);
-        double NdotH = std::max(1e-6, dot(N, H));
-        double VdotH = std::max(1e-6, dot(Vn, H));
-        double a2 = alpha * alpha;
-        double denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-        double D = a2 / (pi * denom * denom + 1e-12);
-        double spec_pdf = (D * NdotH) / std::max(1e-6, 4.0 * VdotH);
-
-        return (1.0 - spec_prob) * diffuse_pdf + spec_prob * spec_pdf;
+    bool scatter(const ray& incoming, const hit_record& rec, colour& attenuation, ray& scattered) const override {
+        bsdf_sample sample;
+        if (!sample_bsdf(incoming,rec,sample)) return false;
+        attenuation = sample.weight; scattered = sample.scattered; return true;
+    }
+    colour shade_direct(const hit_record& rec, const vec3& view, const vec3& light, const colour& radiance,
+                        const hittable&, double visibility = 1) const override {
+        if (opacity_at(rec) <= 0) return colour(0,0,0);
+        auto s = prepare_surface(rec); vec3 v = safe_unit_vector(view), l = safe_unit_vector(light);
+        return evaluate_surface(s,v,l)*radiance*(std::max(0.0,dot(s.n,l))*visibility);
+    }
+    double bsdf_pdf(const hit_record& rec, const vec3& view, const vec3& light) const override {
+        if (opacity_at(rec) <= 0) return 0;
+        return surface_pdf(prepare_surface(rec),safe_unit_vector(view),safe_unit_vector(light));
     }
 
     // pbr_material: SSS-only shading hook (called by renderer after BRDF)
@@ -961,7 +662,7 @@ public:
         sample_surface_params(rec, baseColor_dummy, metallic, rough_dummy);
 
         double strength = sss_strength * (1.0 - metallic);
-        strength *= clamp01(alpha_sss) * vis;
+        strength *= vis; // Opacity is sampled once by the integrator.
         if (strength <= 0.0) return colour(0,0,0);
 
         auto transmission_tint = [&](double optical_depth, const colour& channel_bias) {
@@ -1065,28 +766,16 @@ public:
         return trans_color * Li * (float)(strength * scatter_term);
     }
 
-        // Mask test for triangle-level discard
-        virtual bool is_masked_transparent(const hit_record& rec) const override {
-            double a = 1.0;
-            if (alpha_tex) a = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
-            else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
-            if (alpha_double_sided || rec.front_face) {
-                // Fast discard when clearly below cutoff or fully transparent.
-                if (a <= 0.0 || a < alpha_cutoff) return true;
-                // Stochastic discard: treat as miss with probability (1-a).
-                if (a < 1.0 && random_double() > a) return true;
-            }
-            return false;
-        }
-
-        // Deterministic opacity query used for visibility/shadow calculations.
-        virtual double opacity_at(const hit_record& rec) const override {
-                double a = 1.0;
-                if (alpha_tex) a = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
-                else if (base_tex) a = base_tex->alpha_at(rec.u, rec.v, rec.p);
-                return clamp01(a);
-        }
+    bool is_masked_transparent(const hit_record& rec) const override {
+        double opacity = opacity_at(rec);
+        return opacity <= 0 || (opacity < 1 && random_double() >= opacity);
+    }
+    double opacity_at(const hit_record& rec) const override {
+        if (!alpha_double_sided && !rec.front_face) return 1;
+        double a = alpha_tex ? alpha_tex->mask_alpha_at(rec.u,rec.v,rec.p)
+            : base_tex ? base_tex->alpha_at(rec.u,rec.v,rec.p) : 1;
+        return a < alpha_cutoff ? 0 : clamp01(a);
+    }
 };
-
 
 #endif // MATERIAL_H

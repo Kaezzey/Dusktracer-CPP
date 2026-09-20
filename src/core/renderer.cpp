@@ -636,11 +636,6 @@ render_result renderer::render(
 
             int n = 0;
 
-            // Keep a running mean luminance for simple outlier scaling (fireflies)
-            double running_mean_lum = 0.0;
-            const double MAX_SAMPLE_LUM = 1e4; // absolute clamp for sample luminance
-            const double OUTLIER_FACTOR = 10.0; // allow samples up to this * running_mean
-
             // Convenience aliases for adaptive settings
             bool adaptive = this->adaptive_sampling;
             int min_samples = this->adaptive_min_samples;
@@ -651,8 +646,6 @@ render_result renderer::render(
             // Per-sample sanitizer helper (moved outside the tight loop)
             auto samp_sanitize = [](double v) -> double {
                 if (!std::isfinite(v) || v <= 0.0) return 0.0;
-                const double MAX_SAMPLE = 1e6; // cap per-component sample value
-                if (v > MAX_SAMPLE) v = MAX_SAMPLE;
                 return v;
             };
 
@@ -680,24 +673,8 @@ render_result renderer::render(
                 double sg = samp_sanitize(samp.y());
                 double sb = samp_sanitize(samp.z());
 
-                // Sample luminance
-                double lum = 0.2126*sr + 0.7152*sg + 0.0722*sb;
-
-                // Determine adaptive threshold: max(absolute, factor * running_mean)
-                double adaptive_thresh = MAX_SAMPLE_LUM;
-                if (n > 0) {
-                    adaptive_thresh = std::max(MAX_SAMPLE_LUM, OUTLIER_FACTOR * running_mean_lum);
-                }
-
-                // If this sample is an outlier, scale it down to threshold while preserving colour ratios
-                if (lum > 0.0 && lum > adaptive_thresh) {
-                    double scale_out = adaptive_thresh / lum;
-                    sr *= scale_out; sg *= scale_out; sb *= scale_out;
-                    lum *= scale_out;
-                }
-
-                // Update running mean luminance (simple incremental mean)
-                running_mean_lum = (running_mean_lum * n + lum) / (n + 1);
+                // Preserve finite HDR samples. Clipping rare bright paths biases
+                // GGX highlights and makes lighting depend on sample ordering.
 
                 // Welford update for each channel (radiance)
                 ++n;
@@ -783,8 +760,6 @@ render_result renderer::render(
             // Sanitize components to avoid NaN/Inf and extremely large values
             auto sanitize = [](double v) -> double {
                 if (!std::isfinite(v) || v <= 0.0) return 0.0;
-                const double MAX_LINEAR = 1e6;
-                if (v > MAX_LINEAR) v = MAX_LINEAR;
                 return v;
             };
 
