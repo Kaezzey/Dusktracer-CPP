@@ -1,0 +1,792 @@
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 8, local_size_y = 8) in;
+const float PI = 3.14159265358979323846;
+// Keep these values aligned with graph_kind and scene_material_model.
+const int NODE_OUTPUT = 0;
+const int NODE_TEXTURE = 1;
+const int NODE_SCALAR = 2;
+const int NODE_VECTOR = 3;
+const int NODE_TEXCOORD = 4;
+const int NODE_ADD = 5;
+const int NODE_SUBTRACT = 6;
+const int NODE_MULTIPLY = 7;
+const int NODE_DIVIDE = 8;
+const int NODE_LERP = 9;
+const int NODE_ONE_MINUS = 10;
+const int NODE_SATURATE = 11;
+const int NODE_POWER = 12;
+const int NODE_REROUTE = 13;
+const int MODEL_LAMBERT = 0;
+const int MODEL_METAL = 1;
+const int MODEL_GLASS = 2;
+const int MODEL_EMISSION = 3;
+const int MODEL_ISOTROPIC = 4;
+const int MODEL_PBR = 5;
+
+struct Vertex {
+    vec4 position, normal, tangent, bitangent, uv;
+};
+struct Instance {
+    vec4 rows[3];
+    ivec4 data;
+};
+struct Material {
+    vec4 base, parameters, f0, emission, alpha;
+    ivec4 programs[5];
+};
+struct Instruction {
+    ivec4 code, inputs, channels;
+    vec4 value, defaults;
+};
+struct AreaLight {
+    ivec4 data;
+    vec4 distribution;
+};
+struct Pixel {
+    vec4 sum, albedo, normal, variance;
+};
+struct PointLight {
+    vec4 position, radiance;
+};
+layout(binding = 0) uniform accelerationStructureEXT world;
+layout(std430, binding = 1) readonly buffer Geometries {
+    ivec4 geometries[];
+};
+layout(std430, binding = 2) readonly buffer Vertices {
+    Vertex vertices[];
+};
+layout(std430, binding = 3) readonly buffer Instances {
+    Instance instances[];
+};
+layout(std430, binding = 4) readonly buffer MaterialMaps {
+    uint materialMaps[];
+};
+layout(std430, binding = 5) readonly buffer Materials {
+    Material materials[];
+};
+layout(std430, binding = 6) readonly buffer Instructions {
+    Instruction instructions[];
+};
+layout(std430, binding = 7) readonly buffer Textures {
+    ivec4 textures[];
+};
+layout(std430, binding = 8) readonly buffer Texels {
+    uint texels[];
+};
+layout(std430, binding = 9) buffer Pixels {
+    uint convergedCount; // Pixel array begins at its 16-byte alignment.
+    Pixel pixels[];
+};
+layout(std430, binding = 10) readonly buffer Configuration {
+    vec4 origin, pixel00, deltaU, deltaV, defocusU, defocusV;
+    vec4 background, sunDirection, sunRadiance, adaptive;
+    ivec4 image, counts, options;
+}
+cfg;
+layout(std430, binding = 11) readonly buffer Points {
+    PointLight pointLights[];
+};
+layout(std430, binding = 12) readonly buffer Areas {
+    AreaLight areaLights[];
+};
+layout(std430, binding = 13) readonly buffer Slots {
+    uint slots[];
+};
+layout(push_constant) uniform Dispatch {
+    uint sampleIndex, offsetX, offsetY, sampleCount;
+}
+dispatch;
+
+uint rng;
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+float random() {
+    rng = hash(rng + 0x9e3779b9u);
+    return float(rng >> 8) * (1.0 / 16777216.0);
+}
+vec3 safeNormal(vec3 v, vec3 fallback) {
+    float l = dot(v, v);
+    return l > 1e-20 && !isinf(l) && !isnan(l) ? v * inversesqrt(l) : fallback;
+}
+mat3 frame(vec3 n) {
+    vec3 t = normalize(cross(abs(n.z) < .999 ? vec3(0, 0, 1) : vec3(0, 1, 0), n));
+    return mat3(t, cross(n, t), n);
+}
+vec3 uniformSphere() {
+    float z = 1 - 2 * random(), p = 2 * PI * random(), r = sqrt(max(0, 1 - z * z));
+    return vec3(r * cos(p), r * sin(p), z);
+}
+vec3 cosineHemisphere() {
+    float r = sqrt(random()), p = 2 * PI * random();
+    return vec3(r * cos(p), r * sin(p), sqrt(max(0, 1 - r * r)));
+}
+float luminance(vec3 c) {
+    return dot(c, vec3(.2126, .7152, .0722));
+}
+vec3 finiteColour(vec3 c) {
+    for (int k = 0; k < 3; ++k) {
+        if (isnan(c[k]) || isinf(c[k])) {
+            c[k] = 0;
+        }
+    }
+    return c;
+}
+vec3 srgb(vec3 c) {
+    c = clamp(c, 0, 1);
+    return mix(pow((c + .055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(.04045)));
+}
+
+// Two registers preserve both color-space RGB and raw channel values, plus
+// independent alpha and explicit-mask outputs, exactly as the CPU graph does.
+struct Value {
+    vec4 colour, raw;
+};
+Value scalarValue(float x) {
+    return Value(vec4(vec3(x), 1), vec4(vec3(x), x));
+}
+Value channelValue(Value v, int c) {
+    if (c == 0) {
+        return v;
+    }
+    return scalarValue(c <= 3 ? v.raw[c - 1] : c == 4 ? v.colour.a : v.raw.a);
+}
+Value textureValue(int id, vec2 uv, int flags) {
+    if (id < 0) {
+        return Value(vec4(1, 0, 1, 1), vec4(1, 0, 1, 1));
+    }
+    ivec4 info = textures[id];
+    int ch = info.w & 255;
+    bool hdr = (info.w & 256) != 0;
+    ivec2 p = min(ivec2(clamp(vec2(uv.x, 1 - uv.y), 0, 1) * vec2(info.yz)), info.yz - 1);
+    uint index = uint(info.x + (p.y * info.y + p.x) * (hdr ? 4 : 1));
+    vec4 texel;
+    if (hdr) {
+        texel =
+            uintBitsToFloat(uvec4(texels[index], texels[index + 1], texels[index + 2], texels[index + 3]));
+    } else {
+        texel = unpackUnorm4x8(texels[index]);
+    }
+    float alpha = clamp(ch == 1 ? texel.r : (ch == 2 || ch == 4) ? texel.a : 1, 0, 1);
+    float mask = clamp(ch == 3 ? luminance(texel.rgb) : alpha, 0, 1);
+    vec3 color = ((flags & 1) != 0 && !hdr) ? srgb(texel.rgb) : texel.rgb;
+    vec3 raw = (flags & 2) != 0 ? color : texel.rgb;
+    return Value(vec4(color, alpha), vec4(raw, mask));
+}
+Value evaluate(ivec4 program, vec2 uv) {
+    Value registers[32];
+    for (int pc = 0; pc < program.y; ++pc) {
+        Instruction op = instructions[program.x + pc];
+        Value a = op.inputs.x < 0 ? scalarValue(op.defaults.x)
+                                  : channelValue(registers[op.inputs.x], op.channels.x);
+        Value b = op.inputs.y < 0 ? scalarValue(op.defaults.y)
+                                  : channelValue(registers[op.inputs.y], op.channels.y);
+        Value c = op.inputs.z < 0 ? scalarValue(op.defaults.z)
+                                  : channelValue(registers[op.inputs.z], op.channels.z);
+        Value result = scalarValue(0);
+        int kind = op.code.x;
+        if (kind == NODE_TEXTURE) {
+            result = textureValue(op.code.z, op.inputs.x < 0 ? uv : fract(a.colour.xy), op.code.w);
+        } else {
+            if (kind == NODE_SCALAR) {
+                result.colour.rgb = vec3(op.value.x);
+            } else if (kind == NODE_VECTOR) {
+                result.colour.rgb = op.value.xyz;
+            } else if (kind == NODE_TEXCOORD) {
+                result.colour.rgb = vec3(uv * op.value.xy, 0);
+            } else {
+                vec3 av = a.colour.rgb, bv = b.colour.rgb, t = c.colour.rgb, r = av;
+                if (kind == NODE_ADD) {
+                    r = av + bv;
+                } else if (kind == NODE_SUBTRACT) {
+                    r = av - bv;
+                } else if (kind == NODE_MULTIPLY) {
+                    r = av * bv;
+                } else if (kind == NODE_DIVIDE) {
+                    for (int k = 0; k < 3; ++k) {
+                        r[k] = abs(bv[k]) < 1e-8 ? 0 : av[k] / bv[k];
+                    }
+                } else if (kind == NODE_LERP) {
+                    r = mix(av, bv, t);
+                } else if (kind == NODE_ONE_MINUS) {
+                    r = 1 - av;
+                } else if (kind == NODE_SATURATE) {
+                    r = clamp(av, 0, 1);
+                } else if (kind == NODE_POWER) {
+                    for (int k = 0; k < 3; ++k) {
+                        r[k] = bv[k] == 0 ? 1 : pow(max(0, av[k]), bv[k]);
+                    }
+                }
+                result.colour = vec4(finiteColour(r), a.colour.a);
+                if (kind == NODE_MULTIPLY) {
+                    result.colour.a *= b.colour.a;
+                }
+                if (kind == NODE_LERP) {
+                    result.colour.a = mix(a.colour.a, b.colour.a, c.colour.r);
+                }
+            }
+            result.raw = vec4(result.colour.rgb, result.colour.r);
+        }
+        registers[op.code.y] = result;
+    }
+    return channelValue(registers[program.z], program.w);
+}
+
+vec3 transformVector(Instance inst, vec3 p) {
+    return vec3(dot(inst.rows[0].xyz, p), dot(inst.rows[1].xyz, p), dot(inst.rows[2].xyz, p));
+}
+vec3 transformPoint(Instance inst, vec3 p) {
+    return transformVector(inst, p) + vec3(inst.rows[0].w, inst.rows[1].w, inst.rows[2].w);
+}
+mat3 instanceMatrix(Instance inst) {
+    return transpose(mat3(inst.rows[0].xyz, inst.rows[1].xyz, inst.rows[2].xyz));
+}
+struct Hit {
+    vec3 p, n, g, t, b;
+    vec2 uv;
+    float distance;
+    int material, instance, primitive;
+    bool front;
+};
+Hit surfaceHit(int instanceId, int primitiveId, vec3 localPosition, vec2 bary, vec3 rayDirection) {
+    Hit h;
+    Instance inst = instances[instanceId];
+    ivec4 geom = geometries[inst.data.x];
+    vec3 ng, ns, t, b, p;
+    vec2 uv;
+    if (geom.w != 0) {
+        p = localPosition;
+        ng = safeNormal(p, vec3(0, 1, 0));
+        ns = ng;
+        uv = vec2((atan(-ng.z, ng.x) + PI) / (2 * PI), acos(clamp(-ng.y, -1, 1)) / PI);
+        // The CPU's sphere frame flips its increasing-u tangent on back faces.
+        vec3 faced = dot(transformVector(inst, ng), rayDirection) < 0 ? ng : -ng;
+        t = safeNormal(
+            vec3(faced.z, 0, -faced.x),
+            safeNormal(cross(abs(faced.y) < .999 ? vec3(0, 1, 0) : vec3(1, 0, 0), faced), vec3(1, 0, 0)));
+        b = cross(faced, t);
+        h.material = int(materialMaps[inst.data.y]);
+    } else {
+        int start = geom.x + primitiveId * 3;
+        Vertex a = vertices[start], v = vertices[start + 1], c = vertices[start + 2];
+        vec3 w = vec3(1 - bary.x - bary.y, bary.x, bary.y);
+        p = a.position.xyz * w.x + v.position.xyz * w.y + c.position.xyz * w.z;
+        ng = safeNormal(cross(v.position.xyz - a.position.xyz, c.position.xyz - a.position.xyz),
+                        vec3(0, 1, 0));
+        ns = safeNormal(a.normal.xyz * w.x + v.normal.xyz * w.y + c.normal.xyz * w.z, ng);
+        t = a.tangent.xyz * w.x + v.tangent.xyz * w.y + c.tangent.xyz * w.z;
+        b = a.bitangent.xyz * w.x + v.bitangent.xyz * w.y + c.bitangent.xyz * w.z;
+        uv = a.uv.xy * w.x + v.uv.xy * w.y + c.uv.xy * w.z;
+        h.material = int(materialMaps[inst.data.y + int(slots[geom.y + primitiveId])]);
+    }
+    mat3 normalMatrix = transpose(inverse(instanceMatrix(inst)));
+    vec3 worldGeometry = normalize(normalMatrix * ng);
+    h.front = dot(rayDirection, worldGeometry) < 0;
+    vec3 localNormal = h.front ? ns : -ns;
+    vec3 localGeometry = h.front ? ng : -ng;
+    if (dot(localNormal, localGeometry) < 0) {
+        localNormal = -localNormal;
+    }
+    // Match the CPU's two-stage frame construction. Orthogonalizing only after
+    // a nonuniform instance transform changes the direction of skewed tangents.
+    vec3 localTangent = safeNormal(t - dot(t, localNormal) * localNormal, frame(localNormal)[0]);
+    vec3 localBitangent = cross(localNormal, localTangent);
+    if (dot(localBitangent, b) < 0) {
+        localBitangent = -localBitangent;
+    }
+    h.g = h.front ? worldGeometry : -worldGeometry;
+    h.n = safeNormal(normalMatrix * localNormal, h.g);
+    if (dot(h.n, h.g) < 0) {
+        h.n = -h.n;
+    }
+    t = transformVector(inst, localTangent);
+    b = transformVector(inst, localBitangent);
+    h.t = safeNormal(t - dot(t, h.n) * h.n, frame(h.n)[0]);
+    h.b = cross(h.n, h.t);
+    if (dot(h.b, b) < 0) {
+        h.b = -h.b;
+    }
+    h.p = transformPoint(inst, p);
+    h.uv = uv;
+    h.instance = instanceId;
+    h.primitive = primitiveId;
+    h.distance = 0;
+    return h;
+}
+bool traceRange(vec3 origin, vec3 direction, float minT, float maxT, out Hit hit) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, world, gl_RayFlagsOpaqueEXT, 255, origin, minT, direction, maxT);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) == gl_RayQueryCandidateIntersectionAABBEXT) {
+            vec3 o = rayQueryGetIntersectionObjectRayOriginEXT(query, false);
+            vec3 d = rayQueryGetIntersectionObjectRayDirectionEXT(query, false);
+            float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1, discriminant = b * b - a * c;
+            if (discriminant >= 0) {
+                float t = (-b - sqrt(discriminant)) / a;
+                if (t <= minT) {
+                    t = (-b + sqrt(discriminant)) / a;
+                }
+                if (t > minT && t < maxT) {
+                    rayQueryGenerateIntersectionEXT(query, t);
+                }
+            }
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+    int id = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+    int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    float t = rayQueryGetIntersectionTEXT(query, true);
+    vec3 p = rayQueryGetIntersectionObjectRayOriginEXT(query, true) +
+             t * rayQueryGetIntersectionObjectRayDirectionEXT(query, true);
+    vec2 bary = geometries[instances[id].data.x].w != 0 ? vec2(0)
+                                                        : rayQueryGetIntersectionBarycentricsEXT(query, true);
+    hit = surfaceHit(id, primitive, p, bary, direction);
+    hit.p = origin + t * direction;
+    hit.distance = t;
+    return true;
+}
+bool trace(vec3 origin, vec3 direction, float maxT, out Hit hit) {
+    return traceRange(origin, direction, .001, maxT, hit);
+}
+float opacity(Hit hit) {
+    Material m = materials[hit.material];
+    if (int(m.base.w) != MODEL_PBR || (m.alpha.y == 0 && !hit.front)) {
+        return 1;
+    }
+    float a = m.programs[4].y > 0   ? evaluate(m.programs[4], hit.uv).colour.r
+              : m.programs[0].y > 0 ? evaluate(m.programs[0], hit.uv).colour.a
+                                    : 1;
+    a = clamp(a, 0, 1);
+    return a < m.alpha.x ? 0 : a;
+}
+float visibility(vec3 origin, vec3 direction, float maxT) {
+    float value = 1;
+    float minT = .001;
+    Hit hit;
+    for (int i = 0; i < 1024; ++i) {
+        if (maxT <= minT || !traceRange(origin, direction, minT, maxT, hit)) {
+            return value;
+        }
+        value *= 1 - opacity(hit);
+        if (value <= 1e-6) {
+            return 0;
+        }
+        minT = hit.distance + .001;
+    }
+    return 0;
+}
+
+struct Surface {
+    vec3 base, f0, n, g;
+    float metal, alpha, q;
+    bool deltaSurface;
+    int model;
+};
+Surface prepare(Hit h) {
+    Material m = materials[h.material];
+    Surface s;
+    s.base = m.programs[0].y > 0 ? evaluate(m.programs[0], h.uv).colour.rgb : m.base.rgb;
+    s.metal = m.programs[1].y > 0 ? evaluate(m.programs[1], h.uv).colour.r : m.parameters.x;
+    float rough = m.programs[2].y > 0 ? evaluate(m.programs[2], h.uv).colour.r : m.parameters.y;
+    s.model = int(m.base.w);
+    s.metal = clamp(s.metal, 0, 1);
+    rough = clamp(rough, 0, 1);
+    if (s.model == MODEL_PBR) {
+        s.base = clamp(finiteColour(s.base), 0, 1);
+    }
+    s.f0 = mix(clamp(m.f0.rgb, 0, 1), s.base, s.metal);
+    s.alpha = rough * rough;
+    s.deltaSurface = s.alpha < 1e-4;
+    s.q = s.metal >= 1 ? 1 : clamp(max(s.f0.x, max(s.f0.y, s.f0.z)), .05, .98);
+    s.n = h.n;
+    s.g = h.g;
+    if (s.model == MODEL_PBR && m.programs[3].y > 0) {
+        vec3 texel = 2 * evaluate(m.programs[3], h.uv).colour.rgb - 1;
+        texel.xy *= m.parameters.z;
+        vec3 mapped = safeNormal(texel.x * h.t + texel.y * h.b + texel.z * h.n, h.n);
+        if (dot(mapped, h.g) > 0) {
+            s.n = mapped;
+        }
+    }
+    return s;
+}
+float D(float nh, float a) {
+    float a2 = a * a, d = (1 - nh * nh) + a2 * nh * nh;
+    return nh > 0 ? a2 / (PI * d * d) : 0;
+}
+float smithRoot(float c, float a) {
+    return sqrt(a * a + (1 - a * a) * c * c);
+}
+float G1(float c, float a) {
+    return c > 0 ? 2 * c / (c + smithRoot(c, a)) : 0;
+}
+vec3 fresnel(float c, vec3 f0) {
+    float x = 1 - clamp(c, 0, 1), x2 = x * x;
+    return f0 + (1 - f0) * x2 * x2 * x;
+}
+bool above(Surface s, vec3 v, vec3 l) {
+    return dot(s.g, v) > 0 && dot(s.g, l) > 0 && dot(s.n, v) > 0 && dot(s.n, l) > 0;
+}
+vec3 directBSDF(Surface s, vec3 v, vec3 l) {
+    if (s.model == MODEL_ISOTROPIC) {
+        return s.base / (4 * PI);
+    }
+    float nl = max(0, dot(s.n, l));
+    if (s.model == MODEL_LAMBERT) {
+        return s.base * nl / PI;
+    }
+    if (s.model != MODEL_PBR || !above(s, v, l)) {
+        return vec3(0);
+    }
+    float nv = clamp(dot(s.n, v), 0, 1);
+    nl = clamp(nl, 0, 1);
+    vec3 f = s.base * ((1 - s.metal) / PI) * (1 - fresnel(nv, s.f0)) * (1 - fresnel(nl, s.f0));
+    if (!s.deltaSurface) {
+        vec3 h = safeNormal(v + l, s.n);
+        float vis = .5 / (nl * smithRoot(nv, s.alpha) + nv * smithRoot(nl, s.alpha));
+        f += fresnel(dot(v, h), s.f0) * D(clamp(dot(s.n, h), 0, 1), s.alpha) * vis;
+    }
+    return f * nl;
+}
+float bsdfPDF(Surface s, vec3 v, vec3 l) {
+    if (s.model == MODEL_ISOTROPIC) {
+        return 1 / (4 * PI);
+    }
+    if (s.model == MODEL_LAMBERT) {
+        return max(0, dot(s.n, l)) / PI;
+    }
+    if (s.model != MODEL_PBR || !above(s, v, l)) {
+        return 0;
+    }
+    float nv = dot(s.n, v), nl = dot(s.n, l), pdf = (1 - s.q) * nl / PI;
+    if (!s.deltaSurface) {
+        pdf += s.q * D(clamp(dot(s.n, safeNormal(v + l, s.n)), 0, 1), s.alpha) * G1(nv, s.alpha) / (4 * nv);
+    }
+    return pdf;
+}
+vec3 visibleNormal(vec3 v, float a) {
+    vec3 stretched = normalize(vec3(a * v.xy, v.z));
+    vec3 t = safeNormal(vec3(-stretched.y, stretched.x, 0), vec3(1, 0, 0)), b = cross(stretched, t);
+    float r = sqrt(random()), phi = 2 * PI * random(), x = r * cos(phi), y = r * sin(phi),
+          s = .5 * (1 + stretched.z);
+    y = (1 - s) * sqrt(max(0, 1 - x * x)) + s * y;
+    vec3 n = x * t + y * b + sqrt(max(0, 1 - x * x - y * y)) * stretched;
+    return normalize(vec3(a * n.xy, max(0, n.z)));
+}
+bool scatter(Surface s, Hit hit, vec3 view, out vec3 direction, out vec3 weight, out float pdf,
+             out bool delta) {
+    Material m = materials[hit.material];
+    delta = false;
+    pdf = 0;
+    weight = vec3(0);
+    if (s.model == MODEL_EMISSION) {
+        return false;
+    }
+    if (s.model == MODEL_GLASS) {
+        float eta = hit.front ? 1 / m.parameters.w : m.parameters.w;
+        float c = clamp(dot(view, hit.n), 0, 1), sin2 = eta * eta * (1 - c * c);
+        float ct = sqrt(max(0, 1 - sin2));
+        float rp = (c - eta * ct) / (c + eta * ct), rs = (eta * c - ct) / (eta * c + ct),
+              f = .5 * (rp * rp + rs * rs);
+        bool reflected = sin2 >= 1 || random() < f;
+        direction = reflected ? reflect(-view, hit.n) : refract(-view, hit.n, eta);
+        weight = reflected ? vec3(1) : s.base * eta * eta;
+        delta = true;
+        return true;
+    }
+    if (s.model == MODEL_METAL) {
+        direction = safeNormal(reflect(-view, hit.n) + min(m.f0.w, 1) * uniformSphere(), hit.n);
+        weight = s.base;
+        delta = true;
+        return dot(direction, hit.n) > 0;
+    }
+    if (s.model == MODEL_ISOTROPIC) {
+        direction = uniformSphere();
+        weight = s.base;
+        pdf = 1 / (4 * PI);
+        return true;
+    }
+    if (s.model == MODEL_LAMBERT) {
+        direction = frame(s.n) * cosineHemisphere();
+        weight = s.base;
+        pdf = max(0, dot(s.n, direction)) / PI;
+        return true;
+    }
+    if (dot(s.g, view) <= 0 || dot(s.n, view) <= 0) {
+        return false;
+    }
+    mat3 basis = frame(s.n);
+    if (random() < s.q) {
+        if (s.deltaSurface) {
+            direction = reflect(-view, s.n);
+            weight = fresnel(dot(view, s.n), s.f0) / s.q;
+            delta = true;
+            return above(s, view, direction);
+        }
+        direction = reflect(-view, basis * visibleNormal(transpose(basis) * view, s.alpha));
+    } else {
+        direction = basis * cosineHemisphere();
+    }
+    pdf = bsdfPDF(s, view, direction);
+    if (pdf <= 0) {
+        return false;
+    }
+    weight = directBSDF(s, view, direction) / pdf;
+    return true;
+}
+float powerWeight(float a, float b) {
+    if (a <= 0) {
+        return 0;
+    }
+    float r = b / a;
+    return 1 / (1 + r * r);
+}
+float hitWeight(float previousPDF, float lightPDF, int samples, bool delta) {
+    if (delta || samples == 0 || lightPDF <= 0) {
+        return 1;
+    }
+    return cfg.options.x != 0 ? powerWeight(previousPDF, samples * lightPDF) : 0;
+}
+float sunPDF(vec3 d) {
+    float omega = cfg.sunDirection.w;
+    return cfg.sunRadiance.w != 0 && omega > 1e-12 && dot(d, cfg.sunDirection.xyz) >= 1 - omega / (2 * PI)
+               ? 1 / omega
+               : 0;
+}
+vec3 emission(Hit hit) {
+    Material m = materials[hit.material];
+    if (int(m.base.w) != MODEL_EMISSION) {
+        return vec3(0);
+    }
+    return (m.programs[0].y > 0 ? evaluate(m.programs[0], hit.uv).colour.rgb : m.emission.rgb) * m.emission.w;
+}
+float emitterSampleArea(AreaLight light, Hit hit) {
+    Instance inst = instances[hit.instance];
+    if (geometries[inst.data.x].w == 0) return light.distribution.z;
+    mat3 linear = instanceMatrix(inst);
+    // Uniform local-sphere samples are not uniform on a scaled ellipsoid.
+    float jacobian = abs(determinant(linear)) / max(length(transpose(linear)*hit.g), 1e-20);
+    return 4 * PI * jacobian;
+}
+float emitterPDF(Hit h, vec3 origin, vec3 direction) {
+    Instance inst = instances[h.instance];
+    for (int i = 0; i < inst.data.w; ++i) {
+        AreaLight light = areaLights[inst.data.z + i];
+        if (light.data.y == h.primitive) {
+            float c = abs(dot(h.g, -direction));
+            return c > 1e-12
+                       ? light.distribution.y * dot(h.p - origin, h.p - origin) / (emitterSampleArea(light,h) * c)
+                       : 0;
+        }
+    }
+    return 0;
+}
+vec3 lightContribution(Hit hit, Surface s, vec3 view, vec3 direction, vec3 radiance, float maxT, float weight,
+                       float mis) {
+    vec3 bsdf = directBSDF(s, view, direction);
+    if (all(equal(bsdf, vec3(0)))) {
+        return vec3(0);
+    }
+    vec3 origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
+    return bsdf * radiance * (weight * mis * visibility(origin, direction, maxT));
+}
+vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
+    vec3 result = vec3(0), throughput = vec3(1), previous = origin;
+    float prevPDF = 0;
+    bool prevDelta = true;
+    albedo = vec3(0);
+    normal = vec3(0);
+    int nulls = 0, count = max(0, cfg.counts.z), sunSamples = count > 0 ? max(1, cfg.counts.w) : 0;
+    for (int depth = 0; depth <= cfg.image.w; ++depth) {
+        Hit hit;
+        if (!trace(origin, direction, 1e30, hit)) {
+            result += throughput * cfg.background.rgb;
+            float pdf = sunPDF(direction);
+            if (pdf > 0) {
+                result +=
+                    throughput * cfg.sunRadiance.rgb * pdf * hitWeight(prevPDF, pdf, sunSamples, prevDelta);
+            }
+            break;
+        }
+        float a = opacity(hit);
+        if (a <= 0 || (a < 1 && random() >= a)) {
+            if (++nulls > 1024) {
+                break;
+            }
+            origin = hit.p + direction * .001;
+            --depth;
+            continue;
+        }
+        Surface s = prepare(hit);
+        vec3 view = -direction;
+        if (depth == 0) {
+            albedo = s.base;
+            normal = hit.n;
+        }
+        if (s.model == MODEL_EMISSION) {
+            result += throughput * emission(hit) *
+                      hitWeight(prevPDF, emitterPDF(hit, previous, direction), count, prevDelta);
+            break;
+        }
+        if (depth == cfg.image.w) {
+            break;
+        }
+        vec3 direct = vec3(0);
+        if (cfg.sunRadiance.w != 0) {
+            float omega = cfg.sunDirection.w;
+            int samples = omega <= 1e-12 ? 1 : sunSamples;
+            mat3 basis = frame(cfg.sunDirection.xyz);
+            for (int j = 0; j < samples; ++j) {
+                vec3 l = cfg.sunDirection.xyz;
+                float mis = 1;
+                if (omega > 1e-12) {
+                    float z = 1 - random() * omega / (2 * PI), phi = 2 * PI * random(),
+                          r = sqrt(max(0, 1 - z * z));
+                    l = basis * vec3(r * cos(phi), r * sin(phi), z);
+                    if (cfg.options.x != 0) {
+                        mis = powerWeight(samples / omega, bsdfPDF(s, view, l));
+                    }
+                }
+                direct += lightContribution(hit, s, view, l, cfg.sunRadiance.rgb, 1e30, 1.0 / samples, mis);
+            }
+        }
+        // Sample point lights uniformly. Every positive light has support; the
+        // inverse selection probability keeps the result independent of count.
+        int pointSamples = max(1, count);
+        for (int j = 0; j < pointSamples && cfg.counts.x > 0; ++j) {
+            int index = min(int(random() * cfg.counts.x), cfg.counts.x - 1);
+            PointLight light = pointLights[index];
+            vec3 delta = light.position.xyz - hit.p;
+            float distance = length(delta);
+            if (distance <= .002 || (light.position.w > 0 && distance > light.position.w)) {
+                continue;
+            }
+            direct +=
+                lightContribution(hit, s, view, delta / distance, light.radiance.rgb / (distance * distance),
+                                  distance - .002, float(cfg.counts.x) / pointSamples, 1);
+        }
+        for (int j = 0; j < count && cfg.counts.y > 0; ++j) {
+            float u = random();
+            int lo = 0, hi = cfg.counts.y - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (areaLights[mid].distribution.x < u) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            AreaLight light = areaLights[lo];
+            Instance inst = instances[light.data.x];
+            bool sphere = geometries[inst.data.x].w != 0;
+            vec3 local = sphere ? uniformSphere() : vec3(0);
+            float root = sqrt(random());
+            vec2 bary = vec2(root * (1 - random()), 0);
+            bary.y = root - bary.x;
+            Hit lightHit = surfaceHit(light.data.x, light.data.y, local, bary, vec3(0, 0, 1));
+            vec3 delta = lightHit.p - hit.p;
+            float distance = length(delta);
+            if (distance <= .002) {
+                continue;
+            }
+            vec3 l = delta / distance;
+            float cosine = abs(dot(lightHit.g, -l));
+            if (cosine <= 1e-12) {
+                continue;
+            }
+            float pdf = light.distribution.y * distance * distance / (emitterSampleArea(light,lightHit) * cosine);
+            float mis = cfg.options.x != 0 ? powerWeight(count * pdf, bsdfPDF(s, view, l)) : 1;
+            direct += lightContribution(hit, s, view, l, emission(lightHit), distance - .002,
+                                        1 / (count * pdf), mis);
+        }
+        result += throughput * direct;
+        vec3 weight, next;
+        float pdf;
+        bool delta;
+        if (!scatter(s, hit, view, next, weight, pdf, delta)) {
+            break;
+        }
+        previous = hit.p;
+        prevPDF = pdf;
+        prevDelta = delta;
+        throughput *= weight;
+        direction = normalize(next);
+        origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
+        if (depth >= 8) {
+            float survival = clamp(max(throughput.x, max(throughput.y, throughput.z)), .05, .95);
+            if (random() >= survival) {
+                break;
+            }
+            throughput /= survival;
+        }
+    }
+    return max(vec3(0), finiteColour(result));
+}
+float halton(uint index, uint base) {
+    float sum = 0, f = 1;
+    while (index > 0) {
+        f /= base;
+        sum += f * (index % base);
+        index /= base;
+    }
+    return sum;
+}
+float pixelHash(uint x, uint y) {
+    uint n = x * 73856093u ^ y * 19349663u;
+    n = (n << 13) ^ n;
+    return float((n * (n * n * 15731u + 789221u) + 1376312589u) & 0x7fffffffu) / 2147483647.0;
+}
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy + uvec2(dispatch.offsetX, dispatch.offsetY);
+    if (any(greaterThanEqual(pixel, uvec2(cfg.image.xy)))) {
+        return;
+    }
+    uint index = pixel.y * uint(cfg.image.x) + pixel.x;
+    Pixel accum = pixels[index];
+    if (accum.variance.z != 0) {
+        return;
+    }
+    for (uint offset = 0; offset < dispatch.sampleCount; ++offset) {
+        if (accum.variance.z != 0) {
+            break;
+        }
+        uint sampleIndex = dispatch.sampleIndex + offset;
+        rng = hash(index ^ hash(sampleIndex + 0x243f6a88u));
+        vec2 jitter = cfg.options.y == 1
+                          ? fract(vec2(halton(sampleIndex + 1, 2), halton(sampleIndex + 1, 3)) +
+                                  vec2(pixelHash(pixel.x, pixel.y), pixelHash(pixel.y, pixel.x))) -
+                                .5
+                          : vec2(random(), random()) - .5;
+        vec3 origin = cfg.origin.xyz;
+        if (cfg.origin.w > 0) {
+            float r = sqrt(random()), p = 2 * PI * random();
+            origin += r * (cos(p) * cfg.defocusU.xyz + sin(p) * cfg.defocusV.xyz);
+        }
+        vec3 direction = normalize(cfg.pixel00.xyz + (pixel.x + jitter.x) * cfg.deltaU.xyz +
+                                   (pixel.y + jitter.y) * cfg.deltaV.xyz - origin);
+        vec3 albedo, normal;
+        vec3 value = pathTrace(origin, direction, albedo, normal);
+        accum.sum += vec4(value, 1);
+        accum.albedo += vec4(albedo, 0);
+        accum.normal += vec4(normal, 0);
+        float y = luminance(value), delta = y - accum.variance.x;
+        accum.variance.x += delta / accum.sum.w;
+        accum.variance.y += delta * (y - accum.variance.x);
+        if (cfg.options.z != 0 && accum.sum.w >= cfg.adaptive.x &&
+            int(accum.sum.w) % max(1, int(cfg.adaptive.y)) == 0) {
+            float error = sqrt(max(0, accum.variance.y / (accum.sum.w - 1) / accum.sum.w));
+            if (error < max(cfg.adaptive.w, cfg.adaptive.z * abs(accum.variance.x))) {
+                accum.variance.z = 1;
+                atomicAdd(convergedCount, 1);
+            }
+        }
+    }
+    pixels[index] = accum;
+}

@@ -1,8 +1,19 @@
 // Exercise persistence, native-drop import and preview through production editor
 // functions. Use an isolated working directory: never touch the user's assets.
+#include "GL/glew.h"
+#include "GLFW/glfw3.h"
+static GLFWwindow* smoke_create_window(int,int,const char*,GLFWmonitor*,GLFWwindow*);
+static void smoke_poll_events();
+static void smoke_swap_buffers(GLFWwindow*);
+#define glfwCreateWindow smoke_create_window
+#define glfwPollEvents smoke_poll_events
+#define glfwSwapBuffers smoke_swap_buffers
 #define main dusk_editor_entry_for_test
 #include "../src/core/editor_main.cpp"
 #undef main
+#undef glfwCreateWindow
+#undef glfwPollEvents
+#undef glfwSwapBuffers
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "external/stb_image_write.h"
 #include <future>
@@ -101,9 +112,14 @@ static void benchmark_graph_edits() {
     run("add_disconnected_node",true); run("drag_connected_color",false);
     wait_for_preview(0);
 }
+#include "editor_preview_regressions.inl"
+#include "editor_layout_smoke.inl"
+#include "raster_preview_regressions.inl"
 int main(int argc,char** argv) {
     check(argc >= 2,"isolated working directory supplied");
     std::filesystem::create_directories(argv[1]); std::filesystem::current_path(argv[1]);
+    if (argc >= 3 && std::string(argv[2]) == "--layout") return run_layout_smoke();
+    if (argc >= 3 && std::string(argv[2]) == "--raster") return run_raster_checks(argc >= 4 ? argv[3] : nullptr);
     check(glfwInit() != 0,"GLFW init"); glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
     auto window = glfwCreateWindow(1440,960,"Graph integration test",nullptr,nullptr);
     check(window != nullptr,"hidden preview window"); glfwMakeContextCurrent(window); glewInit();
@@ -148,6 +164,9 @@ int main(int argc,char** argv) {
     check(first != changed,"roughness graph change refreshes actual preview");
     if (argc == 3) benchmark_graph_edits();
     check_edit_scheduling(scalar);
+    check_preview_cache(argc == 4 ? argv[3] : nullptr);
+    check_sphere_interaction();
+    check_outliner_selection();
     std::vector<unsigned char> large_pixels(512*256*4,128);
     check(stbi_write_png("large-texture.png",512,256,4,large_pixels.data(),512*4) != 0,"large thumbnail fixture");
     GLuint thumb = 0; auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(5);
@@ -162,6 +181,7 @@ int main(int argc,char** argv) {
     g_scene.materials[0].graph.find(scalar)->value = vec3(.7,0,0); GraphDirty(0);
     wait_for_preview(0);
     g_graph_states[0].selected.clear(); g_graph_states[0].fit = true;
+    wait_for_sphere(false);
     for (int i = 0; i < 4; ++i) {
         io.DisplaySize = ImVec2(1440,960); io.DeltaTime = 1.f/60; g_thumbs_created_this_frame = 0;
         ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
@@ -180,7 +200,7 @@ int main(int argc,char** argv) {
     pixels.resize(1440*960*4); glReadPixels(0,0,1440,960,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
     stbi_flip_vertically_on_write(1);
     check(stbi_write_png("material-editor.png",1440,960,4,pixels.data(),1440*4) != 0,"production editor screenshot");
-    g_editor_previews.stop();
+    StopEditorPreviews();
     for (const auto& item : g_material_thumb_cache) glDeleteTextures(1,&item.second);
     for (const auto& item : g_texture_thumb_cache) glDeleteTextures(1,&item.second);
     ImGui_ImplOpenGL3_Shutdown(); ImGui::DestroyContext(); glfwDestroyWindow(window); glfwTerminate();

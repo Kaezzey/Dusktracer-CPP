@@ -45,7 +45,7 @@ class camera {
     double defocus_angle = 0;  
     double focus_dist = 10;   
     
-    int image_height;
+    int image_height = 0;
 
     // sampling method (choose HALTON for high-quality, efficient AA)
     enum sampling_method_e { RANDOM_SAMPLES = 0, HALTON_SAMPLES = 1 };

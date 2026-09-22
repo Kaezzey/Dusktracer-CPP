@@ -13,10 +13,32 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
+#include <stdexcept>
 
 class rtw_image {
 public:
     rtw_image() {}
+    rtw_image(const rtw_image&) = delete;
+    rtw_image& operator=(const rtw_image&) = delete;
+
+    // Owned, reduced pixels for editor previews. Preserve the original channel
+    // count so RGB opacity masks and RGBA alpha retain their normal semantics.
+    rtw_image(int width, int height, int channels, const std::vector<unsigned char>& rgba)
+        : bytes_per_pixel(channels), image_width(width), image_height(height),
+          bytes_per_scanline(width * channels) {
+        if (width <= 0 || height <= 0 || channels < 1 || channels > 4 ||
+            rgba.size() != size_t(width) * height * 4) {
+            throw std::invalid_argument("Invalid preview image dimensions or channels.");
+        }
+        owned_pixels.resize(size_t(width) * height * channels);
+        for (size_t p = 0; p < size_t(width) * height; ++p) {
+            for (int c = 0; c < channels; ++c) {
+                owned_pixels[p * channels + c] = rgba[p * 4 + (channels == 2 && c == 1 ? 3 : c)];
+            }
+        }
+        bdata = owned_pixels.data();
+    }
 
     explicit rtw_image(const char* image_filename) {
         auto filename = std::string(image_filename);
@@ -61,7 +83,7 @@ public:
     }
 
     ~rtw_image() {
-        stbi_image_free(bdata);
+        if (bdata != owned_pixels.data()) stbi_image_free(bdata);
         stbi_image_free(fdata);
     }
 
@@ -119,6 +141,7 @@ public:
     }
 
 private:
+    std::vector<unsigned char> owned_pixels;
     int            bytes_per_pixel = 3;
     bool           hdr = false;
     float         *fdata = nullptr;

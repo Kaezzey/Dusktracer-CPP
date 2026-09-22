@@ -1,3 +1,6 @@
+#include "core/affine_transform.h"
+#include "core/gpu_scene.h"
+#include "core/mesh_loader.h"
 // src/core/editor_main.cpp
 
 #include <cstdio>
@@ -18,6 +21,7 @@
 #include <chrono>   // for timing if you want
 #include <unordered_map>
 #include <algorithm>
+#include <future>
 
 #include "../../external/glew/include/GL/glew.h"
 #include "../../include/external/GLFW/glfw3.h"
@@ -64,6 +68,7 @@ static void SetWindowIconAuto(GLFWwindow* w, const char* filename)
 
 #include "../../include/core/camera.h"
 #include "../../include/core/renderer.h"
+#include "../../include/core/render_backend.h"
 #include "../../include/core/scene.h"
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/editor_camera.h"
@@ -92,6 +97,7 @@ static render_progress_state g_render_progress;
 static scene               g_scene;
 static camera              g_camera;
 static renderer            g_renderer;
+static render_selection    g_render_selection;
 static editor_camera_state g_editor_cam;
 static std::atomic<bool>   g_cancel_flag{false};
 static bool                g_scene_initialized = false;
@@ -108,6 +114,8 @@ static float g_camera_look_sens  = 0.002f;  // radians per pixel
 
 // Currently selected object in the Scene Hierarchy (-1 = none)
 static int g_selected_object = -1;
+static int g_selected_light = -1;
+static bool g_focus_properties = false;
 static int g_selected_material = -1; // Selected material in the asset viewer for editing
 static bool g_materials_dirty = false;
 static std::chrono::steady_clock::time_point g_materials_last_edit;
@@ -296,6 +304,8 @@ static void DrawInfoChip(const char* label)
     ImGui::Dummy(ImVec2(end.x - start.x, end.y - start.y));
 }
 
+static void InvalidateRasterMaterial(int index);
+static void InvalidateAllRasterMaterials();
 #include "editor_previews.inl"
 
 // Persist mesh -> default material slot assignments between launches.
@@ -389,8 +399,9 @@ static void UpdateMNEEFromScene()
 static std::thread g_render_thread;
 static std::mutex  g_render_mutex;
 static bool        g_render_in_progress = false;
-static bool        g_render_has_result  = false;
+static std::atomic<bool> g_render_has_result{false};
 static render_result g_render_result;
+static std::string g_render_diagnostic;
 static std::atomic<bool> g_render_final_image_ready{false};
 
 // Progress window (separate OS window) to show progressive render
@@ -417,22 +428,33 @@ static std::vector<std::uint8_t> g_rtPixels;   // RGBA8
 // Rasterised preview: sphere mesh, GPU meshes, FBO
 // -----------------------------------------------------------------------------
 
+struct raster_vertex {
+    float position[3], normal[3], uv[2], tangent[3], bitangent[3];
+};
+struct raster_range {
+    unsigned first = 0;
+    GLsizei count = 0;
+    int material_slot = 0;
+};
 struct gpu_mesh {
-    GLuint vao          = 0;
-    GLuint vbo          = 0;
-    GLuint ebo          = 0;
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    GLuint ebo = 0;
     GLsizei index_count = 0;
+    std::vector<raster_range> ranges;
+    point3 minimum, maximum;
 };
 
-static GLuint  g_rasterShader           = 0;
-static GLuint  g_rasterSphereVAO        = 0;
-static GLuint  g_rasterSphereVBO        = 0;
-static GLuint  g_rasterSphereEBO        = 0;
+static GLuint g_modelThumbnailShader = 0;
+static GLuint g_rasterShader = 0;
+static GLuint g_rasterSphereVAO = 0;
+static GLuint g_rasterSphereVBO = 0;
+static GLuint g_rasterSphereEBO = 0;
 static GLsizei g_rasterSphereIndexCount = 0;
-static GLuint  g_rasterCubeVAO          = 0;
-static GLuint  g_rasterCubeVBO          = 0;
-static GLuint  g_rasterCubeEBO          = 0;
-static GLsizei g_rasterCubeIndexCount   = 0;
+static GLuint g_rasterCubeVAO = 0;
+static GLuint g_rasterCubeVBO = 0;
+static GLuint g_rasterCubeEBO = 0;
+static GLsizei g_rasterCubeIndexCount = 0;
 
 // One gpu_mesh per scene mesh asset, same index as g_scene.meshes
 static std::vector<gpu_mesh> g_gpu_meshes;
@@ -468,6 +490,9 @@ static GLuint GenerateModelThumbnail(int mesh_index)
 
     const int sz = 80;
 
+    GLint prevFBO = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+    GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+
     // Create texture
     GLuint tex = 0;
     glGenTextures(1, &tex);
@@ -500,17 +525,14 @@ static GLuint GenerateModelThumbnail(int mesh_index)
     }
 
     // Save previous viewport and FBO
-    GLint prevFBO = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
-    GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
-
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glViewport(0, 0, sz, sz);
     glEnable(GL_DEPTH_TEST);
     glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    if (g_rasterShader == 0) BuildRasterShader();
-    glUseProgram(g_rasterShader);
+    if (g_modelThumbnailShader == 0) BuildRasterShader();
+    glUseProgram(g_modelThumbnailShader);
 
     // Camera: compute distance from mesh approx radius so thumbnails are auto-framed
     float view[16]; float proj[16]; float model[16];
@@ -545,11 +567,11 @@ static GLuint GenerateModelThumbnail(int mesh_index)
     make_lookat(vec3(cx, cy, cz), vec3(0,0,0), vec3(0,1,0), view);
     make_perspective(fov_deg, 1.0f, 0.01f, distance * 4.0f + r, proj);
 
-    GLint locModel    = glGetUniformLocation(g_rasterShader, "uModel");
-    GLint locView     = glGetUniformLocation(g_rasterShader, "uView");
-    GLint locProj     = glGetUniformLocation(g_rasterShader, "uProj");
-    GLint locColor    = glGetUniformLocation(g_rasterShader, "uColor");
-    GLint locLightDir = glGetUniformLocation(g_rasterShader, "uLightDir");
+    GLint locModel    = glGetUniformLocation(g_modelThumbnailShader, "uModel");
+    GLint locView     = glGetUniformLocation(g_modelThumbnailShader, "uView");
+    GLint locProj     = glGetUniformLocation(g_modelThumbnailShader, "uProj");
+    GLint locColor    = glGetUniformLocation(g_modelThumbnailShader, "uColor");
+    GLint locLightDir = glGetUniformLocation(g_modelThumbnailShader, "uLightDir");
 
     glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
     glUniformMatrix4fv(locView, 1, GL_FALSE, view);
@@ -1131,7 +1153,7 @@ static void build_default_scene(scene& scn)
         obj.center = point3(0, 0, 0);
         obj.radius = 2.00049;
         obj.translation = vec3(0.0773224, -1.13078, -1.13846);
-        obj.rotation_deg = vec3(0, 103, 0);
+        obj.rotation_deg = vec3(0, -103, 0);
         obj.scale = vec3(0.7, 0.7, 0.7);
         obj.mesh_slot_materials = {7, 8, 9, 10};
         scn.objects.push_back(obj);
@@ -1227,6 +1249,9 @@ static GLuint CompileShader(const char* vs, const char* fs)
     glAttachShader(prog, f);
     glBindAttribLocation(prog, 0, "aPos");
     glBindAttribLocation(prog, 1, "aNormal");
+    glBindAttribLocation(prog, 2, "aUV");
+    glBindAttribLocation(prog, 3, "aTangent");
+    glBindAttribLocation(prog, 4, "aBitangent");
     glLinkProgram(prog);
     glGetProgramiv(prog, GL_LINK_STATUS, &status);
     if (!status) {
@@ -1239,7 +1264,7 @@ static GLuint CompileShader(const char* vs, const char* fs)
     return prog;
 }
 
-static void BuildRasterShader()
+static void BuildModelThumbnailShader()
 {
     const char* vs = R"(#version 130
         in vec3 aPos;
@@ -1279,7 +1304,7 @@ static void BuildRasterShader()
         }
     )";
 
-    g_rasterShader = CompileShader(vs, fs);
+    g_modelThumbnailShader = CompileShader(vs, fs);
 }
 
 // Simple flat shader used for picking (outputs a uniform color)
@@ -1379,431 +1404,148 @@ static void make_model_translate_only(const vec3& t, float out[16])
 }
 
 // make model matrix from Translation, Rotation (degrees XYZ), and non-uniform Scale
-static void make_model_trs(const vec3& translate, const vec3& rotation_deg, const vec3& scale, float out[16])
-{
-    // Build rotation matrices R = Rz * Ry * Rx (same convention as transform.h)
-    double rx = rotation_deg.x() * (3.14159265358979323846 / 180.0);
-    double ry = rotation_deg.y() * (3.14159265358979323846 / 180.0);
-    double rz = rotation_deg.z() * (3.14159265358979323846 / 180.0);
-
-    double cx = std::cos(rx), sx = std::sin(rx);
-    double cy = std::cos(ry), sy = std::sin(ry);
-    double cz = std::cos(rz), sz = std::sin(rz);
-
-    double Rx[3][3], Ry[3][3], Rz[3][3];
-    double Rtemp[3][3];
-    double R[3][3];
-
-    Rx[0][0] = 1;  Rx[0][1] = 0;   Rx[0][2] = 0;
-    Rx[1][0] = 0;  Rx[1][1] = cx;  Rx[1][2] = -sx;
-    Rx[2][0] = 0;  Rx[2][1] = sx;  Rx[2][2] = cx;
-
-    Ry[0][0] = cy; Ry[0][1] = 0;   Ry[0][2] = sy;
-    Ry[1][0] = 0;  Ry[1][1] = 1;   Ry[1][2] = 0;
-    Ry[2][0] = -sy;Ry[2][1] = 0;   Ry[2][2] = cy;
-
-    Rz[0][0] = cz; Rz[0][1] = -sz; Rz[0][2] = 0;
-    Rz[1][0] = sz; Rz[1][1] =  cz; Rz[1][2] = 0;
-    Rz[2][0] = 0;  Rz[2][1] =  0;  Rz[2][2] = 1;
-
-    // R = Rz * Ry * Rx
-    for (int i=0;i<3;++i) for (int j=0;j<3;++j) Rtemp[i][j]=0.0;
-    for (int i=0;i<3;++i)
-        for (int j=0;j<3;++j)
-            for (int k=0;k<3;++k)
-                Rtemp[i][j] += Ry[i][k] * Rx[k][j];
-
-    for (int i=0;i<3;++i)
-        for (int j=0;j<3;++j) {
-            R[i][j] = 0.0;
-            for (int k=0;k<3;++k) R[i][j] += Rz[i][k] * Rtemp[k][j];
-        }
-
-    // Combine rotation and non-uniform scale: M = R * S (S diagonal sx,sy,sz)
-    double sx_d = scale.x();
-    double sy_d = scale.y();
-    double sz_d = scale.z();
-
-    out[0]  = (float)(R[0][0] * sx_d); out[1]  = (float)(R[0][1] * sy_d); out[2]  = (float)(R[0][2] * sz_d); out[3]  = 0.0f;
-    out[4]  = (float)(R[1][0] * sx_d); out[5]  = (float)(R[1][1] * sy_d); out[6]  = (float)(R[1][2] * sz_d); out[7]  = 0.0f;
-    out[8]  = (float)(R[2][0] * sx_d); out[9]  = (float)(R[2][1] * sy_d); out[10] = (float)(R[2][2] * sz_d); out[11] = 0.0f;
-
-    out[12] = (float)translate.x(); out[13] = (float)translate.y(); out[14] = (float)translate.z(); out[15] = 1.0f;
+static void make_model_trs(const vec3& translate, const vec3& rotation_deg, const vec3& scale,
+                           float out[16]) {
+    make_trs_column_major(translate, rotation_deg, scale, out);
 }
 
-// Unit sphere mesh with normals
-static void BuildUnitSphereMesh(int segments = 32, int rings = 16)
-{
-    struct SphereVertex {
-        float px, py, pz;
-        float nx, ny, nz;
-    };
-
-    std::vector<SphereVertex> verts;
-    std::vector<unsigned int> inds;
-
-    const float PI = 3.14159265359f;
-
-    for (int y = 0; y <= rings; ++y) {
-        float v   = float(y) / float(rings);
-        float phi = v * PI;
-
-        for (int x = 0; x <= segments; ++x) {
-            float u     = float(x) / float(segments);
-            float theta = u * 2.0f * PI;
-
-            float xp = std::cos(theta) * std::sin(phi);
-            float yp = std::cos(phi);
-            float zp = std::sin(theta) * std::sin(phi);
-
-            SphereVertex vtx;
-            vtx.px = xp;
-            vtx.py = yp;
-            vtx.pz = zp;
-            vtx.nx = xp;
-            vtx.ny = yp;
-            vtx.nz = zp;
-            verts.push_back(vtx);
+// All raster geometry retains the same UVs and tangent frames as ray tracing.
+static void BindRasterVertexLayout() {
+    const int counts[] = {3, 3, 2, 3, 3};
+    const size_t offsets[] = {0, 3, 6, 8, 11};
+    for (int i = 0; i < 5; ++i) {
+        glEnableVertexAttribArray(i);
+        glVertexAttribPointer(i, counts[i], GL_FLOAT, GL_FALSE, sizeof(raster_vertex),
+                              reinterpret_cast<void*>(offsets[i] * sizeof(float)));
+    }
+}
+static gpu_mesh UploadRasterMesh(const std::vector<raster_vertex>& vertices,
+                                 const std::vector<unsigned>& indices) {
+    gpu_mesh mesh;
+    if (vertices.empty() || indices.empty()) {
+        return mesh;
+    }
+    mesh.minimum = mesh.maximum =
+        point3(vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]);
+    for (const auto& vertex : vertices) {
+        for (int c = 0; c < 3; ++c) {
+            mesh.minimum[c] = std::min(mesh.minimum[c], double(vertex.position[c]));
+            mesh.maximum[c] = std::max(mesh.maximum[c], double(vertex.position[c]));
         }
     }
-
+    glGenVertexArrays(1, &mesh.vao);
+    glBindVertexArray(mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(raster_vertex), vertices.data(), GL_STATIC_DRAW);
+    glGenBuffers(1, &mesh.ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned), indices.data(), GL_STATIC_DRAW);
+    BindRasterVertexLayout();
+    glBindVertexArray(0);
+    mesh.index_count = GLsizei(indices.size());
+    return mesh;
+}
+static raster_vertex MakeRasterVertex(const vec3& p, const vec3& n, double u, double v, const vec3& tangent,
+                                      const vec3& bitangent) {
+    raster_vertex result{};
+    for (int c = 0; c < 3; ++c) {
+        result.position[c] = float(p[c]);
+        result.normal[c] = float(n[c]);
+        result.tangent[c] = float(tangent[c]);
+        result.bitangent[c] = float(bitangent[c]);
+    }
+    result.uv[0] = float(u);
+    result.uv[1] = float(v);
+    return result;
+}
+static void BuildUnitSphereMesh(int segments = 64, int rings = 32) {
+    std::vector<raster_vertex> vertices;
+    std::vector<unsigned> indices;
+    for (int y = 0; y <= rings; ++y) {
+        const double v = double(y) / rings, phi = v * pi;
+        for (int x = 0; x <= segments; ++x) {
+            const double u = double(x) / segments, theta = u * 2 * pi;
+            vec3 p(-std::cos(theta) * std::sin(phi), -std::cos(phi), std::sin(theta) * std::sin(phi));
+            vec3 t(std::sin(theta), 0, std::cos(theta));
+            vec3 b(-std::cos(theta) * std::cos(phi), std::sin(phi), std::sin(theta) * std::cos(phi));
+            vertices.push_back(MakeRasterVertex(p, p, u, v, t, b));
+        }
+    }
     for (int y = 0; y < rings; ++y) {
         for (int x = 0; x < segments; ++x) {
-            int i0 =  y      * (segments+1) + x;
-            int i1 =  i0 + 1;
-            int i2 = (y+1)   * (segments+1) + x;
-            int i3 =  i2 + 1;
-
-            inds.push_back(i0); inds.push_back(i2); inds.push_back(i1);
-            inds.push_back(i1); inds.push_back(i2); inds.push_back(i3);
+            unsigned a = y * (segments + 1) + x, b = a + 1, c = a + segments + 1, d = c + 1;
+            indices.insert(indices.end(), {a, b, c, b, d, c});
         }
     }
-
-    g_rasterSphereIndexCount = (GLsizei)inds.size();
-
-    glGenVertexArrays(1, &g_rasterSphereVAO);
-    glBindVertexArray(g_rasterSphereVAO);
-
-    glGenBuffers(1, &g_rasterSphereVBO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_rasterSphereVBO);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(SphereVertex),
-                 verts.data(), GL_STATIC_DRAW);
-
-    glGenBuffers(1, &g_rasterSphereEBO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_rasterSphereEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, inds.size() * sizeof(unsigned int),
-                 inds.data(), GL_STATIC_DRAW);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(SphereVertex), (void*)0);
-
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(SphereVertex), (void*)(3 * sizeof(float)));
-
-    glBindVertexArray(0);
+    auto mesh = UploadRasterMesh(vertices, indices);
+    g_rasterSphereVAO = mesh.vao;
+    g_rasterSphereVBO = mesh.vbo;
+    g_rasterSphereEBO = mesh.ebo;
+    g_rasterSphereIndexCount = mesh.index_count;
 }
-
-// Unit cube mesh with normals (centered at origin, size 1 -> extents [-0.5,0.5])
-static void BuildUnitCubeMesh()
-{
-    struct CubeVertex {
-        float px, py, pz;
-        float nx, ny, nz;
-    };
-
-    // 6 faces * 4 verts each (unique normals per face)
-    std::vector<CubeVertex> verts;
-    std::vector<unsigned int> inds;
-    verts.reserve(24);
-    inds.reserve(36);
-
-    const float hs = 0.5f;
-
-    // Front (+Z)
-    CubeVertex v0 = { -hs, -hs,  hs,  0, 0, 1 };
-    CubeVertex v1 = {  hs, -hs,  hs,  0, 0, 1 };
-    CubeVertex v2 = {  hs,  hs,  hs,  0, 0, 1 };
-    CubeVertex v3 = { -hs,  hs,  hs,  0, 0, 1 };
-
-    // Back (-Z)
-    CubeVertex v4 = {  hs, -hs, -hs,  0, 0, -1 };
-    CubeVertex v5 = { -hs, -hs, -hs,  0, 0, -1 };
-    CubeVertex v6 = { -hs,  hs, -hs,  0, 0, -1 };
-    CubeVertex v7 = {  hs,  hs, -hs,  0, 0, -1 };
-
-    // Left (-X)
-    CubeVertex v8  = { -hs, -hs, -hs, -1, 0, 0 };
-    CubeVertex v9  = { -hs, -hs,  hs, -1, 0, 0 };
-    CubeVertex v10 = { -hs,  hs,  hs, -1, 0, 0 };
-    CubeVertex v11 = { -hs,  hs, -hs, -1, 0, 0 };
-
-    // Right (+X)
-    CubeVertex v12 = {  hs, -hs,  hs, 1, 0, 0 };
-    CubeVertex v13 = {  hs, -hs, -hs, 1, 0, 0 };
-    CubeVertex v14 = {  hs,  hs, -hs, 1, 0, 0 };
-    CubeVertex v15 = {  hs,  hs,  hs, 1, 0, 0 };
-
-    // Top (+Y)
-    CubeVertex v16 = { -hs,  hs,  hs, 0, 1, 0 };
-    CubeVertex v17 = {  hs,  hs,  hs, 0, 1, 0 };
-    CubeVertex v18 = {  hs,  hs, -hs, 0, 1, 0 };
-    CubeVertex v19 = { -hs,  hs, -hs, 0, 1, 0 };
-
-    // Bottom (-Y)
-    CubeVertex v20 = { -hs, -hs, -hs, 0, -1, 0 };
-    CubeVertex v21 = {  hs, -hs, -hs, 0, -1, 0 };
-    CubeVertex v22 = {  hs, -hs,  hs, 0, -1, 0 };
-    CubeVertex v23 = { -hs, -hs,  hs, 0, -1, 0 };
-
-    CubeVertex cube_verts[] = {
-        v0,v1,v2,v3, v4,v5,v6,v7, v8,v9,v10,v11, v12,v13,v14,v15, v16,v17,v18,v19, v20,v21,v22,v23
-    };
-
-    for (int i = 0; i < 24; ++i) verts.push_back(cube_verts[i]);
-
-    unsigned int face_indices[] = {
-        0,1,2, 0,2,3,       // front
-        4,5,6, 4,6,7,       // back
-        8,9,10, 8,10,11,    // left
-        12,13,14, 12,14,15, // right
-        16,17,18, 16,18,19, // top
-        20,21,22, 20,22,23  // bottom
-    };
-
-    for (int i = 0; i < 36; ++i) inds.push_back(face_indices[i]);
-
-    g_rasterCubeIndexCount = (GLsizei)inds.size();
-
-    glGenVertexArrays(1, &g_rasterCubeVAO);
-    glBindVertexArray(g_rasterCubeVAO);
-
-    glGenBuffers(1, &g_rasterCubeVBO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_rasterCubeVBO);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(CubeVertex), verts.data(), GL_STATIC_DRAW);
-
-    glGenBuffers(1, &g_rasterCubeEBO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_rasterCubeEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, inds.size() * sizeof(unsigned int), inds.data(), GL_STATIC_DRAW);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)(3 * sizeof(float)));
-
-    glBindVertexArray(0);
+static void BuildUnitCubeMesh() {
+    const point3 origins[] = {{-.5, -.5, .5},  {.5, -.5, .5}, {.5, -.5, -.5},
+                              {-.5, -.5, -.5}, {-.5, .5, .5}, {-.5, -.5, -.5}};
+    const vec3 tangents[] = {{1, 0, 0}, {0, 0, -1}, {-1, 0, 0}, {0, 0, 1}, {1, 0, 0}, {1, 0, 0}};
+    const vec3 bitangents[] = {{0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+    const double uv[][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    std::vector<raster_vertex> vertices;
+    std::vector<unsigned> indices;
+    for (int face = 0; face < 6; ++face) {
+        const auto& t = tangents[face];
+        const auto& b = bitangents[face];
+        for (const auto& coord : uv) {
+            vertices.push_back(MakeRasterVertex(origins[face] + coord[0] * t + coord[1] * b, cross(t, b),
+                                                coord[0], coord[1], t, b));
+        }
+        unsigned a = face * 4;
+        indices.insert(indices.end(), {a, a + 1, a + 2, a, a + 2, a + 3});
+    }
+    auto mesh = UploadRasterMesh(vertices, indices);
+    g_rasterCubeVAO = mesh.vao;
+    g_rasterCubeVBO = mesh.vbo;
+    g_rasterCubeEBO = mesh.ebo;
+    g_rasterCubeIndexCount = mesh.index_count;
 }
-
-// -----------------------------------------------------------------------------
-// Assimp-based mesh → gpu_mesh loader (FBX/OBJ)
-// -----------------------------------------------------------------------------
-
 struct MeshLoadResult {
     gpu_mesh mesh;
-    float    approx_radius = 1.0f;
-
-    // One per Assimp material index – used as material slots.
+    float approx_radius = 1;
     std::vector<std::string> material_slot_names;
 };
-
-// z_up           : set true for FBX that is authored Z-up
-// normalise_unit : match your mesh_loader.h behaviour
-// user_scale     : extra scale factor if you ever want it
-static MeshLoadResult load_assimp_mesh_as_gpu_mesh(
-    const std::string& full_path,
-    bool               z_up,
-    bool               normalise_unit,
-    double             user_scale)
-{
-    MeshLoadResult result{};
-
-    Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFile(
-        full_path,
-        aiProcess_Triangulate |
-        aiProcess_JoinIdenticalVertices |
-        aiProcess_GenSmoothNormals |
-        aiProcess_ImproveCacheLocality |
-        aiProcess_OptimizeMeshes
-    );
-
-    if (!scene || !scene->mRootNode || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE)) {
-        std::fprintf(stderr, "Assimp load failed for '%s': %s\n",
-                     full_path.c_str(), importer.GetErrorString());
-        return result;
-    }
-
-    // Material slot names (per aiMaterial)
-    result.material_slot_names.clear();
-    result.material_slot_names.reserve(scene->mNumMaterials);
-    for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
-        aiString nm;
-        scene->mMaterials[i]->Get(AI_MATKEY_NAME, nm);
-        result.material_slot_names.emplace_back(nm.C_Str());
-    }
-
-    // -------------------------
-    // PASS 1: bounds (after optional Z->Y rotation)
-    // -------------------------
-    point3 minp( 1e30, 1e30, 1e30 );
-    point3 maxp(-1e30,-1e30,-1e30 );
-
-    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
-        aiMesh* mesh = scene->mMeshes[m];
-        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-            float x = mesh->mVertices[v].x;
-            float y = mesh->mVertices[v].y;
-            float z = mesh->mVertices[v].z;
-
-            if (z_up) {
-                zup_to_yup(x, y, z);
+static MeshLoadResult load_assimp_mesh_as_gpu_mesh(const std::string& full_path, bool z_up,
+                                                   bool normalise_unit, double user_scale) {
+    MeshLoadResult result;
+    try {
+        auto data = build_cached_mesh_data(full_path, z_up, normalise_unit, user_scale);
+        std::vector<raster_vertex> vertices;
+        std::vector<unsigned> indices;
+        std::vector<raster_range> ranges;
+        vertices.reserve(data->triangles.size() * 3);
+        indices.reserve(data->triangles.size() * 3);
+        double radius_squared = 0;
+        for (const auto& t : data->triangles) {
+            if (ranges.empty() || ranges.back().material_slot != t.material_index) {
+                ranges.push_back({unsigned(indices.size()), 0, t.material_index});
             }
-
-            minp = point3(
-                std::min(minp.x(), (double)x),
-                std::min(minp.y(), (double)y),
-                std::min(minp.z(), (double)z)
-            );
-            maxp = point3(
-                std::max(maxp.x(), (double)x),
-                std::max(maxp.y(), (double)y),
-                std::max(maxp.z(), (double)z)
-            );
-        }
-    }
-
-    vec3 extent = maxp - minp;
-
-    double base_scale = 1.0;
-    if (normalise_unit) {
-        double max_extent = std::max({ extent.x(), extent.y(), extent.z() });
-        if (max_extent <= 0.0) max_extent = 1.0;
-        base_scale = 1.0 / max_extent;
-    }
-    double scale = base_scale * user_scale;
-
-    // Pivot: centre in X/Z, feet on y=0 (same as mesh_loader.h)
-    double pivot_x = 0.5 * (minp.x() + maxp.x());
-    double pivot_z = 0.5 * (minp.z() + maxp.z());
-    double pivot_y = minp.y();
-    vec3   pivot(pivot_x, pivot_y, pivot_z);
-
-    std::printf("Raster mesh '%s'\n", full_path.c_str());
-    std::printf("  min = (%.3f, %.3f, %.3f)\n", minp.x(), minp.y(), minp.z());
-    std::printf("  max = (%.3f, %.3f, %.3f)\n", maxp.x(), maxp.y(), maxp.z());
-    std::printf("  z_up = %s, normalise_unit = %s, base_scale = %.4f, user_scale = %.4f\n",
-                z_up ? "true" : "false",
-                normalise_unit ? "true" : "false",
-                base_scale, user_scale);
-
-    struct Vertex {
-        float px, py, pz;
-        float nx, ny, nz;
-    };
-
-    std::vector<Vertex> verts;
-    std::vector<unsigned int> inds;
-    verts.reserve(65536);
-    inds.reserve(65536);
-
-    float max_r2 = 0.0f;
-    unsigned int running_index = 0;
-
-    // -------------------------
-    // PASS 2: build flattened vertex/index buffers in transformed space
-    // -------------------------
-    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
-        aiMesh* mesh = scene->mMeshes[m];
-        bool has_normals = mesh->HasNormals();
-
-        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-            const aiFace& face = mesh->mFaces[f];
-            if (face.mNumIndices != 3) continue;
-
-            for (unsigned int k = 0; k < 3; ++k) {
-                unsigned int idx = face.mIndices[k];
-                if (idx >= mesh->mNumVertices) continue;
-
-                float x = mesh->mVertices[idx].x;
-                float y = mesh->mVertices[idx].y;
-                float z = mesh->mVertices[idx].z;
-
-                if (z_up) {
-                    zup_to_yup(x, y, z);
-                }
-
-                // apply pivot + scale to position
-                vec3 p_local((double)x, (double)y, (double)z);
-                p_local = (p_local - pivot) * scale;
-
-                float px = (float)p_local.x();
-                float py = (float)p_local.y();
-                float pz = (float)p_local.z();
-
-                float nx = 0.0f, ny = 1.0f, nz = 0.0f;
-                if (has_normals) {
-                    nx = mesh->mNormals[idx].x;
-                    ny = mesh->mNormals[idx].y;
-                    nz = mesh->mNormals[idx].z;
-                    if (z_up) {
-                        zup_to_yup(nx, ny, nz);
-                    }
-                }
-
-                Vertex v;
-                v.px = px; v.py = py; v.pz = pz;
-                v.nx = nx; v.ny = ny; v.nz = nz;
-                verts.push_back(v);
-
-                float r2 = px*px + py*py + pz*pz;
-                if (r2 > max_r2) max_r2 = r2;
-
-                inds.push_back(running_index++);
+            const vec3 positions[] = {t.p0, t.p1, t.p2}, normals[] = {t.n0, t.n1, t.n2};
+            const vec3 tangents[] = {t.t0, t.t1, t.t2}, bitangents[] = {t.b0, t.b1, t.b2};
+            const double us[] = {t.u0, t.u1, t.u2}, vs[] = {t.v0, t.v1, t.v2};
+            for (int i = 0; i < 3; ++i) {
+                indices.push_back(unsigned(vertices.size()));
+                vertices.push_back(
+                    MakeRasterVertex(positions[i], normals[i], us[i], vs[i], tangents[i], bitangents[i]));
+                radius_squared = std::max(radius_squared, positions[i].length_squared());
             }
+            ranges.back().count += 3;
         }
+        result.mesh = UploadRasterMesh(vertices, indices);
+        result.mesh.ranges = std::move(ranges);
+        result.approx_radius = float(std::sqrt(radius_squared));
+        result.material_slot_names = std::move(data->material_names);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Raster mesh: %s\n", error.what());
     }
-
-    if (verts.empty() || inds.empty()) {
-        std::fprintf(stderr, "Assimp mesh has no geometry after processing: %s\n",
-                     full_path.c_str());
-        return result;
-    }
-
-    result.approx_radius = max_r2 > 0.0f ? std::sqrt(max_r2) : 1.0f;
-
-    glGenVertexArrays(1, &result.mesh.vao);
-    glBindVertexArray(result.mesh.vao);
-
-    glGenBuffers(1, &result.mesh.vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, result.mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 verts.size() * sizeof(Vertex),
-                 verts.data(),
-                 GL_STATIC_DRAW);
-
-    glGenBuffers(1, &result.mesh.ebo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, result.mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 inds.size() * sizeof(unsigned int),
-                 inds.data(),
-                 GL_STATIC_DRAW);
-
-    result.mesh.index_count = (GLsizei)inds.size();
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(Vertex), (void*)0);
-
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(Vertex), (void*)(3 * sizeof(float)));
-
-    glBindVertexArray(0);
-
-    std::printf("Raster imported mesh: verts=%zu, tris=%zu, approx_radius=%.3f\n",
-                verts.size(), inds.size() / 3, result.approx_radius);
-
     return result;
 }
 
@@ -1814,7 +1556,8 @@ static bool try_load_assimp_mesh(const std::string& full_path,
                                  std::vector<std::string>& out_slot_names)
 {
     MeshLoadResult mlr = load_assimp_mesh_as_gpu_mesh(full_path,
-                                                     /*z_up=*/true,
+                                                     /*z_up=*/std::filesystem::path(full_path).extension() == ".fbx" ||
+                                                              std::filesystem::path(full_path).extension() == ".FBX",
                                                      /*normalise_unit=*/true,
                                                      /*user_scale=*/2.0);
     if (mlr.mesh.vao == 0 || mlr.mesh.index_count == 0)
@@ -2041,18 +1784,26 @@ static void EnsureRasterFBO(int width, int height)
     }
 }
 
+#include "editor_raster.inl"
+
 // Render rasterised scene into g_rasterColorTex
-static void RenderRasterToTexture(int width, int height)
-{
-    if (g_rasterShader == 0)
+static void RenderRasterToTexture(int width, int height) {
+    if (g_rasterShader == 0) {
         return;
+    }
 
     EnsureRasterFBO(width, height);
-    if (g_rasterFBO == 0) return;
+    if (g_rasterFBO == 0) {
+        return;
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, g_rasterFBO);
     glViewport(0, 0, width, height);
     glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LESS);
     glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -2060,151 +1811,22 @@ static void RenderRasterToTexture(int width, int height)
     float proj[16];
 
     const vec3& pos = g_editor_cam.position;
-    const vec3& f   = g_editor_cam.forward;
-    const vec3& u   = g_editor_cam.up;
+    const vec3& f = g_editor_cam.forward;
+    const vec3& u = g_editor_cam.up;
 
     make_lookat(pos, pos + f, u, view);
-    make_perspective(g_editor_cam.vfov,
-                     (float)width / (float)height,
-                     0.01f, 500.0f, proj);
+    make_perspective(g_editor_cam.vfov, (float)width / (float)height, 0.01f, 500.0f, proj);
 
-    glUseProgram(g_rasterShader);
-
-    GLint locModel    = glGetUniformLocation(g_rasterShader, "uModel");
-    GLint locView     = glGetUniformLocation(g_rasterShader, "uView");
-    GLint locProj     = glGetUniformLocation(g_rasterShader, "uProj");
-    GLint locColor    = glGetUniformLocation(g_rasterShader, "uColor");
-    GLint locLightDir = glGetUniformLocation(g_rasterShader, "uLightDir");
-
-    glUniformMatrix4fv(locView, 1, GL_FALSE, view);
-    glUniformMatrix4fv(locProj, 1, GL_FALSE, proj);
-
-    // Raster viewport: prefer camera sun direction if enabled, otherwise use a fixed preview light
-    vec3 lightDir;
-    if (g_camera.use_sun && !g_camera.sun_dir.near_zero()) {
-        // g_camera.sun_dir is from scene -> sun; raster uniform expects light -> scene
-        lightDir = unit_vector(-g_camera.sun_dir);
-    } else {
-        lightDir = unit_vector(vec3(-1.0, -1.0, -0.5));
-    }
-    glUniform3f(locLightDir, (float)lightDir.x(), (float)lightDir.y(), (float)lightDir.z());
-
-    for (const auto& obj : g_scene.objects)
-    {
-        float model[16];
-
-        // Decide which material index to use for raster colouring
-        int mat_index_for_raster = obj.material_index;
-
-        if (obj.type == scene_object_type::mesh_instance &&
-            !obj.mesh_slot_materials.empty())
-        {
-            // Prefer first valid slot binding
-            for (int idx : obj.mesh_slot_materials) {
-                if (idx >= 0 && idx < (int)g_scene.materials.size()) {
-                    mat_index_for_raster = idx;
-                    break;
-                }
-            }
-        }
-
-        float cr = 0.8f, cg = 0.8f, cb = 0.8f;
-        if (mat_index_for_raster >= 0 &&
-            mat_index_for_raster < (int)g_scene.materials.size())
-        {
-            const auto& m = g_scene.materials[mat_index_for_raster];
-            cr = (float)m.base_color.x();
-            cg = (float)m.base_color.y();
-            cb = (float)m.base_color.z();
-        }
-        glUniform3f(locColor, cr, cg, cb);
-
-        if (obj.type == scene_object_type::sphere)
-        {
-            // Compose translation from center + translation, allow rotation/scale edits
-            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-            vec3 rot   = obj.rotation_deg;
-            vec3 scl   = obj.scale * vec3(obj.radius, obj.radius, obj.radius);
-
-            make_model_trs(trans, rot, scl, model);
-            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
-
-            glBindVertexArray(g_rasterSphereVAO);
-            glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount,
-                           GL_UNSIGNED_INT, (void*)0);
-        }
-        else if (obj.type == scene_object_type::cube)
-        {
-            // Cube: use translation + center, rotation_deg and non-uniform scale
-            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-            vec3 rot   = obj.rotation_deg;
-            vec3 scl   = obj.scale;
-
-            make_model_trs(trans, rot, scl, model);
-            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
-
-            glBindVertexArray(g_rasterCubeVAO);
-            glDrawElements(GL_TRIANGLES, g_rasterCubeIndexCount,
-                           GL_UNSIGNED_INT, (void*)0);
-        }
-        else if (obj.type == scene_object_type::mesh_instance)
-        {
-            if (obj.mesh_index < 0 ||
-                obj.mesh_index >= (int)g_gpu_meshes.size())
-                continue;
-
-            const gpu_mesh& gm = g_gpu_meshes[obj.mesh_index];
-            if (gm.vao == 0 || gm.index_count == 0)
-                continue;
-
-            // apply translation, rotation and scale to mesh instances too
-            vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-            vec3 rot   = obj.rotation_deg;
-            vec3 scl   = obj.scale;
-
-            make_model_trs(trans, rot, scl, model);
-            glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
-
-            glBindVertexArray(gm.vao);
-            glDrawElements(GL_TRIANGLES, gm.index_count,
-                           GL_UNSIGNED_INT, (void*)0);
-        }
-    }
-
-    // Draw point-light icons in the raster preview
-    for (const auto& L : g_scene.lights) {
-        if (L.type != scene_light_type::point) continue;
-
-        float model[16];
-        vec3 trans = vec3((float)L.position.x(), (float)L.position.y(), (float)L.position.z());
-        vec3 rot = vec3(0,0,0);
-        // Icon size (small); optionally scale with range but keep readable
-        float icon_scale = 0.08f;
-        vec3 scl = vec3(icon_scale, icon_scale, icon_scale);
-
-        make_model_trs(trans, rot, scl, model);
-        glUniformMatrix4fv(locModel, 1, GL_FALSE, model);
-
-        // Use light colour as icon colour (clamped)
-        float cr = std::min(1.0f, (float)L.radiance.x());
-        float cg = std::min(1.0f, (float)L.radiance.y());
-        float cb = std::min(1.0f, (float)L.radiance.z());
-        glUniform3f(locColor, cr, cg, cb);
-
-        glBindVertexArray(g_rasterSphereVAO);
-        glDrawElements(GL_TRIANGLES, g_rasterSphereIndexCount,
-                       GL_UNSIGNED_INT, (void*)0);
-    }
-
-    // Directional support removed: viewport lighting uses a fixed preview light.
+    RenderRasterScene(view, proj, pos, width, height);
 
     // Draw gizmo (render into raster FBO so it appears in the preview)
-    if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() && g_lineShader != 0) {
+    if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() &&
+        g_lineShader != 0) {
         const auto& obj = g_scene.objects[g_selected_object];
         float model[16];
         vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
         // Build gizmo model without object rotation so axes remain world-aligned
-        vec3 rot   = vec3(0,0,0);
+        vec3 rot = vec3(0, 0, 0);
         // gizmo scale based on object's radius (mesh/cube) for reasonable size
         float gizmo_scale = 0.5f * (float)std::max(0.5, obj.radius);
         vec3 scl = vec3(gizmo_scale, gizmo_scale, gizmo_scale);
@@ -2212,14 +1834,15 @@ static void RenderRasterToTexture(int width, int height)
 
         // Save depth state
         GLboolean wasDepthTest = glIsEnabled(GL_DEPTH_TEST);
-        GLint prevDepthFunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
+        GLint prevDepthFunc = 0;
+        glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
         // Draw on top of scene
         glDisable(GL_DEPTH_TEST);
 
         glUseProgram(g_lineShader);
         GLint locModelL = glGetUniformLocation(g_lineShader, "uModel");
-        GLint locViewL  = glGetUniformLocation(g_lineShader, "uView");
-        GLint locProjL  = glGetUniformLocation(g_lineShader, "uProj");
+        GLint locViewL = glGetUniformLocation(g_lineShader, "uView");
+        GLint locProjL = glGetUniformLocation(g_lineShader, "uProj");
         glUniformMatrix4fv(locViewL, 1, GL_FALSE, view);
         glUniformMatrix4fv(locProjL, 1, GL_FALSE, proj);
         glUniformMatrix4fv(locModelL, 1, GL_FALSE, model);
@@ -2241,7 +1864,11 @@ static void RenderRasterToTexture(int width, int height)
         glUseProgram(0);
 
         // Restore depth state
-        if (wasDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        if (wasDepthTest) {
+            glEnable(GL_DEPTH_TEST);
+        } else {
+            glDisable(GL_DEPTH_TEST);
+        }
         glDepthFunc(prevDepthFunc);
     }
 
@@ -3473,6 +3100,8 @@ static void process_dropped_files()
 // main
 // -----------------------------------------------------------------------------
 
+#include "editor_scene_panels.inl"
+
 int main()
 {
     glfwSetErrorCallback(glfw_error_callback);
@@ -3575,7 +3204,7 @@ int main()
                 // clear any pending popup
                 g_progress_popup_pending = false;
                 // Save final image to disk using existing helper
-                {
+                if (!g_render_result.pixels.empty()) {
                     const std::string out_path = "Renders/LastRender.ppm";
                     bool saved = write_ppm(out_path, g_render_result);
                     if (saved) {
@@ -3716,22 +3345,14 @@ int main()
                 ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
 
-                ImGuiID dock_main_id   = dockspace_id;
-                ImGuiID dock_left_id   = ImGui::DockBuilderSplitNode(
-                    dock_main_id, ImGuiDir_Left, 0.20f, nullptr, &dock_main_id);
-                ImGuiID dock_right_id  = ImGui::DockBuilderSplitNode(
-                    dock_main_id, ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
-
-                // Center: Viewport
-                ImGui::DockBuilderDockWindow("Viewport",       dock_main_id);
-
-                // Left: Scene Hierarchy and Lights
-                ImGui::DockBuilderDockWindow("Scene Hierarchy", dock_left_id);
-                ImGui::DockBuilderDockWindow("Lights",          dock_left_id);
-
-                // Right: Inspector and diagnostics
-                ImGui::DockBuilderDockWindow("Inspector",      dock_right_id);
-                ImGui::DockBuilderDockWindow("Debug Camera",   dock_right_id);
+                ImGuiID dock_main_id = dockspace_id;
+                ImGuiID dock_right_id = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Right, .28f, nullptr, &dock_main_id);
+                ImGuiID dock_tree_id = ImGui::DockBuilderSplitNode(dock_right_id, ImGuiDir_Up, .34f, nullptr, &dock_right_id);
+                ImGui::DockBuilderDockWindow("Viewport", dock_main_id);
+                ImGui::DockBuilderDockWindow("Outliner", dock_tree_id);
+                ImGui::DockBuilderDockWindow("Properties", dock_right_id);
+                ImGui::DockBuilderDockWindow("Render Settings", dock_right_id);
+                ImGui::DockBuilderDockWindow("Debug Camera", dock_right_id);
 
                 ImGui::DockBuilderFinish(dockspace_id);
             }
@@ -3793,186 +3414,7 @@ int main()
         // ---------------------------------------------------------------------
         // Scene Hierarchy
         // ---------------------------------------------------------------------
-        ImGui::Begin("Scene Hierarchy");
-        DrawPanelTitle("Scene", "Objects, transforms and quick creation tools.");
-        char scene_objects_chip[64];
-        char scene_materials_chip[64];
-        std::snprintf(scene_objects_chip, sizeof(scene_objects_chip), "%d objects", (int)g_scene.objects.size());
-        std::snprintf(scene_materials_chip, sizeof(scene_materials_chip), "%d materials", (int)g_scene.materials.size());
-        DrawInfoChip(scene_objects_chip);
-        ImGui::SameLine();
-        DrawInfoChip(scene_materials_chip);
-        DrawSectionLabel("Objects");
-
-        // List + selection
-        for (size_t i = 0; i < g_scene.objects.size(); ++i) {
-            bool is_selected = (int)i == g_selected_object;
-            if (ImGui::Selectable(g_scene.objects[i].name.c_str(), is_selected)) {
-                g_selected_object = (int)i;
-            }
-        }
-
-        if (g_scene.objects.empty()) {
-            ImGui::TextDisabled("No objects in scene.");
-        }
-
-        // ----------------------------------
-        // Add Sphere / Add Cube buttons
-        // ----------------------------------
-        if (ImGui::Button("Add Sphere")) {
-            scene_object obj;
-
-            obj.name = "Sphere " + std::to_string(g_scene.objects.size());
-            obj.type           = scene_object_type::sphere;
-            obj.material_index = -1;
-
-            obj.center       = point3(0, 0, -1);
-            obj.radius       = 0.5;
-            obj.mesh_index   = -1;
-            obj.translation  = vec3(0, 0, 0);
-            obj.rotation_deg = vec3(0, 0, 0);
-            obj.scale        = vec3(1, 1, 1);
-            obj.mesh_slot_materials.clear();
-
-            g_scene.objects.push_back(obj);
-            int new_idx = (int)g_scene.objects.size() - 1;
-            // capture a copy for undo/redo
-            scene_object snapshot = g_scene.objects[new_idx];
-            // push undo action: undo = remove, redo = re-insert
-            UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                [new_idx]() {
-                    if (new_idx >= 0 && new_idx < (int)g_scene.objects.size()) {
-                        g_scene.objects.erase(g_scene.objects.begin() + new_idx);
-                        if (g_scene.objects.empty()) g_selected_object = -1;
-                        else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
-                        g_world_dirty = true;
-                        g_cached_world.reset();
-                    }
-                },
-                [new_idx, snapshot]() {
-                    if (new_idx < 0) return;
-                    int insert_at = new_idx;
-                    if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
-                    g_scene.objects.insert(g_scene.objects.begin() + insert_at, snapshot);
-                    g_selected_object = insert_at;
-                    g_world_dirty = true;
-                    g_cached_world.reset();
-                },
-                "Add Object"
-            ));
-
-            g_selected_object = new_idx;
-            g_world_dirty = true;
-            g_cached_world.reset();
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Add Cube")) {
-            scene_object obj;
-
-            obj.name = "Cube " + std::to_string(g_scene.objects.size());
-
-            // If your enum is scene_object_type::box instead of ::cube, swap it here.
-            obj.type           = scene_object_type::cube;
-            obj.material_index = -1;
-
-            // Centre it roughly where spheres go
-            obj.center       = point3(0, 0, -1);
-
-            // Bounding sphere radius for a unit cube ([-0.5,0.5]^3) ≈ sqrt(3)*0.5
-            obj.radius       = std::sqrt(3.0) * 0.5;
-
-            obj.mesh_index   = -1;
-            obj.translation  = vec3(0, 0, 0);
-            obj.rotation_deg = vec3(0, 0, 0);
-            obj.scale        = vec3(1, 1, 1);
-            obj.mesh_slot_materials.clear();
-
-            g_scene.objects.push_back(obj);
-            int new_idx = (int)g_scene.objects.size() - 1;
-            scene_object snapshot = g_scene.objects[new_idx];
-            UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                [new_idx]() {
-                    if (new_idx >= 0 && new_idx < (int)g_scene.objects.size()) {
-                        g_scene.objects.erase(g_scene.objects.begin() + new_idx);
-                        if (g_scene.objects.empty()) g_selected_object = -1;
-                        else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
-                        g_world_dirty = true;
-                        g_cached_world.reset();
-                    }
-                },
-                [new_idx, snapshot]() {
-                    if (new_idx < 0) return;
-                    int insert_at = new_idx;
-                    if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
-                    g_scene.objects.insert(g_scene.objects.begin() + insert_at, snapshot);
-                    g_selected_object = insert_at;
-                    g_world_dirty = true;
-                    g_cached_world.reset();
-                },
-                "Add Object"
-            ));
-
-            g_selected_object = new_idx;
-            g_world_dirty = true;
-            g_cached_world.reset();
-        }
-
-        ImGui::SameLine();
-        ImGui::TextDisabled("Select object and press Del to remove.");
-
-
-        // Handle Delete key to remove selected object
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-                if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
-                g_selected_object >= 0 &&
-                g_selected_object < (int)g_scene.objects.size())
-            {
-                int del_idx = g_selected_object;
-                scene_object removed = g_scene.objects[del_idx];
-
-                // perform erase
-                g_scene.objects.erase(g_scene.objects.begin() + del_idx);
-
-                // Fix selection index
-                if (g_scene.objects.empty()) {
-                    g_selected_object = -1;
-                } else if (g_selected_object >= (int)g_scene.objects.size()) {
-                    g_selected_object = (int)g_scene.objects.size() - 1;
-                }
-
-                // Mark RT world dirty
-                g_world_dirty = true;
-                g_cached_world.reset();
-
-                // push undo action: undo = re-insert, redo = delete again
-                UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                    [del_idx, removed]() {
-                        // undo = re-insert
-                        int insert_at = del_idx;
-                        if (insert_at < 0) insert_at = 0;
-                        if (insert_at > (int)g_scene.objects.size()) insert_at = (int)g_scene.objects.size();
-                        g_scene.objects.insert(g_scene.objects.begin() + insert_at, removed);
-                        g_selected_object = insert_at;
-                        g_world_dirty = true;
-                        g_cached_world.reset();
-                    },
-                    [del_idx]() {
-                        // redo = perform delete again (after undo)
-                        if (del_idx >= 0 && del_idx < (int)g_scene.objects.size()) {
-                            g_scene.objects.erase(g_scene.objects.begin() + del_idx);
-                            if (g_scene.objects.empty()) g_selected_object = -1;
-                            else if (g_selected_object >= (int)g_scene.objects.size()) g_selected_object = (int)g_scene.objects.size() - 1;
-                            g_world_dirty = true;
-                            g_cached_world.reset();
-                        }
-                    },
-                    "Delete Object"
-                ));
-            }
-        }
-
-        ImGui::End();
+        DrawSceneOutliner();
 
         // ---------------------------------------------------------------------
         // Content drawer (textures + models), hidden by default and toggled
@@ -4022,12 +3464,8 @@ int main()
                 content_drawer_flags |= ImGuiWindowFlags_NoInputs;
             }
             ImGui::Begin("Content Drawer", nullptr, content_drawer_flags);
-            DrawPanelTitle("Content Drawer", "Textures, meshes and materials available in the current scene.");
-            DrawInfoChip("Ctrl+Space");
-            ImGui::SameLine();
-            ImGui::TextDisabled("Toggle drawer");
+            ImGui::TextDisabled("Drop files to import. Drag assets into the scene or graph. Ctrl+Space to close.");
             g_thumb_budget_per_frame = g_thumb_budget_default;
-            ImGui::TextDisabled("Drop images (.png/.jpg/.tga/.bmp) and models (.fbx/.obj) here to import. Double-click model to add to scene.");
             ImGui::Separator();
 
         // Assets search
@@ -4045,8 +3483,10 @@ int main()
             return n.find(assets_query) != std::string::npos;
         };
 
-            if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const float cellPad = 18.0f;
+        if (ImGui::BeginTabBar("AssetTypes")) {
+            if (ImGui::BeginTabItem("Textures")) {
+            ImGui::BeginChild("TexturesGrid", ImVec2(0,0));
+            const float cellPad = 12.0f;
             const ImVec2 thumbSize(80, 80);
             const float labelH = ImGui::GetTextLineHeightWithSpacing();
             const float cellW = thumbSize.x + cellPad * 2;
@@ -4059,7 +3499,7 @@ int main()
             for (int i = 0; i < (int)g_scene.textures.size(); ++i) {
                 auto& tex = g_scene.textures[i];
                 if (!matches_query(tex.name)) continue;
-                GLuint thumb = GetOrCreateTextureThumbnail(tex.path);
+                GLuint thumb = ImGui::IsRectVisible(ImVec2(cellW,cellH)) ? GetOrCreateTextureThumbnail(tex.path) : 0;
 
                 ImGui::BeginGroup();
                 std::string cell_id = std::string("tex_cell_") + std::to_string(i);
@@ -4083,16 +3523,13 @@ int main()
                 float imgX = p0.x + (cellW - thumbSize.x) * 0.5f;
                 ImGui::SetCursorScreenPos(ImVec2(imgX, p0.y + cellPad));
                 if (thumb) {
-                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,1), ImVec2(1,0));
+                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,0), ImVec2(1,1));
                 } else {
                     ImGui::Dummy(thumbSize);
                 }
                 // Center label beneath the image
                 const char* label = tex.name.c_str();
-                ImVec2 textSize = ImGui::CalcTextSize(label);
-                float textX = p0.x + (cellW - textSize.x) * 0.5f;
-                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + thumbSize.y + 4));
-                ImGui::TextUnformatted(label);
+                DrawAssetCellLabel(label,p0,p1,p0.y+cellPad+thumbSize.y+4);
 
                 ImGui::EndGroup();
 
@@ -4110,13 +3547,14 @@ int main()
             } else if (matched == 0 && !assets_query.empty()) {
                 ImGui::TextDisabled("No matching textures.");
             }
-            // If the last row of texture cells wasn't filled, ensure we move to the next line
-            // so the following "Models" section cannot appear to the right of the textures.
             if (col != 0) ImGui::NewLine();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
 
-        if (ImGui::CollapsingHeader("Models", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const float cellPad = 18.0f;
+        if (ImGui::BeginTabItem("Meshes")) {
+            ImGui::BeginChild("MeshesGrid", ImVec2(0,0));
+            const float cellPad = 12.0f;
             const ImVec2 iconSize(80, 80); // placeholder size or thumbnail
             const float labelH = ImGui::GetTextLineHeightWithSpacing();
             const float cellW = iconSize.x + cellPad * 2;
@@ -4154,8 +3592,8 @@ int main()
                 
                 // Single-click to select for Inspector
                 if (cell_clicked && !cell_double_clicked) {
+                    SelectSceneObject(-1);
                     g_selected_mesh_asset = m;
-                    g_selected_object = -1; // Deselect scene objects
                 }
                 // Drag from whole cell
                 if (ImGui::BeginDragDropSource()) {
@@ -4218,7 +3656,7 @@ int main()
                 if (!mesh.thumbnail_path.empty()) {
                     meshThumb = GetOrCreateTextureThumbnail(mesh.thumbnail_path);
                 } else {
-                    meshThumb = GetOrCreateModelThumbnail(m);
+                    meshThumb = ImGui::IsRectVisible(iconSize) ? GetOrCreateModelThumbnail(m) : 0;
                 }
                 if (meshThumb) {
                     ImGui::Image((ImTextureID)(intptr_t)meshThumb, iconSize, ImVec2(0,1), ImVec2(1,0));
@@ -4227,10 +3665,7 @@ int main()
                 }
                 // Center label
                 const char* label = mesh.name.c_str();
-                ImVec2 textSize = ImGui::CalcTextSize(label);
-                float textX = p0.x + (cellW - textSize.x) * 0.5f;
-                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + iconSize.y + 4));
-                ImGui::TextUnformatted(label);
+                DrawAssetCellLabel(label,p0,p1,p0.y+cellPad+iconSize.y+4);
                 ImGui::EndGroup();
 
                 // Allow dropping a texture onto the model tile to set thumbnail
@@ -4263,11 +3698,14 @@ int main()
             if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered()) {
                 g_selected_mesh_asset = -1;
             }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
 
         // Materials tab
-        if (ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const float cellPad = 18.0f;
+        if (ImGui::BeginTabItem("Materials")) {
+            ImGui::BeginChild("MaterialsGrid", ImVec2(0,0));
+            const float cellPad = 12.0f;
             const ImVec2 thumbSize(80, 80);
             const float labelH = ImGui::GetTextLineHeightWithSpacing();
             const float cellW = thumbSize.x + cellPad * 2;
@@ -4333,7 +3771,7 @@ int main()
                 auto& mat = g_scene.materials[mat_idx];
                 if (!matches_query(mat.name)) continue;
 
-                GLuint thumb = GetOrCreateMaterialThumbnail(mat_idx);
+                GLuint thumb = ImGui::IsRectVisible(ImVec2(cellW,cellH)) ? GetOrCreateMaterialThumbnail(mat_idx) : 0;
 
                 ImGui::BeginGroup();
                 std::string cell_id = std::string("mat_cell_") + std::to_string(mat_idx);
@@ -4373,17 +3811,14 @@ int main()
                 float imgX = p0.x + (cellW - thumbSize.x) * 0.5f;
                 ImGui::SetCursorScreenPos(ImVec2(imgX, p0.y + cellPad));
                 if (thumb) {
-                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,1), ImVec2(1,0));
+                    ImGui::Image((ImTextureID)(intptr_t)thumb, thumbSize, ImVec2(0,0), ImVec2(1,1));
                 } else {
                     ImGui::Dummy(thumbSize);
                 }
                 
                 // Center label beneath the image
                 const char* label = mat.name.c_str();
-                ImVec2 textSize = ImGui::CalcTextSize(label);
-                float textX = p0.x + (cellW - textSize.x) * 0.5f;
-                ImGui::SetCursorScreenPos(ImVec2(textX, p0.y + cellPad + thumbSize.y + 4));
-                ImGui::TextUnformatted(label);
+                DrawAssetCellLabel(label,p0,p1,p0.y+cellPad+thumbSize.y+4);
 
                 ImGui::EndGroup();
 
@@ -4403,13 +3838,11 @@ int main()
                 ImGui::TextDisabled("No matching materials.");
             }
             if (col != 0) ImGui::NewLine();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
 
-        // Accept OS file-drops preferentially when hovering this window
-        if (ImGui::IsWindowHovered()) {
-            // Nothing to do here directly; files are delivered via GLFW drop callback
-            // and processed by process_dropped_files(). The hover check simply
-            // communicates intent to users (tooltip or visual effect could be added).
+            ImGui::EndTabBar();
         }
 
             ImGui::End();
@@ -4419,235 +3852,10 @@ int main()
         }
 
         // ---------------------------------------------------------------------
-        // Lights
+        // Render settings
         // ---------------------------------------------------------------------
-        ImGui::Begin("Lights");
-        DrawPanelTitle("Lighting", "Directional sun, point lights and caustic controls.");
-
-        // Lights support both Point and Directional (Sun) types.
-
-        char lights_chip[64];
-        std::snprintf(lights_chip, sizeof(lights_chip), "%d lights", (int)g_scene.lights.size());
-        DrawInfoChip(lights_chip);
-        DrawSectionLabel("Scene Lights");
-
-        if (ImGui::Button("Add Light")) {
-            scene_light sl;
-            sl.name = "Light";
-            sl.type = scene_light_type::point;
-            sl.radiance = vec3(3.0, 3.0, 3.0);
-            sl.position = point3(0.0, 5.0, 0.0);
-            sl.range = 10.0;
-            g_scene.lights.push_back(sl);
-            g_world_dirty = true;
-            g_cached_world.reset();
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Add Sun")) {
-            scene_light sl;
-            sl.name = "Sun";
-            sl.type = scene_light_type::directional;
-            sl.radiance = vec3(20.0, 20.0, 20.0);
-            sl.direction = unit_vector(vec3(-0.3, -1.0, 0.2));
-            sl.angular_radius_deg = 0.53; // approximate real sun radius in degrees
-            g_scene.lights.push_back(sl);
-
-            // Mirror into camera preview defaults.
-            g_camera.use_sun = true;
-            g_camera.sun_dir = -sl.direction;
-            g_camera.sun_radiance = colour(sl.radiance.x(), sl.radiance.y(), sl.radiance.z());
-            g_camera.sun_angular_radius = sl.angular_radius_deg;
-            g_camera.sun_shadow_samples = 16;
-
-            g_world_dirty = true;
-            g_cached_world.reset();
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Remove Last Light") && !g_scene.lights.empty()) {
-            auto& removed_light = g_scene.lights.back();
-            bool was_sun = (removed_light.type == scene_light_type::directional);
-            g_scene.lights.pop_back();
-            
-            // If we removed a sun, check if any other suns remain
-            if (was_sun) {
-                bool has_sun = false;
-                for (const auto& L : g_scene.lights) {
-                    if (L.type == scene_light_type::directional) {
-                        has_sun = true;
-                        break;
-                    }
-                }
-                // Disable MNEE if no sun remains
-                if (!has_sun) {
-                    g_camera.use_sun = false;
-                    g_camera.enable_mnee = false;
-                }
-            }
-            
-            g_world_dirty = true;
-            g_cached_world.reset();
-        }
-
-        ImGui::Separator();
-
-        // List lights with editable properties
-        for (size_t li = 0; li < g_scene.lights.size(); ++li) {
-            auto& L = g_scene.lights[li];
-            ImGui::PushID((int)li);
-            bool open = ImGui::TreeNode(L.name.c_str());
-            if (open) {
-                // Name
-                char namebuf[256] = {0};
-                std::strncpy(namebuf, L.name.c_str(), sizeof(namebuf)-1);
-                if (ImGui::InputText("Name", namebuf, sizeof(namebuf))) {
-                    L.name = std::string(namebuf);
-                }
-
-                // Radiance (colour + intensity)
-                float radR = (float)L.radiance.x();
-                float radG = (float)L.radiance.y();
-                float radB = (float)L.radiance.z();
-                float intensity = std::max(1e-6f, std::max(std::max(radR, radG), radB));
-                float color[3] = { radR / intensity, radG / intensity, radB / intensity };
-
-                bool changed = false;
-                if (ImGui::ColorEdit3("Light Color", color)) {
-                    changed = true;
-                }
-                float inten_f = intensity;
-                if (ImGui::DragFloat("Intensity", &inten_f, 0.1f, 0.0f, 1e6f)) {
-                    if (inten_f < 0.0f) inten_f = 0.0f;
-                    changed = true;
-                }
-
-                if (changed) {
-                    L.radiance = vec3(color[0] * inten_f, color[1] * inten_f, color[2] * inten_f);
-                    g_world_dirty = true; g_cached_world.reset();
-                }
-
-                if (L.type == scene_light_type::directional) {
-                    ImGui::TextDisabled("Type: Directional");
-
-                    // Convert stored light.direction (light -> scene) to a user-friendly
-                    // sun direction from scene -> sun for angles. We expose Azimuth and
-                    // Elevation (degrees) sliders which are easier to reason about.
-                    vec3 sun_dir = -L.direction; // scene -> sun
-
-                    // Compute azimuth (0..360) and elevation (-90..90) from sun_dir
-                    double toDeg = 180.0 / 3.14159265358979323846;
-                    double toRad = 3.14159265358979323846 / 180.0;
-                    double az = std::atan2((double)sun_dir.z(), (double)sun_dir.x()) * toDeg;
-                    if (az < 0.0) az += 360.0;
-                    double el = std::asin(std::clamp((double)sun_dir.y(), -1.0, 1.0)) * toDeg;
-
-                    float azf = (float)az;
-                    float elf = (float)el;
-                    bool ang_changed = false;
-                    if (ImGui::SliderFloat("Azimuth (deg)", &azf, 0.0f, 360.0f)) ang_changed = true;
-                    if (ImGui::SliderFloat("Elevation (deg)", &elf, -90.0f, 90.0f)) ang_changed = true;
-
-                    if (ang_changed) {
-                        double azr = (double)azf * toRad;
-                        double elr = (double)elf * toRad;
-                        vec3 new_sun_dir((float)(std::cos(elr) * std::cos(azr)),
-                                         (float)std::sin(elr),
-                                         (float)(std::cos(elr) * std::sin(azr)));
-                        L.direction = -new_sun_dir; // store as light -> scene
-                        g_world_dirty = true; g_cached_world.reset();
-
-                        // Mirror into camera sun parameters.
-                        g_camera.use_sun = true;
-                        g_camera.sun_dir = new_sun_dir; // scene -> sun
-                        g_camera.sun_radiance = colour(L.radiance.x(), L.radiance.y(), L.radiance.z());
-                    }
-
-                    // Show computed direction (read-only) for clarity
-                    float dirf[3] = { (float)L.direction.x(), (float)L.direction.y(), (float)L.direction.z() };
-                    ImGui::Text("Direction (light->scene): %.3f, %.3f, %.3f", dirf[0], dirf[1], dirf[2]);
-
-                    // Angular radius control (degrees)
-                    double angv = L.angular_radius_deg;
-                    double ang_min = 0.0, ang_max = 10.0;
-                    if (ImGui::SliderScalar("Angular radius (deg)", ImGuiDataType_Double, &angv, &ang_min, &ang_max)) {
-                        L.angular_radius_deg = angv;
-                        g_camera.sun_angular_radius = angv;
-                        g_world_dirty = true; g_cached_world.reset();
-                    }
-
-                    int sun_samples = g_camera.sun_shadow_samples;
-                    if (ImGui::DragInt("Sun shadow samples", &sun_samples, 1, 0, 64)) {
-                        if (sun_samples < 0) sun_samples = 0;
-                        if (sun_samples > 256) sun_samples = 256;
-                        g_camera.sun_shadow_samples = sun_samples;
-                        g_world_dirty = true; g_cached_world.reset();
-                    }
-                } else {
-                    ImGui::TextDisabled("Type: Point");
-                    float posf[3] = { (float)L.position.x(), (float)L.position.y(), (float)L.position.z() };
-                    if (ImGui::DragFloat3("Position", posf, 0.1f)) {
-                        L.position = point3(posf[0], posf[1], posf[2]);
-                        g_world_dirty = true; g_cached_world.reset();
-                    }
-                    float rangef = (float)L.range;
-                    if (ImGui::DragFloat("Range", &rangef, 0.1f, 0.0f, 1e6f)) {
-                        L.range = rangef; g_world_dirty = true; g_cached_world.reset();
-                    }
-                }
-
-                ImGui::TreePop();
-            }
-            ImGui::PopID();
-        }
-
-        ImGui::Separator();
-        // Moved here: Specular caustics (MNEE) controls live under the Lights tab
-        {
-            bool prev = g_camera.enable_mnee;
-            ImGui::Checkbox("Approximate caustics (experimental)", &g_camera.enable_mnee);
-            if (g_camera.enable_mnee && !prev) {
-                UpdateMNEEFromScene();
-            }
-            if (!g_camera.enable_mnee) {
-                g_camera.mnee_has_sphere = false;
-            }
-            if (g_camera.enable_mnee) {
-                if (g_camera.mnee_has_sphere) {
-                    ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
-                        g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(), g_camera.mnee_sphere_center.z(),
-                        g_camera.mnee_sphere_radius, g_camera.mnee_sphere_ior);
-                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 1, 256);
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Point light caustics budget. 1-16 = fast preview, 64-256 = final quality.\nWARNING: High values cause EXTREME slowdown!");
-                    }
-                    ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
-                    {
-                        float gain = (float)g_camera.mnee_gain_scale;
-                        if (ImGui::SliderFloat("MNEE Gain scale", &gain, 0.5f, 3.0f)) {
-                            g_camera.mnee_gain_scale = gain;
-                        }
-                    }
-                    {
-                        double ang = g_camera.sun_angular_radius;
-                        float angf = (float)ang;
-                        if (ImGui::SliderFloat("Sun angular radius (deg)", &angf, 0.0f, 2.0f)) {
-                            g_camera.sun_angular_radius = (double)angf;
-                        }
-                    }
-                } else {
-                    ImGui::TextDisabled("No dielectric sphere found in scene.");
-                }
-            }
-        }
-
-        ImGui::End();
-
-        // ---------------------------------------------------------------------
-        // Inspector
-        // ---------------------------------------------------------------------
-        ImGui::Begin("Inspector");
-        DrawPanelTitle("Inspector", "Camera, quality and output settings.");
+        ImGui::Begin("Render Settings");
+        DrawPanelTitle("Render Settings");
         DrawSectionLabel("Camera");
         ImGui::Text("Position: (%.2f, %.2f, %.2f)",
             g_editor_cam.position.x(),
@@ -4655,7 +3863,7 @@ int main()
             g_editor_cam.position.z());
         ImGui::Text("Yaw: %.2f, Pitch: %.2f", g_editor_cam.yaw, g_editor_cam.pitch);
 
-        DrawSectionLabel("Navigation");
+        if (ImGui::CollapsingHeader("Editor navigation")) {
         ImGui::Text("Controls:");
         ImGui::Text("  WASD = move, Q/E = down/up");
         ImGui::Text("  RMB drag in Viewport = look");
@@ -4672,6 +3880,8 @@ int main()
             // camera reset doesn't dirty world
         }
 
+        }
+
         DrawSectionLabel("Render Quality");
 
         int spp = g_camera.samples_per_pixel;
@@ -4686,38 +3896,15 @@ int main()
             g_camera.max_depth = max_depth;
         }
 
-        // Quality presets
-        DrawSectionLabel("Presets");
-        if (ImGui::Button("Fast Preview")) {
-            g_camera.samples_per_pixel = 256;
-            g_camera.max_depth = 20;
-            g_camera.mnee_per_thread_budget = 32;
-            g_camera.direct_light_samples = 2;
+        const char* presets[] = {"Custom", "Preview", "Medium", "Final"};
+        int preset = 0;
+        if (ImGui::Combo("Quality preset", &preset, presets, IM_ARRAYSIZE(presets))) {
+            const int samples[] = {0,256,512,2048}, depths[] = {0,20,35,50}, lights[] = {0,2,4,6};
+            if (preset > 0) {
+                g_camera.samples_per_pixel = samples[preset]; g_camera.max_depth = depths[preset];
+                g_camera.direct_light_samples = lights[preset];
+            }
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=256, Depth=20, MNEE=32 - preview settings");
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Medium Quality")) {
-            g_camera.samples_per_pixel = 512;
-            g_camera.max_depth = 35;
-            g_camera.mnee_per_thread_budget = 64;
-            g_camera.direct_light_samples = 4;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=512, Depth=35, MNEE=64 - medium quality");
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Final Quality")) {
-            g_camera.samples_per_pixel = 2048;
-            g_camera.max_depth = 50;
-            g_camera.mnee_per_thread_budget = 256;
-            g_camera.direct_light_samples = 6;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SPP=2048, Depth=50, MNEE=256 - final production quality");
-        }
-        // Direct lighting sampling (NEE/MIS) removed
         DrawSectionLabel("Post");
         // Exposure control (linear multiplier applied in renderer)
         {
@@ -4742,7 +3929,7 @@ int main()
                 if (ds > 1.0f) ds = 1.0f;
                 g_renderer.denoiser_strength = ds;
             }
-            ImGui::TextDisabled("Strength controls the aggressiveness of OIDN (0 = off).");
+            ImGui::TextDisabled("Final image blend: 0 = raw, 1 = fully denoised.");
 #else
             ImGui::TextDisabled("OpenImageDenoise not available in this build.");
 #endif
@@ -4840,9 +4027,13 @@ int main()
             // background doesn't require world rebuild
         }
 
-        ImGui::Separator();
-        ImGui::Text("Selection");
-
+        DrawCausticSettings();
+        ImGui::End();
+        if (g_focus_properties) { ImGui::SetNextWindowFocus(); g_focus_properties = false; }
+        ImGui::Begin("Properties");
+        if (g_selected_light >= 0 && g_selected_light < int(g_scene.lights.size())) {
+            DrawSelectedLight();
+        } else {
         // Show mesh asset inspector if a mesh asset is selected
         if (g_selected_mesh_asset >= 0 && g_selected_mesh_asset < (int)g_scene.meshes.size()) {
             auto& mesh = g_scene.meshes[g_selected_mesh_asset];
@@ -5656,6 +4847,7 @@ int main()
             ImGui::TextDisabled("No object selected.");
         }
 
+        }
         ImGui::End();
 
         // ---------------------------------------------------------------------
@@ -5795,7 +4987,8 @@ int main()
                 }
 
                 // Build world only if needed
-                if (!g_cached_world || g_world_dirty) {
+                const bool needs_cpu_world = g_render_selection.backend == render_backend::cpu || g_camera.enable_mnee;
+                if (needs_cpu_world && (!g_cached_world || g_world_dirty)) {
                     auto new_world = std::make_shared<hittable_list>(
                         build_world_from_scene(g_scene)
                     );
@@ -5820,12 +5013,22 @@ int main()
                 g_progress_popup_pending = false;
 
                 // Kick off worker thread
-                auto world_copy = g_cached_world;
+                auto world_copy = needs_cpu_world ? g_cached_world : nullptr;
                 camera cam_copy = g_camera;
+                renderer settings_copy = g_renderer;
+                render_selection selection_copy = g_render_selection;
+                auto scene_copy = std::make_shared<const scene>(g_scene);
+                {
+                    std::lock_guard<std::mutex> lock(g_render_mutex);
+                    g_render_result = {};
+                    g_render_has_result.store(false);
+                    g_render_diagnostic = selection_copy.backend == render_backend::cpu
+                        ? "Rendering with CPU." : "Preparing GPU ray tracing...";
+                }
                 g_render_final_image_ready.store(false);
 
                 // Safety check: ensure world is valid before starting render
-                if (!world_copy) {
+                if (needs_cpu_world && !world_copy) {
                     std::fprintf(stderr, "ERROR: Cannot start render - world is null!\n");
                     g_render_in_progress = false;
                     g_cancel_flag.store(false);
@@ -5841,14 +5044,8 @@ int main()
                         }
                     }
 
-                    g_render_thread = std::thread([world_copy, cam_copy]() mutable {
+                    g_render_thread = std::thread([world_copy, cam_copy, settings_copy, selection_copy, scene_copy]() mutable {
                         try {
-                            // Additional safety check inside thread
-                            if (!world_copy) {
-                                std::fprintf(stderr, "[ERROR] World copy is NULL inside render thread! Aborting.\n");
-                                return;
-                            }
-
                             size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
                             
                             // Build caustics photon map once before render. Build when
@@ -5942,8 +5139,9 @@ int main()
                                 throw std::runtime_error("Render dimensions exceed maximum");
                             }
                             
+                            std::string diagnostic;
                             render_result img =
-                                g_renderer.render(*world_copy, cam_copy,
+                                render_selected(selection_copy, *scene_copy, world_copy.get(), cam_copy, settings_copy,
                                                   &g_cancel_flag, &g_render_progress,
                                                   // progress callback: write partial image into shared result
                                                   [](const render_result& partial) {
@@ -5956,32 +5154,76 @@ int main()
                                                       } catch (...) {
                                                           std::fprintf(stderr, "[ERROR] Progress callback unknown exception\n");
                                                       }
+                                                  }, diagnostic, [](const std::string& status) {
+                                                      std::lock_guard<std::mutex> lock(g_render_mutex);
+                                                      g_render_diagnostic = status;
                                                   });
 
                             // final result: store and mark final-ready
                             {
                                 std::lock_guard<std::mutex> lock(g_render_mutex);
                                 g_render_result = std::move(img);
+                                g_render_diagnostic = g_cancel_flag.load() ? "Render cancelled." : diagnostic;
                                 g_render_has_result = true;
                                 g_render_final_image_ready.store(true);
                             }
                         } catch (const std::bad_alloc& e) {
+                            std::lock_guard<std::mutex> lock(g_render_mutex);
+                            g_render_diagnostic = "Render failed: insufficient memory.";
                             std::fprintf(stderr, "\n!!! FATAL: Memory allocation failed in render thread !!!\n");
                             std::fprintf(stderr, "[EXCEPTION] bad_alloc: %s\n", e.what());
                             std::fprintf(stderr, "[CRASH] Likely ran out of memory during photon map or render buffer allocation\n");
                         } catch (const std::exception& e) {
+                            std::lock_guard<std::mutex> lock(g_render_mutex);
+                            g_render_diagnostic = std::string("Render failed: ") + e.what();
                             std::fprintf(stderr, "\n!!! FATAL: Exception in render thread !!!\n");
                             std::fprintf(stderr, "[EXCEPTION] Type: std::exception\n");
                             std::fprintf(stderr, "[EXCEPTION] what(): %s\n", e.what());
                         } catch (...) {
+                            std::lock_guard<std::mutex> lock(g_render_mutex);
+                            g_render_diagnostic = "Render failed with an unknown error.";
                             std::fprintf(stderr, "\n!!! FATAL: Unknown exception in render thread !!!\n");
                             std::fprintf(stderr, "[CRASH] Caught non-standard exception (possible access violation or segfault)\n");
                         }
+                        // Completion must reach the UI on errors and cancellation too.
+                        g_render_final_image_ready.store(true);
+                        g_render_has_result.store(true);
                     });
                 }
         };
 
         bool request_render = false;
+        // Device discovery does not stall a frame or require a Vulkan driver.
+        static auto discovery = std::async(std::launch::async, enumerate_render_devices);
+        static render_device_list devices;
+        static bool devices_ready = false;
+        if (!devices_ready && discovery.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            devices = discovery.get();
+            devices_ready = true;
+        }
+        std::string device_label = "CPU";
+        for (const auto& device : devices.devices)
+            if (g_render_selection.backend == render_backend::vulkan && device.id == g_render_selection.device_id)
+                device_label = device.name;
+        ImGui::BeginDisabled(g_render_in_progress);
+        ImGui::SetNextItemWidth(250);
+        if (ImGui::BeginCombo("##RenderDevice", device_label.c_str())) {
+            if (ImGui::Selectable("CPU", g_render_selection.backend == render_backend::cpu))
+                g_render_selection = {};
+            for (const auto& device : devices.devices) {
+                ImGui::BeginDisabled(!device.compatible);
+                if (ImGui::Selectable(device.name.c_str(), g_render_selection.device_id == device.id))
+                    g_render_selection = {render_backend::vulkan, device.id};
+                ImGui::EndDisabled();
+                if (!device.compatible && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", device.reason.c_str());
+            }
+            if (!devices_ready) ImGui::TextDisabled("Detecting GPUs...");
+            else if (!devices.diagnostic.empty()) ImGui::TextWrapped("%s", devices.diagnostic.c_str());
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 4.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
@@ -6017,6 +5259,9 @@ int main()
         ImGui::RadioButton("RT##ViewportMode", &g_viewport_mode, 0);
         ImGui::SameLine();
         ImGui::RadioButton("Raster##ViewportMode", &g_viewport_mode, 1);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Live materials and shadows. Use Render for full reflections, glass and indirect lighting.");
+        if (g_viewport_mode == 1 && !raster_preview::material_error.empty())
+            ImGui::TextColored(ImVec4(1,.6f,.3f,1),"%s",raster_preview::material_error.c_str());
         ImGui::PopStyleVar(2);
 
         DrawInfoChip(viewport_res_chip);
@@ -6024,6 +5269,10 @@ int main()
         DrawInfoChip(viewport_quality_chip);
         ImGui::SameLine();
         DrawInfoChip(g_render_in_progress ? "Render Active" : "Ready");
+        {
+            std::lock_guard<std::mutex> lock(g_render_mutex);
+            if (!g_render_diagnostic.empty()) ImGui::TextWrapped("%s", g_render_diagnostic.c_str());
+        }
 
         if (g_render_in_progress) {
             ImGui::Spacing();
@@ -6213,7 +5462,7 @@ int main()
                             if (!did_hit_gizmo) {
                                 int picked = PerformPick(tex_w, tex_h, (int)sx, (int)sy);
                                 if (picked >= 0 && picked < (int)g_scene.objects.size()) {
-                                    g_selected_object = picked;
+                                    SelectSceneObject(picked);
                                     g_show_gizmo = true;
                                 } else {
                                     g_selected_object = -1;
@@ -6354,7 +5603,8 @@ int main()
         glfwSwapBuffers(window);
     }
 
-    g_editor_previews.stop();
+    StopEditorPreviews();
+    StopRasterPreview();
     if (g_materials_dirty) SaveMaterialsManifest();
 
     // Cleanup
@@ -6385,6 +5635,7 @@ int main()
     }
 
     if (g_rasterShader)   glDeleteProgram(g_rasterShader);
+    if (g_modelThumbnailShader) glDeleteProgram(g_modelThumbnailShader);
     if (g_rasterColorTex) glDeleteTextures(1, &g_rasterColorTex);
     if (g_rasterDepthRBO) glDeleteRenderbuffers(1, &g_rasterDepthRBO);
     if (g_rasterFBO)      glDeleteFramebuffers(1, &g_rasterFBO);

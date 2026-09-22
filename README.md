@@ -5,6 +5,8 @@
 
 Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, featuring:
 - CPU path tracing (GGX PBR, dielectric Fresnel, microfacet BRDFs)
+- Optional Vulkan hardware ray tracing with GPU selection and CPU fallback ([backend and validation](src/gpu/README.md))
+- [Editor layout, sphere previews and thumbnail caching](src/core/EDITOR_PREVIEWS.md).
 - GPU raster preview for instant feedback (OpenGL, correct TRS)
 - Interactive ImGui editor with gizmo, picking, and scene graph
 - Assimp-powered import pipeline (OBJ/FBX + textures)
@@ -22,7 +24,7 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 ## Features
 ### Rendering
 - GGX PBR with metallic/roughness workflow ([model, audit, and validation](docs/pbr-validation.md))
-- Dielectric Fresnel (Schlick/Shirley) & microfacet sampling  
+- Exact dielectric Fresnel and GGX visible-normal sampling
 - Correct inverse-transpose normals under non-uniform scale  
 - Unified transform wrapper for spheres, cubes, and meshes  
 - BVH acceleration & AABB optimisations  

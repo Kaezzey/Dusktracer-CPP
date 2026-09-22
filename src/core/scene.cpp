@@ -47,11 +47,6 @@ static std::shared_ptr<texture> load_texture_path(const std::string& path, textu
     textures[key] = result;
     return result;
 }
-static std::shared_ptr<texture> load_scene_texture(const scene& scn, int index,
-        texture_sample_space space = texture_sample_space::srgb_color) {
-    return index < 0 || index >= (int)scn.textures.size() ? nullptr : load_texture_path(scn.textures[index].path,space);
-}
-
 // ------------------------------------------------------------
 // Helper: lightweight default materials (shared once)
 // ------------------------------------------------------------
@@ -78,7 +73,7 @@ static std::shared_ptr<material> get_default_magenta_mat()
 // using scene.texture indices
 // ------------------------------------------------------------
 std::shared_ptr<material> build_rt_material(const scene& scn,
-                                            const scene_material& m)
+                                            const scene_material& m, const material_texture_loader& loader)
 {
     auto make_base_colour = [&](const vec3& c) {
         return std::make_shared<solid_colour>(
@@ -92,17 +87,19 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         );
     };
 
+    auto load_path = [&](const std::string& path, texture_sample_space space) {
+        return loader ? loader(path, space) : load_texture_path(path, space);
+    };
+    auto load_index = [&](int index, texture_sample_space space) -> std::shared_ptr<texture> {
+        return index < 0 || index >= int(scn.textures.size()) ? nullptr : load_path(scn.textures[index].path, space);
+    };
     auto graph_loader = [&](const graph_node& node, bool srgb) -> std::shared_ptr<texture> {
         auto space = srgb ? texture_sample_space::srgb_color : texture_sample_space::linear_data;
-        // Paths survive manifest reloads and asset index changes.
-        if (!node.texture_path.empty()) {
-            return load_texture_path(node.texture_path,space);
-        }
-        return load_scene_texture(scn, node.texture_index, space);
+        return node.texture_path.empty() ? load_index(node.texture_index, space) : load_path(node.texture_path, space);
     };
     auto input_texture = [&](int slot, int legacy, texture_sample_space space) {
         if (!m.graph.nodes.empty()) return compile_material_graph(m.graph, slot, graph_loader);
-        return load_scene_texture(scn, legacy, space);
+        return load_index(legacy, space);
     };
 
     switch (m.model) {
@@ -277,11 +274,9 @@ hittable_list build_world_from_scene(const scene& scn)
         if (obj.type == scene_object_type::sphere) {
             auto mat = get_material(obj.material_index);
 
-            // Create unit sphere at origin and apply editor transforms via transform wrapper.
-            // Use uniform scale = obj.scale.x * obj.radius (obj.scale.x used as uniform multiplier)
-            double s = obj.scale.x();
-            if (s <= 0.0) s = 1.0;
-            s *= obj.radius;
+            vec3 scale = obj.scale;
+            for (int axis = 0; axis < 3; ++axis) if (scale[axis] == 0) scale[axis] = 1;
+            scale *= obj.radius;
 
             vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
 
@@ -291,7 +286,7 @@ hittable_list build_world_from_scene(const scene& scn)
                 unit_sphere,
                 translation,
                 obj.rotation_deg,
-                vec3(s, s, s)
+                scale
             );
 
             world.add(inst);
@@ -306,11 +301,11 @@ hittable_list build_world_from_scene(const scene& scn)
                 mat
             );
 
-            // Use scale.x as uniform scale (if <=0, clamp to 1)
+            // Preserve nonuniform and mirrored local scale.
             vec3 scl = obj.scale;
-            if (scl.x() <= 0.0) scl = vec3(1.0, scl.y(), scl.z());
-            if (scl.y() <= 0.0) scl = vec3(scl.x(), 1.0, scl.z());
-            if (scl.z() <= 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
+            if (scl.x() == 0.0) scl = vec3(1.0, scl.y(), scl.z());
+            if (scl.y() == 0.0) scl = vec3(scl.x(), 1.0, scl.z());
+            if (scl.z() == 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
 
             // Combine center + translation for instance transform
             vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
@@ -399,11 +394,11 @@ hittable_list build_world_from_scene(const scene& scn)
         // available, `triangle_mesh` falls back to a BVH.
         auto tri_mesh = std::make_shared<triangle_mesh>(tri_list->objects);
 
-        // Apply instance transform (translation, rotation_deg, uniform scale)
+        // Apply the shared local-scale, rotation, translation convention
         vec3 scl = obj.scale;
-            if (scl.x() <= 0.0) scl = vec3(1.0, scl.y(), scl.z());
-            if (scl.y() <= 0.0) scl = vec3(scl.x(), 1.0, scl.z());
-            if (scl.z() <= 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
+            if (scl.x() == 0.0) scl = vec3(1.0, scl.y(), scl.z());
+            if (scl.y() == 0.0) scl = vec3(scl.x(), 1.0, scl.z());
+            if (scl.z() == 0.0) scl = vec3(scl.x(), scl.y(), 1.0);
 
             vec3 translation = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
 
@@ -449,13 +444,15 @@ void build_emissive_surfaces(const scene& scn, camera& cam)
         auto mat = build_rt_material(scn,description);
         vec3 translation = obj.translation+obj.center;
         if (obj.type == scene_object_type::sphere) {
-            double scale = (obj.scale.x() > 0 ? obj.scale.x() : 1)*obj.radius;
-            if (scale <= 0) continue;
+            if (obj.radius <= 0) continue;
+            vec3 scale = obj.scale;
+            for (int axis = 0; axis < 3; ++axis) if (scale[axis] == 0) scale[axis] = 1;
+            scale *= obj.radius;
             add(std::make_shared<transform>(std::make_shared<sphere>(point3(),1,mat),
-                translation,obj.rotation_deg,vec3(scale,scale,scale)));
+                translation,obj.rotation_deg,scale));
         } else if (obj.type == scene_object_type::cube) {
             vec3 scale = obj.scale;
-            for (int i = 0; i < 3; ++i) if (scale[i] <= 0) scale[i] = 1;
+            for (int i = 0; i < 3; ++i) if (scale[i] == 0) scale[i] = 1;
             auto faces = box(point3(-.5,-.5,-.5),point3(.5,.5,.5),mat);
             for (const auto& face : faces->objects)
                 add(std::make_shared<transform>(face,translation,obj.rotation_deg,scale));

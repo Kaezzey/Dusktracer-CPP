@@ -226,32 +226,13 @@ private:
     // This is done once in the constructor so the hit() path is cheaper.
     void orthonormalise_vertex_frames() {
         auto fix_one = [](const vec3& N_in, vec3& T_in, vec3& B_in) {
-            vec3 N = unit_vector(N_in);
-
-            // Orthonormalise T to N
-            vec3 T = T_in;
-            if (T.near_zero()) {
-                // Construct some tangent if broken
-                vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-                T = cross(up, N);
-            } else {
-                T = T - dot(T, N) * N;
-            }
-            T = unit_vector(T);
-
-            // B from N x T
-            vec3 B = cross(N, T);
-            if (B.near_zero()) {
-                // last resort
-                vec3 up = (std::fabs(N.y()) < 0.999) ? vec3(0,1,0) : vec3(1,0,0);
-                T = unit_vector(cross(up, N));
-                B = cross(N, T);
-            } else {
-                B = unit_vector(B);
-            }
-
-            T_in = T;
-            B_in = B;
+            // Preserve imported UV handedness, including mirrored UV islands.
+            // The same frame construction is used by GPU vertex uploads.
+            hit_record frame;
+            frame.normal = safe_unit_vector(N_in);
+            frame.set_tangent_frame(T_in, B_in);
+            T_in = frame.tangent;
+            B_in = frame.bitangent;
         };
 
         fix_one(n0, t0, b0);

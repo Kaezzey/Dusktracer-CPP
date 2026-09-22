@@ -1,5 +1,6 @@
 #include "../../include/core/dusktracer.h"
 #include "../../include/core/renderer.h"
+#include "core/denoise.h"
 #include "../../include/core/interval.h"
 
 #include <cmath>
@@ -855,7 +856,6 @@ render_result renderer::render(
                                                     filter.setImage("output", outBuf, oidn::Format::Float3, w, h);
                                                     filter.set("hdr", true);
                                                     filter.set("srgb", false);
-                                                    filter.set("strength", (float)this->denoiser_strength);
                                                     filter.commit();
                                                     
                                                     // Final cancel check before expensive execute
@@ -863,7 +863,7 @@ render_result renderer::render(
                                                         filter.execute();
                                                         
                                                         void* outPtr = outBuf.getData();
-                                                        if (outPtr) {
+                                                        if (outPtr && colorPtr && device.getError(errorMessage) == oidn::Error::None) {
                                                             // Copy denoised result into a shared cache so the UI can
                                                             // display a stable denoised image while rendering continues.
                                                             {
@@ -871,7 +871,11 @@ render_result renderer::render(
                                                                 if (s_cached_denoised_hdr.size() != hdr_buffer.size()) {
                                                                     s_cached_denoised_hdr.resize(hdr_buffer.size());
                                                                 }
-                                                                std::memcpy(s_cached_denoised_hdr.data(), outPtr, bufBytes);
+                                                                const float blend = float(std::clamp(denoiser_strength,0.0,1.0));
+                                                                const auto* raw = static_cast<const float*>(colorPtr);
+                                                                const auto* filtered = static_cast<const float*>(outPtr);
+                                                                for (size_t i = 0; i < hdr_buffer.size(); ++i)
+                                                                    s_cached_denoised_hdr[i] = raw[i] + blend*(filtered[i]-raw[i]);
                                                             }
                                                             s_cached_denoised_ts.store(now_ms);
                                                         }
@@ -1040,61 +1044,11 @@ render_result renderer::render(
     std::vector<float> denoised_buffer;
     denoised_buffer = hdr_buffer; // default: copy
 
-#ifdef HAVE_OIDN
-    if (this->use_denoiser && need_aux_aovs) {
-        try {
-            const int pixels = w * h;
-            oidn::DeviceRef device = oidn::newDevice();
-            device.commit();
-            oidn::FilterRef filter = device.newFilter("RT");
-
-            // Create device-accessible buffers and copy host HDR data into them
-            size_t bufBytes = (size_t)pixels * 3 * sizeof(float);
-            oidn::BufferRef colorBuf = device.newBuffer(bufBytes);
-            oidn::BufferRef outBuf = device.newBuffer(bufBytes);
-            // Copy HDR floats into the device buffer
-            void* colorPtr = colorBuf.getData();
-            if (colorPtr) {
-                std::memcpy(colorPtr, hdr_buffer.data(), bufBytes);
-            }
-
-            // Create and copy AOV buffers (albedo + normal) into device buffers
-            oidn::BufferRef albedoBuf = device.newBuffer(bufBytes);
-            oidn::BufferRef normalBuf = device.newBuffer(bufBytes);
-            void* albPtr = albedoBuf.getData();
-            if (albPtr) {
-                std::memcpy(albPtr, albedo_buffer.data(), bufBytes);
-            }
-            void* nrmPtr = normalBuf.getData();
-            if (nrmPtr) {
-                std::memcpy(nrmPtr, normal_buffer.data(), bufBytes);
-            }
-
-            filter.setImage("color", colorBuf, oidn::Format::Float3, w, h);
-            filter.setImage("albedo", albedoBuf, oidn::Format::Float3, w, h);
-            filter.setImage("normal", normalBuf, oidn::Format::Float3, w, h);
-            filter.setImage("output", outBuf, oidn::Format::Float3, w, h);
-            filter.set("hdr", true);
-            filter.set("srgb", false);
-            // strength: 0.0 = off, typical 0.2..0.5
-            filter.set("strength", (float)this->denoiser_strength);
-            filter.commit();
-            filter.execute();
-
-            // Copy denoised data back to host-visible vector
-            void* outPtr = outBuf.getData();
-            if (outPtr) {
-                std::memcpy(denoised_buffer.data(), outPtr, bufBytes);
-            }
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "OIDN exception: %s\n", e.what());
-        } catch (...) {
-            std::fprintf(stderr, "Unknown exception while running OIDN\n");
-        }
+    if (use_denoiser && need_aux_aovs && (!cancel_flag || !cancel_flag->load())) {
+        const auto error = denoise_hdr(denoised_buffer, albedo_buffer, normal_buffer,
+                                       w, h, denoiser_strength, cancel_flag);
+        if (!error.empty()) std::fprintf(stderr, "Denoiser: %s\n", error.c_str());
     }
-#else
-    (void)denoised_buffer; // silence unused warning when OIDN disabled
-#endif
 
     // Final tonemap/gamma pass: convert denoised linear floats -> 8-bit
     // Luminance-based Reinhard tone mapping (preserves color saturation)

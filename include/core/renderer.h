@@ -21,10 +21,10 @@ struct render_result {
 
 // Progress state shared between renderer and UI
 struct render_progress_state {
-    int total_scanlines = 0;
+    std::atomic<int> total_scanlines{0};
     std::atomic<int>    completed_scanlines{0};
     // Tile-based progress (preferred when renderer uses tiles)
-    int total_tiles = 0;
+    std::atomic<int> total_tiles{0};
     std::atomic<int>    completed_tiles{0};
     std::atomic<double> elapsed_seconds{0.0};
     std::atomic<double> eta_seconds{0.0};
@@ -37,8 +37,8 @@ public:
     double exposure = 1.0;
     // Denoiser flags (controlled from editor)
     bool use_denoiser = true;
-    // 0.0 = off (stronger = smoother, typical 0.2-0.5), interpreted by OIDN when enabled
-    double denoiser_strength = 0.1;
+    // Blend between raw (0) and fully denoised (1) final radiance.
+    double denoiser_strength = 1.0;
     // Progressive denoising: apply OIDN to partial results during render (like Cycles)
     bool progressive_denoise = false;
 

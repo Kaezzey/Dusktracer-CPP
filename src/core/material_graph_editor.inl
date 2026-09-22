@@ -231,14 +231,7 @@ static void DrawMaterialGraphDetails(scene_material& mat, scene& scn, int index)
         initialize_material_graph(mat, scn.textures); InvalidateMaterialThumbnail(index);
         g_graph_states[index].fit = true; MarkMaterialsDirty();
     }
-    GLuint preview = GetOrCreateMaterialThumbnail(index);
-    if (preview) {
-        float side = std::min(200.0f,ImGui::GetContentRegionAvail().x);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f,(ImGui::GetContentRegionAvail().x-side)*0.5f));
-        ImGui::Image((ImTextureID)(intptr_t)preview,ImVec2(side,side));
-        ImGui::TextDisabled("Material preview");
-        ImGui::Separator();
-    }
+    DrawMaterialSpherePreview(index);
     auto& state = g_graph_states[index];
     if (state.selected.size() == 1) if (auto node = mat.graph.find(state.selected.front())) {
         if (node->kind != graph_kind::output) {

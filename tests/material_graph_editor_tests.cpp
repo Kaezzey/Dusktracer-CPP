@@ -23,7 +23,7 @@ static void InvalidateMaterialThumbnail(int) {}
 static void DrawPanelTitle(const char* title,const char*) { ImGui::TextUnformatted(title); }
 static GLuint test_texture = 0;
 static GLuint GetOrCreateTextureThumbnail(const std::string&) { return test_texture; }
-static GLuint GetOrCreateMaterialThumbnail(int) { return 0; }
+static void DrawMaterialSpherePreview(int) {}
 #include "../src/core/material_graph_editor.inl"
 
 static int checks = 0;

@@ -1,3 +1,5 @@
 build
 docs
 ASTRA_CONTEXT.md
+
+.dusk-cache/

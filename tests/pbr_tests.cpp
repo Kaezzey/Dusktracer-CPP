@@ -115,39 +115,88 @@ static void check_bsdf() {
 
 static void check_geometry() {
     auto mat = std::make_shared<dielectric>(1.5);
-    auto ball = std::make_shared<sphere>(point3(),1,mat);
-    transform instance(ball,vec3(),vec3(20,30,40),vec3(2,1,.5));
+    triangle mirrored_uv(point3(-1, -1, 0), point3(1, -1, 0), point3(0, 1, 0), 0, 0, 1, 0, .5, -1, mat);
+    require(mirrored_uv.b0.y() < -.999, "triangle construction retains mirrored UV handedness");
+    auto ball = std::make_shared<sphere>(point3(), 1, mat);
+    transform instance(ball, vec3(), vec3(20, 30, 40), vec3(2, 1, .5));
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int angle = 0; angle <= 360; angle += 30) {
+            vec3 rotation;
+            rotation[axis] = angle;
+            const vec3 scale(3, .5, 1.25), translation(2, -1, 4);
+            transform rotated(ball, translation, rotation, scale);
+            float rows[12], matrix[16];
+            rotated.affine_rows(rows);
+            make_trs_column_major(translation, rotation, scale, matrix);
+            vec3 columns[3];
+            for (int col = 0; col < 3; ++col) {
+                columns[col] = vec3(rows[col], rows[4 + col], rows[8 + col]);
+                near(columns[col].length(), scale[col], 1e-6,
+                     "rotation preserves each local scaled axis length");
+                for (int row = 0; row < 3; ++row) {
+                    near(matrix[col * 4 + row], rows[row * 4 + col], 0,
+                         "raster and ray tracing use identical transform elements");
+                }
+            }
+            near(dot(columns[0], columns[1]), 0, 1e-6, "nonuniform rotation introduces no XY shear");
+            near(dot(columns[1], columns[2]), 0, 1e-6, "nonuniform rotation introduces no YZ shear");
+            near(dot(columns[0], columns[2]), 0, 1e-6, "nonuniform rotation introduces no XZ shear");
+            hit_record rotated_hit;
+            vec3 axis_direction = unit_vector(columns[0]);
+            require(rotated.hit(ray(translation + 5 * axis_direction, -axis_direction, 0),
+                                interval(.001, infinity), rotated_hit),
+                    "rotated ellipsoid intersects along its long axis");
+            near((rotated_hit.p - translation).length(), 3, 1e-6,
+                 "rotated ellipsoid retains its local long radius");
+        }
+    }
+    float quarter_turn[16];
+    make_trs_column_major(vec3(), vec3(0, 0, 90), vec3(3, .5, 1), quarter_turn);
+    near(quarter_turn[1], 3, 1e-6, "positive Z rotation carries scaled X toward positive Y");
     hit_record hit;
-    require(instance.hit(ray(point3(),vec3(1,0,0),0),interval(.001,infinity),hit) && !hit.front_face,"transformed glass preserves inside-to-outside intersections");
-    require(instance.hit(ray(point3(4,0,0),vec3(-1,0,0),0),interval(.001,infinity),hit) && hit.front_face,"transformed glass preserves entering intersections");
-    auto tri = std::make_shared<triangle>(point3(-1,-1,0),point3(1,-1,0),point3(0,1,0),0,0,1,0,.5,1,mat);
-    tri->n0 = tri->n1 = tri->n2 = safe_unit_vector(vec3(.8,0,1));
-    tri->t0 = tri->t1 = tri->t2 = vec3(1,0,0);
-    tri->b0 = tri->b1 = tri->b2 = vec3(0,-1,0);
-    transform mirrored(tri,vec3(),vec3(),vec3(-2,1,1));
-    require(mirrored.hit(ray(point3(0,0,2),vec3(0,0,-1),0),interval(.001,infinity),hit),"mirrored smooth triangle intersects");
-    near(dot(hit.tangent,hit.normal),0,1e-12,"transformed tangent is orthogonal");
-    near(dot(hit.bitangent,vec3(0,-1,0)),1,1e-12,"mirrored UV bitangent orientation is preserved");
-    near(hit.geometric_normal.z(),1,1e-12,"geometric normal stays distinct from the smooth shading normal");
+    require(instance.hit(ray(point3(), vec3(1, 0, 0), 0), interval(.001, infinity), hit) && !hit.front_face,
+            "transformed glass preserves inside-to-outside intersections");
+    require(instance.hit(ray(point3(4, 0, 0), vec3(-1, 0, 0), 0), interval(.001, infinity), hit) &&
+                hit.front_face,
+            "transformed glass preserves entering intersections");
+    auto tri = std::make_shared<triangle>(point3(-1, -1, 0), point3(1, -1, 0), point3(0, 1, 0), 0, 0, 1, 0,
+                                          .5, 1, mat);
+    tri->n0 = tri->n1 = tri->n2 = safe_unit_vector(vec3(.8, 0, 1));
+    tri->t0 = tri->t1 = tri->t2 = vec3(1, 0, 0);
+    tri->b0 = tri->b1 = tri->b2 = vec3(0, -1, 0);
+    transform mirrored(tri, vec3(), vec3(), vec3(-2, 1, 1));
+    require(mirrored.hit(ray(point3(0, 0, 2), vec3(0, 0, -1), 0), interval(.001, infinity), hit),
+            "mirrored smooth triangle intersects");
+    near(dot(hit.tangent, hit.normal), 0, 1e-12, "transformed tangent is orthogonal");
+    near(dot(hit.bitangent, vec3(0, -1, 0)), 1, 1e-12, "mirrored UV bitangent orientation is preserved");
+    near(hit.geometric_normal.z(), 1, 1e-12,
+         "geometric normal stays distinct from the smooth shading normal");
 #ifdef HAVE_EMBREE
-    triangle_mesh mesh; mesh.triangles.push_back(tri);
-    embree_triangle_accel accel(mesh); hit_record cpu, embree;
-    ray test(point3(0,0,2),vec3(0,0,-1),0);
-    require(tri->hit(test,interval(.001,infinity),cpu) && accel.hit(test,interval(.001,infinity),embree),"CPU and Embree intersect the same smooth triangle");
-    near((cpu.normal-embree.normal).length(),0,1e-6,"CPU and Embree shading normals agree");
-    near((cpu.geometric_normal-embree.geometric_normal).length(),0,1e-6,"CPU and Embree geometric normals agree");
-    near((cpu.bitangent-embree.bitangent).length(),0,1e-6,"CPU and Embree preserve the same tangent handedness");
-    std::array<ray,4> rays = {test,ray(point3(0,0,-2),vec3(0,0,1),0),test,test};
-    std::array<hit_record,4> packet;
-    require(accel.hit_packet(rays,interval(.001,infinity),packet),"Embree packet intersects the fixture");
+    triangle_mesh mesh;
+    mesh.triangles.push_back(tri);
+    embree_triangle_accel accel(mesh);
+    hit_record cpu, embree;
+    ray test(point3(0, 0, 2), vec3(0, 0, -1), 0);
+    require(tri->hit(test, interval(.001, infinity), cpu) &&
+                accel.hit(test, interval(.001, infinity), embree),
+            "CPU and Embree intersect the same smooth triangle");
+    near((cpu.normal - embree.normal).length(), 0, 1e-6, "CPU and Embree shading normals agree");
+    near((cpu.geometric_normal - embree.geometric_normal).length(), 0, 1e-6,
+         "CPU and Embree geometric normals agree");
+    near((cpu.bitangent - embree.bitangent).length(), 0, 1e-6,
+         "CPU and Embree preserve the same tangent handedness");
+    std::array<ray, 4> rays = {test, ray(point3(0, 0, -2), vec3(0, 0, 1), 0), test, test};
+    std::array<hit_record, 4> packet;
+    require(accel.hit_packet(rays, interval(.001, infinity), packet), "Embree packet intersects the fixture");
     for (int i = 0; i < 4; ++i) {
-        require(tri->hit(rays[i],interval(.001,infinity),cpu) && cpu.front_face == packet[i].front_face,"packet and scalar hits agree on front/back orientation");
-        near((cpu.normal-packet[i].normal).length(),0,1e-6,"packet and scalar shading frames agree");
+        require(tri->hit(rays[i], interval(.001, infinity), cpu) && cpu.front_face == packet[i].front_face,
+                "packet and scalar hits agree on front/back orientation");
+        near((cpu.normal - packet[i].normal).length(), 0, 1e-6, "packet and scalar shading frames agree");
     }
 #endif
     double pdf;
-    require(instance.sample_surface(.2,.3,0,hit,pdf),"transformed surface samples exist");
-    near(pdf,instance.surface_pdf(hit),1e-12,"nonuniform transform preserves the area sampling Jacobian");
+    require(instance.sample_surface(.2, .3, 0, hit, pdf), "transformed surface samples exist");
+    near(pdf, instance.surface_pdf(hit), 1e-12, "nonuniform transform preserves the area sampling Jacobian");
 }
 
 static double mean_trace(camera& cam, const hittable& world, int count = 80000) {

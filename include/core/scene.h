@@ -4,12 +4,16 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 
 #include "vec3.h"  // for vec3 / point3
 #include "material_graph.h"
 
 // Forward declarations
 class material;
+class texture;
+enum class texture_sample_space;
+using material_texture_loader = std::function<std::shared_ptr<texture>(const std::string&, texture_sample_space)>;
 class hittable;
 class hittable_list;
 
@@ -93,7 +97,8 @@ struct scene_material : scene_material_parameters {
 // Convert an editor-facing scene_material into a runtime material*
 // using the scene's texture list (scene.textures[...] indices).
 std::shared_ptr<material> build_rt_material(const scene& scn,
-                                            const scene_material& desc);
+                                            const scene_material& desc,
+                                            const material_texture_loader& loader = {});
 
 // ----------------------------------------
 // Geometry types
@@ -108,21 +113,9 @@ enum class scene_object_type {
 // Editor-facing object description
 // ----------------------------------------
 //
-// Conventions:
-// - sphere:
-//     center, radius, material_index
-//
-// - cube:
-//     center       = cube centre in world space
-//     scale.x      = uniform scale multiplier (side length; 1 = unit cube)
-//     rotation_deg = Euler rotation (degrees)
-//     material_index used
-//
-// - mesh_instance:
-//     mesh_index, translation, rotation_deg, scale.x (uniform),
-//     mesh_slot_materials for per-slot overrides,
-//     material_index used as a fallback.
-//
+// Local nonuniform scale, then right-handed Euler X/Y/Z rotation, then
+// center + translation. Spheres additionally multiply local scale by radius.
+// Mesh slot bindings override material_index, which is the instance fallback.
 struct scene_object {
     std::string       name;
     scene_object_type type = scene_object_type::sphere;
