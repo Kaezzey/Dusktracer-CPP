@@ -35,10 +35,11 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Embree path UV interpolation fix to ensure correct texture sampling on hardware-accelerated geometry
 
 ### Editor Features
+- [Project folders and complete `.dusk` scenes](src/core/PROJECTS.md): New/Open/Save/Save As, portable assets, and renderer state.
 - Persistent material graph with texture drops, searchable nodes, editable wires, CPU shader evaluation, and asynchronous previews ([guide and performance checks](docs/material-graph.md))
 - Content Drawer (ctrl + spacebar)
 - GPU-based picking via RGB8 ID buffer  
-- Screen-space gizmo: axis translation with closest-point ray math  
+- Unreal-style move, rotate and scale gizmos: finite pixel-sized handles, yellow hover/drag feedback, plane controls, snapping, world/local axes and undo ([controls](src/core/TRANSFORM_GIZMOS.md))
 - Scene Hierarchy, Inspector, and Material Editor  
 - Drag & drop mesh/texture import  
 - Viewport selection + Delete key: click object in viewport to select and press Del (viewport-focused) to remove (undoable)
@@ -68,7 +69,7 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Energy-conserving metallic/roughness shading
 - Dielectric F0 control and correct Fresnel
 - Tangent-space normal mapping with adjustable strength
-- Stable gizmo translation via line–ray closest points
+- Stable transform dragging with frozen ray/plane anchors and continuous rotation
 - Raster preview shares exact TRS math with ray tracer
 - Reverse-mapping transforms for correct ray intersection
 - Per-material alpha masking with stochastic sampling and automatic double-sided handling for masked materials

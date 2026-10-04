@@ -115,9 +115,16 @@ static void benchmark_graph_edits() {
 #include "editor_preview_regressions.inl"
 #include "editor_layout_smoke.inl"
 #include "raster_preview_regressions.inl"
+#include "editor_project_regressions.inl"
+#include "editor_gizmo_regressions.inl"
 int main(int argc,char** argv) {
     check(argc >= 2,"isolated working directory supplied");
     std::filesystem::create_directories(argv[1]); std::filesystem::current_path(argv[1]);
+    if (argc >= 3 && std::string(argv[2]) == "--gizmos") return gizmo_checks::run();
+    if (argc >= 3 && std::string(argv[2]) == "--projects") {
+        try { return run_project_checks(); }
+        catch (const std::exception& error) { std::fprintf(stderr, "Project test exception: %s\n", error.what()); return 1; }
+    }
     if (argc >= 3 && std::string(argv[2]) == "--layout") return run_layout_smoke();
     if (argc >= 3 && std::string(argv[2]) == "--raster") return run_raster_checks(argc >= 4 ? argv[3] : nullptr);
     check(glfwInit() != 0,"GLFW init"); glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
@@ -165,7 +172,9 @@ int main(int argc,char** argv) {
     if (argc == 3) benchmark_graph_edits();
     check_edit_scheduling(scalar);
     check_preview_cache(argc == 4 ? argv[3] : nullptr);
+    check_preview_camera();
     check_sphere_interaction();
+    check_gpu_sphere();
     check_outliner_selection();
     std::vector<unsigned char> large_pixels(512*256*4,128);
     check(stbi_write_png("large-texture.png",512,256,4,large_pixels.data(),512*4) != 0,"large thumbnail fixture");
@@ -181,7 +190,7 @@ int main(int argc,char** argv) {
     g_scene.materials[0].graph.find(scalar)->value = vec3(.7,0,0); GraphDirty(0);
     wait_for_preview(0);
     g_graph_states[0].selected.clear(); g_graph_states[0].fit = true;
-    wait_for_sphere(false);
+    wait_for_sphere();
     for (int i = 0; i < 4; ++i) {
         io.DisplaySize = ImVec2(1440,960); io.DeltaTime = 1.f/60; g_thumbs_created_this_frame = 0;
         ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
@@ -201,6 +210,9 @@ int main(int argc,char** argv) {
     stbi_flip_vertically_on_write(1);
     check(stbi_write_png("material-editor.png",1440,960,4,pixels.data(),1440*4) != 0,"production editor screenshot");
     StopEditorPreviews();
+    StopRasterPreview();
+    glDeleteProgram(g_rasterShader);
+    glDeleteProgram(g_modelThumbnailShader);
     for (const auto& item : g_material_thumb_cache) glDeleteTextures(1,&item.second);
     for (const auto& item : g_texture_thumb_cache) glDeleteTextures(1,&item.second);
     ImGui_ImplOpenGL3_Shutdown(); ImGui::DestroyContext(); glfwDestroyWindow(window); glfwTerminate();

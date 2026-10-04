@@ -58,6 +58,7 @@ class transform : public hittable {
 
         // Point → world
         rec.p = apply(M, rec.p) + t;
+        rec.object = this;
 
         // Preserve the original outward orientation. Re-facing an already
         // face-forward normal incorrectly classifies every exit as an entry.
@@ -81,6 +82,7 @@ class transform : public hittable {
             return false;
         }
         rec.p = apply(M, rec.p) + t;
+        rec.object = this;
         vec3 tangent = apply(M, rec.tangent), bitangent = apply(M, rec.bitangent);
         rec.normal = safe_unit_vector(apply_transpose(M_inv, rec.normal));
         rec.geometric_normal = safe_unit_vector(g);

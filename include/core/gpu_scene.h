@@ -15,6 +15,9 @@ struct f4 {
 };
 struct i4 {
     int32_t x = 0, y = 0, z = 0, w = 0;
+    int32_t operator[](int index) const {
+        return index == 0 ? x : index == 1 ? y : index == 2 ? z : w;
+    }
     int32_t& operator[](int index) {
         return index == 0 ? x : index == 1 ? y : index == 2 ? z : w;
     }
@@ -40,7 +43,9 @@ struct material_record {
     f4 parameters;  // metallic, roughness, normal strength, IOR
     f4 f0;          // RGB dielectric F0; W legacy metal fuzz
     f4 emission;    // RGB emission; W intensity
-    f4 alpha;       // cutoff, double-sided masking, reserved, reserved
+    f4 alpha;       // cutoff, double-sided masking, provably opaque, reserved
+    f4 subsurface;  // Burley fraction, world-space radius, entry IOR, directional normalization
+    f4 scatter_tint;// RGB override tint; W enables override
     i4 programs[5]; // start, count, result register, result channel
 };
 struct texture_record {
@@ -68,5 +73,5 @@ material_record compile_material(const scene& source, const scene_material& mate
                                  const std::function<int(int)>& texture_channels = {});
 snapshot compile_scene(const scene& source, const std::atomic<bool>* cancel = nullptr);
 static_assert(sizeof(vertex) == 80 && sizeof(instance) == 64 && sizeof(instruction) == 80 &&
-              sizeof(material_record) == 160);
+              sizeof(material_record) == 192);
 } // namespace dusk_gpu

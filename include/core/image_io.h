@@ -3,6 +3,7 @@
 
 #include <string>
 #include <fstream>
+#include <filesystem>
 #include "renderer.h"   // for render_result
 
 inline bool write_ppm(const std::string& filename, const render_result& img)
@@ -10,7 +11,7 @@ inline bool write_ppm(const std::string& filename, const render_result& img)
     if (img.width <= 0 || img.height <= 0 || img.pixels.empty())
         return false;
 
-    std::ofstream out(filename);
+    std::ofstream out(std::filesystem::u8path(filename));
     if (!out.is_open())
         return false;
 
@@ -28,7 +29,8 @@ inline bool write_ppm(const std::string& filename, const render_result& img)
         }
     }
 
-    return true;
+    out.flush();
+    return bool(out);
 }
 
 #endif // DUSK_IMAGE_IO_H

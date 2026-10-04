@@ -50,6 +50,7 @@ static std::unordered_map<std::string, texture_asset> textures;
 static preview_worker texture_worker;
 static std::deque<preview_worker::result> ready_textures;
 static uint64_t frame = 0, revision = 1, shadow_key = 0;
+static uint64_t texture_generation = 1;
 static size_t texture_bytes = 0;
 static unsigned queued_textures = 0;
 static GLuint sun_depth = 0, point_depth = 0, shadow_fbo = 0, placeholder = 0;
@@ -119,7 +120,7 @@ static preview_image decode_texture(const std::string& path) {
 }
 static void pump_textures() {
     for (auto& result : texture_worker.take_results()) {
-        ready_textures.push_back(std::move(result));
+        if (result.revision == texture_generation) ready_textures.push_back(std::move(result));
     }
     // Keep large uploads out of graph-edit callbacks and limit them to one per frame.
     if (ready_textures.empty()) {
@@ -156,7 +157,7 @@ static texture_asset& get_texture(const std::string& path) {
     asset.last_frame = frame;
     // At most two decoded uploads may be pending, even when many assets are visible.
     if (!asset.requested && !asset.loaded && queued_textures < 2) {
-        asset.requested = texture_worker.request(path, 1, [path] { return decode_texture(path); });
+        asset.requested = texture_worker.request(path, texture_generation, [path] { return decode_texture(path); });
         if (asset.requested) ++queued_textures;
     }
     return asset;
@@ -613,8 +614,8 @@ static void BuildRasterShader() {
         return;
     }
     BuildModelThumbnailShader();
-    std::string lit = std::string(raster_shaders::material) + raster_shaders::lit;
-    std::string shadow = std::string(raster_shaders::material) + raster_shaders::shadow;
+    std::string lit = std::string(raster_shaders::version) + raster_shaders::material + raster_shaders::lit;
+    std::string shadow = std::string(raster_shaders::version) + raster_shaders::material + raster_shaders::shadow;
     surface_program.id = g_rasterShader = CompileShader(raster_shaders::vertex, lit.c_str());
     shadow_program.id = CompileShader(raster_shaders::vertex, shadow.c_str());
     const int units[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};

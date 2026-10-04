@@ -26,9 +26,6 @@ render_result render_selected(const render_selection& selection, const scene& so
     if (selection.backend == render_backend::vulkan) {
         try {
 #ifdef DUSK_ENABLE_VULKAN_RT
-            if (cam.enable_mnee) {
-                throw std::runtime_error("Experimental caustics require CPU rendering.");
-            }
             auto data = dusk_gpu::compile_scene(source, cancel);
             auto report = [&](const std::string& message) {
                 diagnostic = message;

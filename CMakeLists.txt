@@ -140,6 +140,7 @@ if (WIN32)
     set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/appicon.rc")
 
     target_sources(Dusktracer        PRIVATE ${APP_ICON_RC})
+    target_link_libraries(Dusktracer PRIVATE ole32 shell32 uuid)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -489,5 +490,7 @@ if (DUSK_BUILD_GRAPH_TESTS)
     set_tests_properties(gpu_transport_correctness PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME material_graph_editor_integration COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/graph-integration")
     add_test(NAME raster_materials_and_shadows COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/raster-validation" --raster)
+    add_test(NAME project_persistence_and_switching COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/project-validation" --projects)
     add_test(NAME editor_layout_smoke COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/layout-smoke" --layout)
+    add_test(NAME editor_transform_gizmos COMMAND DuskGraphIntegrationTests "${CMAKE_BINARY_DIR}/gizmo-validation" --gizmos)
 endif()

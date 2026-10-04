@@ -70,11 +70,13 @@ class quad : public hittable {
         rec.bitangent = B;
 
         rec.mat = mat;
+        rec.object = this;
         return true;
     }
 
     bool sample_surface(double a, double b, double, hit_record& rec, double& pdf) const override {
         rec.p = Q+a*u+b*v; rec.u = a; rec.v = b; rec.mat = mat;
+        rec.object = this;
         rec.normal = rec.geometric_normal = normal; rec.front_face = true;
         rec.set_tangent_frame(u,v); pdf = surface_pdf(rec); return pdf > 0;
     }

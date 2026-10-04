@@ -16,12 +16,16 @@ static void SceneChanged() {
     }
 }
 static void SelectSceneObject(int index) {
+    transform_gizmo::finish(true);
+    g_show_gizmo = index >= 0;
     g_focus_properties = index >= 0;
     g_selected_object = index;
     g_selected_light = -1;
     g_selected_mesh_asset = -1;
 }
 static void SelectSceneLight(int index) {
+    transform_gizmo::finish(true);
+    g_show_gizmo = false;
     g_focus_properties = index >= 0;
     g_selected_light = index;
     g_selected_object = -1;
@@ -295,8 +299,8 @@ static void DrawSelectedLight() {
         }
 
         // Angular radius control (degrees)
-        double angv = light.angular_radius_deg;
-        double ang_min = 0.0, ang_max = 10.0;
+        double angv = light.angular_radius_deg > 0 ? light.angular_radius_deg : 0.266;
+        double ang_min = 0.01, ang_max = 10.0;
         if (ImGui::SliderScalar("Sun radius (deg)", ImGuiDataType_Double, &angv, &ang_min, &ang_max)) {
             light.angular_radius_deg = angv;
             g_camera.sun_angular_radius = angv;
@@ -329,45 +333,8 @@ static void DrawSelectedLight() {
     ImGui::PopItemWidth();
 }
 static void DrawCausticSettings() {
-    if (ImGui::CollapsingHeader("Experimental caustics")) {
-        {
-            bool prev = g_camera.enable_mnee;
-            ImGui::Checkbox("Approximate caustics (experimental)", &g_camera.enable_mnee);
-            if (g_camera.enable_mnee && !prev) {
-                UpdateMNEEFromScene();
-            }
-            if (!g_camera.enable_mnee) {
-                g_camera.mnee_has_sphere = false;
-            }
-            if (g_camera.enable_mnee) {
-                if (g_camera.mnee_has_sphere) {
-                    ImGui::Text("MNEE Sphere: C=(%.3f, %.3f, %.3f) R=%.3f IOR=%.3f",
-                                g_camera.mnee_sphere_center.x(), g_camera.mnee_sphere_center.y(),
-                                g_camera.mnee_sphere_center.z(), g_camera.mnee_sphere_radius,
-                                g_camera.mnee_sphere_ior);
-                    ImGui::SliderInt("MNEE Budget/thread", &g_camera.mnee_per_thread_budget, 1, 256);
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Point light caustics budget. 1-16 = fast preview, 64-256 = final "
-                                          "quality.\nWARNING: High values cause EXTREME slowdown!");
-                    }
-                    ImGui::SliderInt("MNEE Sun samples", &g_camera.mnee_sun_samples, 1, 32);
-                    {
-                        float gain = (float)g_camera.mnee_gain_scale;
-                        if (ImGui::SliderFloat("MNEE Gain scale", &gain, 0.5f, 3.0f)) {
-                            g_camera.mnee_gain_scale = gain;
-                        }
-                    }
-                    {
-                        double ang = g_camera.sun_angular_radius;
-                        float angf = (float)ang;
-                        if (ImGui::SliderFloat("Sun angular radius (deg)", &angf, 0.0f, 2.0f)) {
-                            g_camera.sun_angular_radius = (double)angf;
-                        }
-                    }
-                } else {
-                    ImGui::TextDisabled("No dielectric sphere found in scene.");
-                }
-            }
-        }
+    if (ImGui::CollapsingHeader("Caustics")) {
+        ImGui::TextWrapped("Glass caustics use traced light transport. Increase samples and path depth "
+                           "to resolve focused light; a larger sun radius softens the pattern.");
     }
 }

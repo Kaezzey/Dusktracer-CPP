@@ -4,6 +4,7 @@
 #include "aabb.h"
 
 class material;
+class hittable;
 
 class hit_record{
 
@@ -11,6 +12,9 @@ class hit_record{
         point3 p;
         vec3 normal;
         shared_ptr<material> mat;
+        // Boundary identity for spatial subsurface transport. Instances override
+        // primitive identity so all faces of one object share a scattering domain.
+        const hittable* object = nullptr;
         double t = 0;
         double u = 0;
         double v = 0;

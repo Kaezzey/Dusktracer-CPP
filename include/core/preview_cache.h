@@ -21,10 +21,10 @@ inline uint64_t hash(const std::string& text) {
 }
 inline std::string file_stamp(const std::string& path) {
     std::error_code error;
-    const auto absolute = std::filesystem::absolute(path, error).lexically_normal();
+    const auto absolute = std::filesystem::absolute(std::filesystem::u8path(path), error).lexically_normal();
     const auto size = std::filesystem::file_size(absolute, error);
     const auto modified = std::filesystem::last_write_time(absolute, error).time_since_epoch().count();
-    return absolute.string() + "|" + std::to_string(size) + "|" + std::to_string(modified);
+    return absolute.u8string() + "|" + std::to_string(size) + "|" + std::to_string(modified);
 }
 struct cached_image {
     preview_image image;

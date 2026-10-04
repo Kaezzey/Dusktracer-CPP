@@ -76,6 +76,7 @@ class sphere : public hittable {
             rec.bitangent = unit_vector(cross(rec.normal, rec.tangent));
 
             rec.mat = mat;
+            rec.object = this;
             return true;
         }
 
@@ -84,6 +85,7 @@ class sphere : public hittable {
             double y = 1-2*u, r = std::sqrt(std::max(0.0,1-y*y)), phi = 2*pi*v;
             rec.normal = rec.geometric_normal = vec3(r*std::cos(phi),y,r*std::sin(phi));
             rec.front_face = true; rec.p = centre.at(time)+radius*rec.normal; rec.mat = mat;
+            rec.object = this;
             get_sphere_uv(rec.normal,rec.u,rec.v);
             rec.set_tangent_frame(vec3(rec.normal.z(),0,-rec.normal.x()),vec3());
             pdf = surface_pdf(rec); return true;
@@ -138,6 +140,7 @@ class sphere : public hittable {
                 rec.tangent = t;
                 rec.bitangent = unit_vector(cross(rec.normal, rec.tangent));
                 rec.mat = mat;
+                rec.object = this;
 
                 out_recs[i] = rec;
                 mask |= (1u << i);
@@ -164,4 +167,4 @@ class sphere : public hittable {
         
 };
 
-#endif 
+#endif

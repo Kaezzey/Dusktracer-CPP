@@ -85,10 +85,6 @@ struct compiler {
         return id;
     }
     void material(const scene_material& m) {
-        if (m.model == scene_material_model::pbr && m.use_sss && m.sss_strength > 0) {
-            throw std::runtime_error("Material '" + m.name +
-                                     "' uses subsurface scattering, which currently requires CPU rendering.");
-        }
         out.materials.push_back(compile_material(
             source, m, [&](const graph_node& node) { return texture_id(node); }, out.instructions,
             [&](int id) { return out.textures[id].data.w & 255; }));

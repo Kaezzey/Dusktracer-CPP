@@ -287,8 +287,12 @@ static void render_chart(const std::string& path) {
     auto image = engine.render(world,cam);
     require(stbi_write_png(path.c_str(),image.width,image.height,3,image.pixels.data(),image.width*3) != 0,"production renderer saves the roughness/metalness chart");
 }
+#include "material_transport_regressions.inl"
+
 int main(int argc, char** argv) {
-    check_bsdf(); check_geometry(); check_transport();
+    check_bsdf(); check_geometry(); check_transport(); check_dielectric_sun(); check_subsurface_transport();
     if (argc > 1) render_chart(argv[1]);
+    if (argc > 2 && std::string(argv[2]) == "--materials")
+        render_material_transport_samples(std::filesystem::path(argv[1]).parent_path());
     std::cout << checks << " PBR checks passed\n";
 }

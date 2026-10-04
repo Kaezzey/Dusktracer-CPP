@@ -2,20 +2,30 @@
 
 The Outliner groups objects and lights and filters by name. Selecting a row opens
 its Properties; Delete acts on that selection, with undo/redo. Camera, render
-quality, output, denoising, and experimental caustics live in Render Settings.
+quality, output, denoising, and caustics guidance live in Render Settings.
 The Content Drawer has separate Textures, Meshes, and Materials tabs.
 
-The material graph has an independent sphere preview: drag to rotate, scroll to
-zoom, and Reset to restore the view. It renders at 192 pixels while interacting
-and refines to 512 pixels when settled. Rotation changes only preview state,
-never material data or scene acceleration structures. Studio lights stay fixed
-while the sphere's UVs and tangent frame rotate. This uses the actual CPU material
-evaluator for direct lighting, not the final scene path tracer.
+The material graph has a fixed 1024 x 1024 sphere preview while dragging and at
+rest. Drag orbits a perspective camera around a stationary sphere; horizontal
+movement follows world Y without roll. Scroll dollies the camera and Reset
+restores the view. Studio lights, UVs, and tangent-space normals stay attached to
+their world-space frames. Orbiting changes only editor preview state.
 
-Three bounded, joined workers serve interactive spheres, material thumbnails,
-and texture thumbnails separately. OpenGL uploads remain on the UI thread. Each
-job owns a scene/material snapshot, and revision checks reject stale results.
-Only visible drawer cells request asset thumbnails.
+The interactive sphere reuses the raster viewport's GPU material evaluator and
+texture cache. A fullscreen pass intersects camera rays with an analytic sphere,
+so its outline has no mesh facets. The shader and output texture are reused;
+only camera uniforms change during orbit. Settled previews redraw only after an
+edit or texture upload. Rendering restores the caller's OpenGL state. This is a
+studio material inspection view with the same direct-lighting approximations as
+the raster viewport, not the final path tracer (see its limits below).
+
+Three bounded, joined workers serve material thumbnails, texture thumbnails,
+and CPU sphere fallbacks separately. Graphs beyond the GPU evaluator's limits
+(such as more than 12 distinct textures) use the CPU fallback at the same fixed
+resolution; those unusually large graphs can orbit more slowly. Each CPU job
+owns a scene/material snapshot, and revision checks reject stale results.
+OpenGL uploads remain on the UI thread. Only visible drawer cells request asset
+thumbnails.
 
 Disposable files in `.dusk-cache/previews` store reduced texture sources (at most
 1024 pixels per side for thumbnails/spheres, 2048 for the raster viewport) and settled 128-pixel material thumbnails. File size and
@@ -27,8 +37,10 @@ An eight-image LRU per preview worker retains decoded sources between edits.
 HDR preview sources retain their original float representation.
 
 `DuskGraphIntegrationTests` exercises production ImGui dragging, independent worker
-scheduling, preview refinement, cache corruption/invalidation, and Outliner actions.
-It writes material-editor and Outliner screenshots in its isolated output folder.
+scheduling, fixed-resolution dragging, GPU UV/normal orientation, camera framing,
+GL state restoration, cache corruption/invalidation, and Outliner actions.
+It reports completed GPU orbit timings and writes material-editor and Outliner
+screenshots in its isolated output folder.
 An optional fourth argument profiles a real texture without modifying it:
 
 ```powershell

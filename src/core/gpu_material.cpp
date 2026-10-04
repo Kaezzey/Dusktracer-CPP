@@ -1,6 +1,10 @@
 #include "core/gpu_scene.h"
+#include "core/materials/sss.h"
 #include <cmath>
 #include <stdexcept>
+#include <optional>
+#include <algorithm>
+#include <cstring>
 
 namespace dusk_gpu {
 namespace {
@@ -12,6 +16,8 @@ f4 pack(const vec3& v, float w = 0) {
     }
     return {float(v.x()), float(v.y()), float(v.z()), w};
 }
+#include "gpu_material_optimizer.inl"
+
 struct material_compiler {
     const scene& source;
     const std::function<int(const graph_node&)>& texture_id;
@@ -89,7 +95,7 @@ struct material_compiler {
             instructions.push_back(op);
         }
         span.z = registers[indices.at(root->from)];
-        return span;
+        return optimise_program(instructions, span);
     }
     material_record material(const scene_material& m) {
         material_record record{};
@@ -99,6 +105,12 @@ struct material_compiler {
         record.emission =
             pack(m.emission.length_squared() == 0 ? m.base_color : m.emission, float(m.emission_intensity));
         record.alpha = {float(m.alpha_cutoff), m.alpha_double_sided ? 1.f : 0.f, 0, 0};
+        double fraction = m.model==scene_material_model::pbr && m.use_sss && m.sss_model!=0
+            ? std::clamp(m.sss_strength,0.,1.) : 0;
+        double eta=std::clamp(m.sss_eta,1.,4.);
+        record.subsurface = {float(fraction),float(std::max(1e-6,m.sss_radius)),float(eta),
+            float(sss::entry_directional(1,eta)/sss::entry_transmission(1,eta))};
+        record.scatter_tint = pack(m.sss_color_override_color,m.sss_color_override_enabled?1.f:0.f);
         material_graph graph = m.graph;
         if (graph.nodes.empty()) {
             int output = graph.add(graph_kind::output, 0, 0);
@@ -130,7 +142,18 @@ struct material_compiler {
         }
         int slots = m.model == scene_material_model::pbr ? 5 : 1;
         for (int s = 0; s < slots; ++s) {
-            record.programs[s] = program(graph, s);
+            auto span = program(graph, s);
+            for (int previous = 0; previous < s && span.y; ++previous) {
+                const auto& candidate = record.programs[previous];
+                if (candidate.y == span.y && candidate.z == span.z &&
+                    std::memcmp(instructions.data()+candidate.x, instructions.data()+span.x,
+                                size_t(span.y)*sizeof(instruction)) == 0) {
+                    instructions.resize(span.x);
+                    span.x = candidate.x;
+                    break;
+                }
+            }
+            record.programs[s] = span;
         }
         if (record.programs[4].y) {
             record.alpha.y = 1;
@@ -144,6 +167,10 @@ struct material_compiler {
                 record.alpha.y = 1;
             }
         }
+        const bool explicit_mask = record.programs[4].y != 0;
+        const auto opacity = explicit_mask ? record.programs[4] : record.programs[0];
+        record.alpha.z = m.model != scene_material_model::pbr ||
+            (m.alpha_cutoff <= 1 && opaque_program(instructions, opacity, explicit_mask, texture_channels)) ? 1.f : 0.f;
         return record;
     }
 };

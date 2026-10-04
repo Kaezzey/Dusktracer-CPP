@@ -67,6 +67,10 @@ checksum validation. A stale or corrupt cache rebuilds automatically.
   instancing, material-slot overrides, UVs, smooth normals, and tangent frames.
 - Lambert, legacy fuzzy metal, ideal dielectric, emissive, isotropic surface,
   and the existing single-scattering GGX PBR material.
+- Spatial Burley subsurface diffusion on PBR materials, including world-space
+  radius, strength, entry IOR, optional scatter tint, masks and material slots.
+  Probes remain on the originating instance and material; lighting and shadows
+  are evaluated at the sampled entry point with complementary MIS.
 - Every current graph operation, scalar broadcast, output channels, UV tiling,
   automatic/explicit texture color spaces, normal mapping, and opacity.
 - HDR emission and textures; ordinary textures occupy one RGBA8 word per texel.
@@ -84,8 +88,17 @@ uses double precision. Pixel-identical Monte Carlo noise is not expected.
 
 ## Deliberate limits and differences
 
-Active subsurface scattering and experimental photon/MNEE caustics require CPU
-rendering. They are not silently omitted. The PBR model retains the CPU model’s
+Spatial subsurface scattering uses the same normalized Burley profile, three-axis
+projection probabilities, intersection-selection PDFs and directional entry
+normalization as the CPU. Legacy nonzero SSS model IDs map to this profile; None
+and disabled SSS preserve ordinary PBR. It replaces the diffuse substrate and
+does not add a second full diffuse lobe. Probes enumerate at most 256 scene
+intersections per axis, with a float-scale-aware advancement step. GPU SSS does
+not use a CPU shading pass or trigger CPU fallback.
+
+Sunlight and emissive caustics use ordinary dielectric path transport
+on both backends. Legacy zero-radius suns use a physical 0.266-degree disc;
+legacy MNEE/photon settings no longer add light. The PBR model retains the CPU model’s
 single-scattering and normal-mapping approximations; this backend adds no new
 Principled layers or multiple-scattering compensation.
 
@@ -94,7 +107,24 @@ reaches those through BSDF paths. These estimates have different variance but
 the same intended radiance. Point-light selection is uniform on the GPU and
 importance-weighted on the CPU; both include their selection probabilities.
 
-Progressive GPU previews are undenoised. Final OIDN runs on its CPU device to
+Progressive GPU previews apply **GPU Firefly Suppression**, enabled by default
+in Render Settings. This reconstructs isolated indirect outliers against a
+5x5 neighbourhood before tone mapping, using the same filter for previews and
+final images. It keeps direct lighting, visible emitters and specular-only
+camera paths outside the filter. Dense caustic footprints pass through.
+The raw HDR estimator remains unchanged; disable the control for unfiltered
+reference output. Reconstruction can soften tiny indirect highlights, and
+does not make a low-sample caustic fully converged. No global radiance/sample
+clamp or extra caustic energy is added. GGX uses cross-product sin-squared
+evaluation to avoid FP32 cancellation at narrow highlights.
+
+Sunlit scenes containing glass require at least 256 samples before adaptive
+termination; SSS scenes require at least 128. All scenes require two consecutive
+quiet variance checks. The
+configured maximum sample count still takes precedence. This reduces premature
+termination before rare high-energy paths have been sampled.
+
+Final OIDN runs on its CPU device to
 avoid another GPU context competing for memory. The strength control blends
 the filtered result with the raw image (full filtering by default). The viewport
 reports the final denoising phase and any error; errors preserve the raw image. Maximum GPU depth is 128 and dimensions
@@ -111,7 +141,12 @@ GPU skips hardware checks with CTest code 77; a Vulkan-disabled build tests the
 CPU-only fallback. Tests cover graph arithmetic/channel/color-space semantics,
 long graph register reuse, UVs, alpha, transformed material slots, normal maps,
 glass entry/exit, area-light sample-count invariance, point lights, cancellation,
-adaptive sampling, device-selection failure, and a production material chart.
+adaptive sampling, device-selection failure, firefly suppression, preview/final
+filter parity, retention of direct highlights and dense caustics, and a production
+material chart. Firefly comparisons are saved under `build/gpu-fixtures`.
+SSS checks compare furnace, backlighting, external occlusion, tint/IOR,
+nonuniform transforms, neighbouring instances and emissive-area MIS with CPU
+references; on/off screenshots are saved in the same folder.
 
 Enable Khronos validation during hardware checks:
 

@@ -70,5 +70,21 @@ int main() {
         require(worker.take_results().size() == preview_worker::capacity,"full result queue preserves every completed asset");
         require(wait_for(worker,"last").revision == 33,"draining results releases worker backpressure without dropping work");
     }
+    {
+        preview_worker worker;
+        std::promise<void> started, release;
+        auto gate = release.get_future().share();
+        std::atomic<int> obsolete{0};
+        worker.request("active", 1, [&] { started.set_value(); gate.wait(); return preview_image{}; });
+        require(started.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+                "project switch fixture starts an in-flight preview");
+        worker.request("old-project", 2, [&] { ++obsolete; return preview_image{}; });
+        worker.discard_pending();
+        require(worker.request("new-project", 3, [] { return preview_image{}; }),
+                "project switch keeps worker available without joining active work");
+        release.set_value();
+        require(wait_for(worker, "new-project").revision == 3 && obsolete == 0,
+                "new project proceeds without rendering discarded previews");
+    }
     std::cout << checks << " worker checks passed\n";
 }

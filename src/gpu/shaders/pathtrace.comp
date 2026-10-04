@@ -3,6 +3,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 const float PI = 3.14159265358979323846;
 // Keep these values aligned with graph_kind and scene_material_model.
+const int NODE_CONSTANT = -1;
 const int NODE_OUTPUT = 0;
 const int NODE_TEXTURE = 1;
 const int NODE_SCALAR = 2;
@@ -23,6 +24,7 @@ const int MODEL_GLASS = 2;
 const int MODEL_EMISSION = 3;
 const int MODEL_ISOTROPIC = 4;
 const int MODEL_PBR = 5;
+const int MODEL_SUBSURFACE_ENTRY = 6;
 
 struct Vertex {
     vec4 position, normal, tangent, bitangent, uv;
@@ -32,7 +34,7 @@ struct Instance {
     ivec4 data;
 };
 struct Material {
-    vec4 base, parameters, f0, emission, alpha;
+    vec4 base, parameters, f0, emission, alpha, subsurface, scatterTint;
     ivec4 programs[5];
 };
 struct Instruction {
@@ -44,7 +46,7 @@ struct AreaLight {
     vec4 distribution;
 };
 struct Pixel {
-    vec4 sum, albedo, normal, variance;
+    vec4 sum, albedo, normal, variance, indirect;
 };
 struct PointLight {
     vec4 position, radiance;
@@ -92,6 +94,9 @@ layout(std430, binding = 12) readonly buffer Areas {
 };
 layout(std430, binding = 13) readonly buffer Slots {
     uint slots[];
+};
+layout(std430, binding = 14) writeonly buffer DisplayPixels {
+    uint displayPixels[];
 };
 layout(push_constant) uniform Dispatch {
     uint sampleIndex, offsetX, offsetY, sampleCount;
@@ -178,7 +183,7 @@ Value textureValue(int id, vec2 uv, int flags) {
     vec3 raw = (flags & 2) != 0 ? color : texel.rgb;
     return Value(vec4(color, alpha), vec4(raw, mask));
 }
-Value evaluate(ivec4 program, vec2 uv) {
+Value evaluateRoot(ivec4 program, vec2 uv) {
     Value registers[32];
     for (int pc = 0; pc < program.y; ++pc) {
         Instruction op = instructions[program.x + pc];
@@ -190,7 +195,9 @@ Value evaluate(ivec4 program, vec2 uv) {
                                   : channelValue(registers[op.inputs.z], op.channels.z);
         Value result = scalarValue(0);
         int kind = op.code.x;
-        if (kind == NODE_TEXTURE) {
+        if (kind == NODE_CONSTANT) {
+            result = Value(op.value, op.defaults);
+        } else if (kind == NODE_TEXTURE) {
             result = textureValue(op.code.z, op.inputs.x < 0 ? uv : fract(a.colour.xy), op.code.w);
         } else {
             if (kind == NODE_SCALAR) {
@@ -234,7 +241,12 @@ Value evaluate(ivec4 program, vec2 uv) {
         }
         registers[op.code.y] = result;
     }
-    return channelValue(registers[program.z], program.w);
+    return registers[program.z];
+}
+Value evaluate(ivec4 program, vec2 uv) { return channelValue(evaluateRoot(program,uv),program.w); }
+bool sameProgram(ivec4 a, ivec4 b) { return a.y > 0 && all(equal(a.xyz,b.xyz)); }
+Value baseRoot(Material m, vec2 uv) {
+    return m.programs[0].y > 0 ? evaluateRoot(m.programs[0],uv) : Value(vec4(m.base.rgb,1),vec4(m.base.rgb,1));
 }
 
 vec3 transformVector(Instance inst, vec3 p) {
@@ -318,23 +330,23 @@ Hit surfaceHit(int instanceId, int primitiveId, vec3 localPosition, vec2 bary, v
     h.distance = 0;
     return h;
 }
-bool traceRange(vec3 origin, vec3 direction, float minT, float maxT, out Hit hit) {
+float sphereIntersection(vec3 o, vec3 d, float minT, float maxT) {
+    float a = dot(d,d), b = dot(o,d), discriminant = b*b - a*(dot(o,o)-1);
+    if (discriminant >= 0) {
+        float t = (-b-sqrt(discriminant))/a;
+        if (t <= minT) t = (-b+sqrt(discriminant))/a;
+        if (t > minT && t < maxT) return t;
+    }
+    return -1;
+}
+bool traceRangeMasked(vec3 origin, vec3 direction, float minT, float maxT, uint mask, out Hit hit) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, world, gl_RayFlagsOpaqueEXT, 255, origin, minT, direction, maxT);
+    rayQueryInitializeEXT(query, world, gl_RayFlagsOpaqueEXT, mask, origin, minT, direction, maxT);
     while (rayQueryProceedEXT(query)) {
         if (rayQueryGetIntersectionTypeEXT(query, false) == gl_RayQueryCandidateIntersectionAABBEXT) {
-            vec3 o = rayQueryGetIntersectionObjectRayOriginEXT(query, false);
-            vec3 d = rayQueryGetIntersectionObjectRayDirectionEXT(query, false);
-            float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1, discriminant = b * b - a * c;
-            if (discriminant >= 0) {
-                float t = (-b - sqrt(discriminant)) / a;
-                if (t <= minT) {
-                    t = (-b + sqrt(discriminant)) / a;
-                }
-                if (t > minT && t < maxT) {
-                    rayQueryGenerateIntersectionEXT(query, t);
-                }
-            }
+            float t = sphereIntersection(rayQueryGetIntersectionObjectRayOriginEXT(query,false),
+                                          rayQueryGetIntersectionObjectRayDirectionEXT(query,false),minT,maxT);
+            if (t > 0) rayQueryGenerateIntersectionEXT(query,t);
         }
     }
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
@@ -352,26 +364,54 @@ bool traceRange(vec3 origin, vec3 direction, float minT, float maxT, out Hit hit
     hit.distance = t;
     return true;
 }
+bool traceRange(vec3 origin, vec3 direction, float minT, float maxT, out Hit hit) {
+    return traceRangeMasked(origin,direction,minT,maxT,255u,hit);
+}
+bool blockedByOpaque(vec3 origin, vec3 direction, float maxT) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, world, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          1u, origin, .001, direction, maxT);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query,false) == gl_RayQueryCandidateIntersectionAABBEXT) {
+            float t = sphereIntersection(rayQueryGetIntersectionObjectRayOriginEXT(query,false),
+                                          rayQueryGetIntersectionObjectRayDirectionEXT(query,false),.001,maxT);
+            if (t > 0) rayQueryGenerateIntersectionEXT(query,t);
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(query,true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
 bool trace(vec3 origin, vec3 direction, float maxT, out Hit hit) {
     return traceRange(origin, direction, .001, maxT, hit);
 }
-float opacity(Hit hit) {
-    Material m = materials[hit.material];
-    if (int(m.base.w) != MODEL_PBR || (m.alpha.y == 0 && !hit.front)) {
+float surfaceOpacity(Hit hit, Material m, Value base) {
+    if (m.alpha.z != 0 || int(m.base.w) != MODEL_PBR || (m.alpha.y == 0 && !hit.front)) {
         return 1;
     }
-    float a = m.programs[4].y > 0   ? evaluate(m.programs[4], hit.uv).colour.r
-              : m.programs[0].y > 0 ? evaluate(m.programs[0], hit.uv).colour.a
-                                    : 1;
+    float a = m.programs[4].y > 0 ?
+        channelValue(sameProgram(m.programs[0],m.programs[4]) ? base : evaluateRoot(m.programs[4],hit.uv),m.programs[4].w).colour.r :
+        channelValue(base,m.programs[0].w).colour.a;
     a = clamp(a, 0, 1);
     return a < m.alpha.x ? 0 : a;
 }
+float opacity(Hit hit) {
+    Material m = materials[hit.material];
+    if (m.alpha.z != 0 || int(m.base.w) != MODEL_PBR || (m.alpha.y == 0 && !hit.front)) return 1;
+    if (m.programs[4].y > 0) {
+        float a = clamp(evaluate(m.programs[4],hit.uv).colour.r,0,1);
+        return a < m.alpha.x ? 0 : a;
+    }
+    return surfaceOpacity(hit,m,baseRoot(m,hit.uv));
+}
 float visibility(vec3 origin, vec3 direction, float maxT) {
+    if (maxT <= .001) return 1;
+    bool fast = (cfg.options.w & 2) != 0;
+    if (fast && blockedByOpaque(origin,direction,maxT)) return 0;
+    if (fast && (cfg.options.w & 1) != 0) return 1;
     float value = 1;
     float minT = .001;
     Hit hit;
     for (int i = 0; i < 1024; ++i) {
-        if (maxT <= minT || !traceRange(origin, direction, minT, maxT, hit)) {
+        if (maxT <= minT || !traceRangeMasked(origin, direction, minT, maxT, fast ? 2u : 255u, hit)) {
             return value;
         }
         value *= 1 - opacity(hit);
@@ -383,19 +423,77 @@ float visibility(vec3 origin, vec3 direction, float maxT) {
     return 0;
 }
 
+float diffusionProfile(float radius,float distance) {
+    radius=max(radius,1e-12);
+    return (exp(-radius/distance)+exp(-radius/(3*distance)))/(8*PI*distance*radius);
+}
+int projectionHits(Hit exitHit,mat3 axes,int axis,vec3 center,float extent,bool choose,out Hit selected) {
+    vec3 offset=center-exitHit.p;
+    float projected2=max(0,dot(offset,offset)-pow(dot(offset,axes[axis]),2));
+    if(projected2>=extent*extent) return 0;
+    float halfLength=sqrt(max(0,extent*extent-projected2));
+    vec3 origin=center-halfLength*axes[axis];
+    float minimum=1e-6; int found=0;
+    for(int step=0;step<256;++step) {
+        Hit candidate;
+        if(minimum>=2*halfLength || !traceRange(origin,axes[axis],minimum,2*halfLength,candidate)) break;
+        // A scale-aware step advances at least a few float ULPs along the probe.
+        minimum=candidate.distance+max(1e-6,abs(candidate.distance)*4.7683716e-7);
+        if(candidate.instance!=exitHit.instance || candidate.material!=exitHit.material) continue;
+        if(!candidate.front) { candidate.n=-candidate.n; candidate.g=-candidate.g; }
+        candidate.front=true;
+        if(opacity(candidate)<=0) continue;
+        ++found;
+        // Reservoir selection gives a uniform entry without a bounded hit array.
+        if(choose && (found==1 || random()<1.0/found)) selected=candidate;
+    }
+    return found;
+}
+bool sampleSubsurface(Hit exitHit,vec3 base,out Hit entry,out vec3 weight) {
+    Material m=materials[exitHit.material];
+    float distance=m.subsurface.y,extent=30*distance,selection=random();
+    mat3 axes=frame(exitHit.g);
+    int axis=selection<.5?2:selection<.75?0:1;
+    float u=random();
+    float radius=u<.25?-distance*log(max(1e-8,1-4*u)):-3*distance*log(max(1e-8,1-(u-.25)/.75));
+    if(radius>=extent) return false; // The same truncated tail as the CPU is absorption.
+    float phi=2*PI*random();
+    vec3 center=exitHit.p+radius*(cos(phi)*axes[(axis+1)%3]+sin(phi)*axes[(axis+2)%3]);
+    int found=projectionHits(exitHit,axes,axis,center,extent,true,entry);
+    if(found==0) return false;
+    vec3 delta=entry.p-exitHit.p; float pdf=0;
+    for(int a=0;a<3;++a) {
+        vec3 projected=entry.p-dot(delta,axes[a])*axes[a];
+        Hit ignored;
+        int count=a==axis?found:projectionHits(exitHit,axes,a,projected,extent,false,ignored);
+        if(count>0) pdf+=(a==2?.5:.25)*diffusionProfile(length(projected-exitHit.p),distance)*abs(dot(entry.g,axes[a]))/count;
+    }
+    if(pdf<=0 || isnan(pdf) || isinf(pdf)) return false;
+    vec3 tint=m.scatterTint.w!=0?clamp(finiteColour(m.scatterTint.rgb),0,1):base;
+    weight=tint*(diffusionProfile(length(delta),distance)*opacity(entry)/pdf);
+    return true;
+}
 struct Surface {
     vec3 base, f0, n, g;
-    float metal, alpha, q;
+    float metal, alpha, q, subsurface, entryIOR, entryNormalization;
     bool deltaSurface;
     int model;
 };
-Surface prepare(Hit h) {
+Surface prepare(Hit h, Value base) {
     Material m = materials[h.material];
     Surface s;
-    s.base = m.programs[0].y > 0 ? evaluate(m.programs[0], h.uv).colour.rgb : m.base.rgb;
-    s.metal = m.programs[1].y > 0 ? evaluate(m.programs[1], h.uv).colour.r : m.parameters.x;
-    float rough = m.programs[2].y > 0 ? evaluate(m.programs[2], h.uv).colour.r : m.parameters.y;
+    s.base = channelValue(base,m.programs[0].w).colour.rgb;
+    Value metal = m.programs[1].y == 0 ? scalarValue(m.parameters.x) :
+        sameProgram(m.programs[0],m.programs[1]) ? base : evaluateRoot(m.programs[1],h.uv);
+    Value roughness = m.programs[2].y == 0 ? scalarValue(m.parameters.y) :
+        sameProgram(m.programs[0],m.programs[2]) ? base :
+        sameProgram(m.programs[1],m.programs[2]) ? metal : evaluateRoot(m.programs[2],h.uv);
+    s.metal = channelValue(metal,m.programs[1].w).colour.r;
+    float rough = channelValue(roughness,m.programs[2].w).colour.r;
     s.model = int(m.base.w);
+    s.subsurface = m.subsurface.x;
+    s.entryIOR = m.subsurface.z;
+    s.entryNormalization = m.subsurface.w;
     s.metal = clamp(s.metal, 0, 1);
     rough = clamp(rough, 0, 1);
     if (s.model == MODEL_PBR) {
@@ -408,7 +506,10 @@ Surface prepare(Hit h) {
     s.n = h.n;
     s.g = h.g;
     if (s.model == MODEL_PBR && m.programs[3].y > 0) {
-        vec3 texel = 2 * evaluate(m.programs[3], h.uv).colour.rgb - 1;
+        Value mappedValue = sameProgram(m.programs[0],m.programs[3]) ? base :
+            sameProgram(m.programs[1],m.programs[3]) ? metal :
+            sameProgram(m.programs[2],m.programs[3]) ? roughness : evaluateRoot(m.programs[3],h.uv);
+        vec3 texel = 2 * channelValue(mappedValue,m.programs[3].w).colour.rgb - 1;
         texel.xy *= m.parameters.z;
         vec3 mapped = safeNormal(texel.x * h.t + texel.y * h.b + texel.z * h.n, h.n);
         if (dot(mapped, h.g) > 0) {
@@ -417,8 +518,11 @@ Surface prepare(Hit h) {
     }
     return s;
 }
-float D(float nh, float a) {
-    float a2 = a * a, d = (1 - nh * nh) + a2 * nh * nh;
+float D(vec3 n, vec3 h, float a) {
+    float nh = clamp(dot(n,h),0,1);
+    // Cross-product sin² avoids cancellation at narrow glossy highlights in FP32.
+    vec3 tangent = cross(n,h);
+    float a2 = a * a, d = dot(tangent,tangent) + a2 * nh * nh;
     return nh > 0 ? a2 / (PI * d * d) : 0;
 }
 float smithRoot(float c, float a) {
@@ -431,6 +535,14 @@ vec3 fresnel(float c, vec3 f0) {
     float x = 1 - clamp(c, 0, 1), x2 = x * x;
     return f0 + (1 - f0) * x2 * x2 * x;
 }
+float entryTransmission(float cosine,float eta) {
+    cosine=clamp(cosine,0,1);
+    if(eta==1) return 1;
+    float transmitted=sqrt(max(0,1-(1-cosine*cosine)/(eta*eta)));
+    float rp=(eta*cosine-transmitted)/(eta*cosine+transmitted);
+    float rs=(cosine-eta*transmitted)/(cosine+eta*transmitted);
+    return 1-.5*(rp*rp+rs*rs);
+}
 bool above(Surface s, vec3 v, vec3 l) {
     return dot(s.g, v) > 0 && dot(s.g, l) > 0 && dot(s.n, v) > 0 && dot(s.n, l) > 0;
 }
@@ -439,6 +551,7 @@ vec3 directBSDF(Surface s, vec3 v, vec3 l) {
         return s.base / (4 * PI);
     }
     float nl = max(0, dot(s.n, l));
+    if(s.model==MODEL_SUBSURFACE_ENTRY) return vec3(nl*entryTransmission(nl,s.entryIOR)*s.entryNormalization);
     if (s.model == MODEL_LAMBERT) {
         return s.base * nl / PI;
     }
@@ -447,11 +560,11 @@ vec3 directBSDF(Surface s, vec3 v, vec3 l) {
     }
     float nv = clamp(dot(s.n, v), 0, 1);
     nl = clamp(nl, 0, 1);
-    vec3 f = s.base * ((1 - s.metal) / PI) * (1 - fresnel(nv, s.f0)) * (1 - fresnel(nl, s.f0));
+    vec3 f = s.base * ((1 - s.metal)*(1-s.subsurface) / PI) * (1 - fresnel(nv, s.f0)) * (1 - fresnel(nl, s.f0));
     if (!s.deltaSurface) {
         vec3 h = safeNormal(v + l, s.n);
         float vis = .5 / (nl * smithRoot(nv, s.alpha) + nv * smithRoot(nl, s.alpha));
-        f += fresnel(dot(v, h), s.f0) * D(clamp(dot(s.n, h), 0, 1), s.alpha) * vis;
+        f += fresnel(dot(v, h), s.f0) * D(s.n, h, s.alpha) * vis;
     }
     return f * nl;
 }
@@ -459,15 +572,15 @@ float bsdfPDF(Surface s, vec3 v, vec3 l) {
     if (s.model == MODEL_ISOTROPIC) {
         return 1 / (4 * PI);
     }
-    if (s.model == MODEL_LAMBERT) {
+    if (s.model == MODEL_LAMBERT || s.model==MODEL_SUBSURFACE_ENTRY) {
         return max(0, dot(s.n, l)) / PI;
     }
     if (s.model != MODEL_PBR || !above(s, v, l)) {
         return 0;
     }
-    float nv = dot(s.n, v), nl = dot(s.n, l), pdf = (1 - s.q) * nl / PI;
+    float nv = dot(s.n, v), nl = dot(s.n, l), pdf = (1 - s.q)*(1-s.subsurface) * nl / PI;
     if (!s.deltaSurface) {
-        pdf += s.q * D(clamp(dot(s.n, safeNormal(v + l, s.n)), 0, 1), s.alpha) * G1(nv, s.alpha) / (4 * nv);
+        pdf += s.q * D(s.n, safeNormal(v + l, s.n), s.alpha) * G1(nv, s.alpha) / (4 * nv);
     }
     return pdf;
 }
@@ -481,9 +594,10 @@ vec3 visibleNormal(vec3 v, float a) {
     return normalize(vec3(a * n.xy, max(0, n.z)));
 }
 bool scatter(Surface s, Hit hit, vec3 view, out vec3 direction, out vec3 weight, out float pdf,
-             out bool delta) {
+             out bool delta, out bool subsurface) {
     Material m = materials[hit.material];
     delta = false;
+    subsurface = false;
     pdf = 0;
     weight = vec3(0);
     if (s.model == MODEL_EMISSION) {
@@ -523,7 +637,13 @@ bool scatter(Surface s, Hit hit, vec3 view, out vec3 direction, out vec3 weight,
         return false;
     }
     mat3 basis = frame(s.n);
-    if (random() < s.q) {
+    float lobe=random(), probability=(1-s.q)*s.subsurface;
+    if(probability>0 && lobe>=1-probability) {
+        subsurface=true;
+        weight=(1-fresnel(dot(view,s.n),s.f0))*((1-s.metal)*s.subsurface/probability);
+        return true;
+    }
+    if (lobe < s.q) {
         if (s.deltaSurface) {
             direction = reflect(-view, s.n);
             weight = fresnel(dot(view, s.n), s.f0) / s.q;
@@ -597,47 +717,8 @@ vec3 lightContribution(Hit hit, Surface s, vec3 view, vec3 direction, vec3 radia
     vec3 origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
     return bsdf * radiance * (weight * mis * visibility(origin, direction, maxT));
 }
-vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
-    vec3 result = vec3(0), throughput = vec3(1), previous = origin;
-    float prevPDF = 0;
-    bool prevDelta = true;
-    albedo = vec3(0);
-    normal = vec3(0);
-    int nulls = 0, count = max(0, cfg.counts.z), sunSamples = count > 0 ? max(1, cfg.counts.w) : 0;
-    for (int depth = 0; depth <= cfg.image.w; ++depth) {
-        Hit hit;
-        if (!trace(origin, direction, 1e30, hit)) {
-            result += throughput * cfg.background.rgb;
-            float pdf = sunPDF(direction);
-            if (pdf > 0) {
-                result +=
-                    throughput * cfg.sunRadiance.rgb * pdf * hitWeight(prevPDF, pdf, sunSamples, prevDelta);
-            }
-            break;
-        }
-        float a = opacity(hit);
-        if (a <= 0 || (a < 1 && random() >= a)) {
-            if (++nulls > 1024) {
-                break;
-            }
-            origin = hit.p + direction * .001;
-            --depth;
-            continue;
-        }
-        Surface s = prepare(hit);
-        vec3 view = -direction;
-        if (depth == 0) {
-            albedo = s.base;
-            normal = hit.n;
-        }
-        if (s.model == MODEL_EMISSION) {
-            result += throughput * emission(hit) *
-                      hitWeight(prevPDF, emitterPDF(hit, previous, direction), count, prevDelta);
-            break;
-        }
-        if (depth == cfg.image.w) {
-            break;
-        }
+vec3 directLighting(Hit hit, Surface s, vec3 view) {
+    int count=max(0,cfg.counts.z),sunSamples=count>0?max(1,cfg.counts.w):0;
         vec3 direct = vec3(0);
         if (cfg.sunRadiance.w != 0) {
             float omega = cfg.sunDirection.w;
@@ -657,11 +738,23 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
                 direct += lightContribution(hit, s, view, l, cfg.sunRadiance.rgb, 1e30, 1.0 / samples, mis);
             }
         }
-        // Sample point lights uniformly. Every positive light has support; the
-        // inverse selection probability keeps the result independent of count.
+        // Power-weighted selection reduces noise for uneven light intensities.
+        // Divide by the actual float CDF interval, including its uniform mixture.
         int pointSamples = max(1, count);
         for (int j = 0; j < pointSamples && cfg.counts.x > 0; ++j) {
-            int index = min(int(random() * cfg.counts.x), cfg.counts.x - 1);
+            float selection = random();
+            int index = min(int(selection * cfg.counts.x), cfg.counts.x - 1);
+            float probability = 1.0/cfg.counts.x;
+            if ((cfg.options.w & 4) != 0) {
+                int lo = 0, hi = cfg.counts.x-1;
+                while (lo < hi) {
+                    int mid = (lo+hi)/2;
+                    if (pointLights[mid].radiance.w <= selection) lo = mid+1;
+                    else hi = mid;
+                }
+                index = lo;
+                probability = pointLights[index].radiance.w - (index == 0 ? 0 : pointLights[index-1].radiance.w);
+            }
             PointLight light = pointLights[index];
             vec3 delta = light.position.xyz - hit.p;
             float distance = length(delta);
@@ -670,7 +763,7 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
             }
             direct +=
                 lightContribution(hit, s, view, delta / distance, light.radiance.rgb / (distance * distance),
-                                  distance - .002, float(cfg.counts.x) / pointSamples, 1);
+                                  distance - .002, 1.0 / (probability * pointSamples), 1);
         }
         for (int j = 0; j < count && cfg.counts.y > 0; ++j) {
             float u = random();
@@ -706,16 +799,85 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
             direct += lightContribution(hit, s, view, l, emission(lightHit), distance - .002,
                                         1 / (count * pdf), mis);
         }
+    return direct;
+}
+vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, out vec3 indirect) {
+    vec3 result = vec3(0), throughput = vec3(1), previous = origin;
+    indirect = vec3(0);
+    bool indirectPath = false;
+    float prevPDF = 0;
+    bool prevDelta = true;
+    albedo = vec3(0);
+    normal = vec3(0);
+    int nulls = 0, count = max(0, cfg.counts.z), sunSamples = count > 0 ? max(1, cfg.counts.w) : 0;
+    for (int depth = 0; depth <= cfg.image.w; ++depth) {
+        Hit hit;
+        if (!trace(origin, direction, 1e30, hit)) {
+            vec3 contribution = throughput * cfg.background.rgb;
+            float pdf = sunPDF(direction);
+            if (pdf > 0) {
+                contribution += throughput * cfg.sunRadiance.rgb * pdf * hitWeight(prevPDF, pdf, sunSamples, prevDelta);
+            }
+            result += contribution;
+            if(indirectPath) indirect += contribution;
+            break;
+        }
+        Material material = materials[hit.material];
+        Value base = baseRoot(material,hit.uv);
+        float a = surfaceOpacity(hit,material,base);
+        if (a <= 0 || (a < 1 && random() >= a)) {
+            if (++nulls > 1024) {
+                break;
+            }
+            origin = hit.p + direction * .001;
+            --depth;
+            continue;
+        }
+        Surface s = prepare(hit,base);
+        vec3 view = -direction;
+        if (depth == 0) {
+            albedo = s.base;
+            normal = hit.n;
+        }
+        if (s.model == MODEL_EMISSION) {
+            vec3 emitted = (material.programs[0].y > 0 ? s.base : material.emission.rgb) * material.emission.w;
+            vec3 contribution = throughput * emitted * hitWeight(prevPDF, emitterPDF(hit, previous, direction), count, prevDelta);
+            result += contribution;
+            if(indirectPath) indirect += contribution;
+            break;
+        }
+        if (depth == cfg.image.w) {
+            break;
+        }
+        vec3 direct=directLighting(hit,s,view);
         result += throughput * direct;
+        if(indirectPath) indirect += throughput * direct;
         vec3 weight, next;
         float pdf;
-        bool delta;
-        if (!scatter(s, hit, view, next, weight, pdf, delta)) {
+        bool delta,subsurface;
+        if (!scatter(s, hit, view, next, weight, pdf, delta,subsurface)) {
             break;
+        }
+        if(subsurface) {
+            Hit entry; vec3 spatialWeight;
+            if(!sampleSubsurface(hit,s.base,entry,spatialWeight)) break;
+            throughput *= weight*spatialWeight;
+            hit=entry;
+            s.model=MODEL_SUBSURFACE_ENTRY; s.n=entry.g; s.g=entry.g;
+            direct=directLighting(entry,s,entry.g);
+            result += throughput*direct;
+            indirect += throughput*direct;
+            indirectPath=true;
+            next=frame(entry.g)*cosineHemisphere();
+            float cosine=max(0,dot(entry.g,next));
+            pdf=cosine/PI;
+            weight=vec3(PI*entryTransmission(cosine,s.entryIOR)*s.entryNormalization);
+            delta=false;
         }
         previous = hit.p;
         prevPDF = pdf;
         prevDelta = delta;
+        indirectPath = indirectPath || !delta || (s.model==MODEL_METAL && material.f0.w>0);
         throughput *= weight;
         direction = normalize(next);
         origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
@@ -727,7 +889,33 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal) {
             throughput /= survival;
         }
     }
+    indirect = max(vec3(0),finiteColour(indirect));
     return max(vec3(0), finiteColour(result));
+}
+vec3 reconstructed(uint index, uvec2 p) {
+    Pixel center = pixels[index];
+    vec3 value = max(finiteColour(center.sum.rgb / max(1,center.sum.w)),0);
+    if((cfg.options.w & 8)==0) return value;
+    vec3 indirect = max(finiteColour(center.indirect.rgb / max(1,center.sum.w)),0);
+    float centerLum=luminance(indirect);
+    if(centerLum<=.05) return value;
+    float neighbours[24]; int count=0;
+    for(int dy=-2;dy<=2;++dy) for(int dx=-2;dx<=2;++dx) {
+        ivec2 q = ivec2(p)+ivec2(dx,dy);
+        if((dx==0 && dy==0) || any(lessThan(q,ivec2(0))) || any(greaterThanEqual(q,cfg.image.xy))) continue;
+        Pixel other = pixels[q.y*cfg.image.x+q.x];
+        if(other.sum.w==0) continue; // partially rendered tiles are not black neighbours
+        float y=luminance(max(finiteColour(other.indirect.rgb/max(1,other.sum.w)),0));
+        int i=count;
+        while(i>0 && neighbours[i-1]>y) { neighbours[i]=neighbours[i-1]; --i; }
+        neighbours[i]=y; ++count;
+    }
+    if(count>=3) {
+        float supported=neighbours[(count*3)/4];
+        float ceiling=4*max(supported,4*neighbours[count/2])+.05;
+        if(centerLum>ceiling) value=max(vec3(0),value-indirect*(1-supported/centerLum));
+    }
+    return value;
 }
 float halton(uint index, uint base) {
     float sum = 0, f = 1;
@@ -750,6 +938,16 @@ void main() {
     }
     uint index = pixel.y * uint(cfg.image.x) + pixel.x;
     Pixel accum = pixels[index];
+    if (dispatch.sampleCount == 0) {
+        vec3 linear = reconstructed(index,pixel) * uintBitsToFloat(dispatch.sampleIndex);
+        float lum = luminance(linear);
+        vec3 mapped = linear * (lum < 1e-6 ? 0 : 1 / (1 + lum));
+        vec3 encoded = mix(1.055 * pow(max(mapped,0), vec3(1.0/2.4)) - .055,
+                           mapped * 12.92, lessThanEqual(mapped, vec3(.0031308)));
+        uvec3 rgb = uvec3(256 * clamp(encoded, 0, .999));
+        displayPixels[index] = rgb.r | (rgb.g << 8) | (rgb.b << 16) | 0xff000000u;
+        return;
+    }
     if (accum.variance.z != 0) {
         return;
     }
@@ -771,9 +969,10 @@ void main() {
         }
         vec3 direction = normalize(cfg.pixel00.xyz + (pixel.x + jitter.x) * cfg.deltaU.xyz +
                                    (pixel.y + jitter.y) * cfg.deltaV.xyz - origin);
-        vec3 albedo, normal;
-        vec3 value = pathTrace(origin, direction, albedo, normal);
+        vec3 albedo, normal, indirect;
+        vec3 value = pathTrace(origin, direction, albedo, normal, indirect);
         accum.sum += vec4(value, 1);
+        accum.indirect += vec4(indirect,0);
         accum.albedo += vec4(albedo, 0);
         accum.normal += vec4(normal, 0);
         float y = luminance(value), delta = y - accum.variance.x;
@@ -782,7 +981,10 @@ void main() {
         if (cfg.options.z != 0 && accum.sum.w >= cfg.adaptive.x &&
             int(accum.sum.w) % max(1, int(cfg.adaptive.y)) == 0) {
             float error = sqrt(max(0, accum.variance.y / (accum.sum.w - 1) / accum.sum.w));
-            if (error < max(cfg.adaptive.w, cfg.adaptive.z * abs(accum.variance.x))) {
+            // A single quiet batch is not evidence that a rare caustic has converged.
+            bool quiet = error < max(cfg.adaptive.w, cfg.adaptive.z * abs(accum.variance.x));
+            accum.variance.w = quiet ? accum.variance.w+1 : 0;
+            if (accum.variance.w >= 2) {
                 accum.variance.z = 1;
                 atomicAdd(convergedCount, 1);
             }

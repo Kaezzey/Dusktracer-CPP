@@ -56,6 +56,7 @@ static void smoke_swap_buffers(GLFWwindow* window) {
               "full editor screenshot");
         if (layout_frame == 72) {
             check(g_material_thumb_cache.size() == 8, "material tab schedules visible material thumbnails");
+            project_ui::saved_fingerprint = dusk_project::fingerprint(CurrentProjectView());
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
     }
@@ -100,7 +101,7 @@ static int run_layout_smoke() {
     light.direction = unit_vector(vec3(-1, -2, -3));
     light.radiance = colour(3, 3, 3);
     g_scene.lights.push_back(light);
-    const int result = dusk_editor_entry_for_test();
+    const int result = dusk_editor_entry_for_test(0, nullptr);
     std::printf("%d complete editor layout checks passed\n", checks);
     return result;
 }

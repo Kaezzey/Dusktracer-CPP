@@ -17,10 +17,16 @@ void main() {
     gl_Position = uProj * uView * p;
 }
 )GLSL";
-inline constexpr const char* material = R"GLSL(#version 130
+inline constexpr const char* version = "#version 130\n";
+inline constexpr const char* material = R"GLSL(
 const float PI = 3.14159265358979323846;
+#ifdef MATERIAL_SPHERE_PREVIEW
+vec3 vWorld, vNormal, vTangent, vBitangent;
+vec2 vUV;
+#else
 in vec3 vWorld, vNormal, vTangent, vBitangent;
 in vec2 vUV;
+#endif
 uniform vec4 uBase, uParameters, uF0, uEmission, uAlpha;
 uniform ivec4 uPrograms[5];
 uniform sampler2D uInstructions;
@@ -31,6 +37,7 @@ vec3 safeNormal(vec3 value, vec3 fallback) {
     float squared = dot(value, value);
     return squared > 1e-20 ? value * inversesqrt(squared) : fallback;
 }
+const int NODE_CONSTANT = -1;
 const int NODE_OUTPUT = 0;
 const int NODE_TEXTURE = 1;
 const int NODE_SCALAR = 2;
@@ -121,7 +128,9 @@ Value evaluate(ivec4 program, vec2 uv) {
                                   : channelValue(registers[op.inputs.z], op.channels.z);
         Value result = scalarValue(0);
         int kind = op.code.x;
-        if (kind == NODE_TEXTURE) {
+        if (kind == NODE_CONSTANT) {
+            result = Value(op.value, op.defaults);
+        } else if (kind == NODE_TEXTURE) {
             result = textureValue(op.code.z, op.inputs.x < 0 ? uv : fract(a.colour.xy), op.code.w);
         } else {
             if (kind == NODE_SCALAR) {
@@ -269,7 +278,7 @@ vec3 displayColor(vec3 linearColor) {
     c = c / (1+c);
     return mix(1.055*pow(c,vec3(1.0/2.4))-.055, c*12.92, lessThanEqual(c,vec3(.0031308)));
 }
-void main() {
+void shadeSurface() {
     Value surface = baseValue();
     maskSurface(surface);
     int model = int(uBase.w);
@@ -277,8 +286,12 @@ void main() {
     vec3 smoothNormal = safeNormal(vNormal,vec3(0,1,0));
     vec3 v = safeNormal(uEye-vWorld, smoothNormal);
     if (dot(smoothNormal,v) < 0) smoothNormal = -smoothNormal;
+#ifdef MATERIAL_SPHERE_PREVIEW
+    vec3 geometricNormal = smoothNormal;
+#else
     vec3 geometricNormal = safeNormal(cross(dFdx(vWorld),dFdy(vWorld)),smoothNormal);
     if (dot(geometricNormal,v) < 0) geometricNormal = -geometricNormal;
+#endif
     vec3 n = smoothNormal;
     if (uPrograms[3].y > 0) {
         vec3 t = safeNormal(vTangent - n*dot(n,vTangent),safeNormal(cross(n,vec3(.123,.456,.789)),vec3(1,0,0)));
@@ -318,6 +331,9 @@ void main() {
     }
     FragColor = vec4(displayColor(color),1);
 }
+#ifndef MATERIAL_SPHERE_PREVIEW
+void main() { shadeSurface(); }
+#endif
 )GLSL";
 inline constexpr const char* shadow = R"GLSL(
 uniform bool uPointShadowPass;

@@ -28,10 +28,18 @@ render_result render_selected(const render_selection&, const scene&, const hitta
 
 namespace dusk_gpu {
 struct snapshot;
+struct render_statistics {
+    bool reused_device = false, reused_pipeline = false;
+    uint64_t uploaded_bytes = 0, blas_builds = 0, tlas_builds = 0, submissions = 0;
+    uint64_t preview_readback_bytes = 0, final_readback_bytes = 0;
+};
+// Releases the retained scene/device after pending rendering has completed.
+void clear_cache();
 render_result render(snapshot, camera, const renderer&, const std::string& device_id,
                      std::atomic<bool>*, render_progress_state*,
                      const std::function<void(const render_result&)>&,
                      std::vector<float>* linear_output = nullptr,
-                     const std::function<void(const std::string&)>& status_callback = {});
+                     const std::function<void(const std::string&)>& status_callback = {},
+                     render_statistics* statistics = nullptr);
 render_device_list enumerate();
 } // namespace dusk_gpu

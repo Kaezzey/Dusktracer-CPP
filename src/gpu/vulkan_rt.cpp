@@ -1,4 +1,5 @@
 #include "core/denoise.h"
+#include "core/firefly_filter.h"
 #define VK_NO_PROTOTYPES
 #define NOMINMAX
 #include <vulkan/vulkan.h>
@@ -14,6 +15,8 @@
 #include <stdexcept>
 #include <iostream>
 #include "pipeline_cache.h"
+#include "content_key.h"
+#include <mutex>
 
 namespace dusk_gpu {
 namespace {
@@ -50,6 +53,11 @@ void check(VkResult result, const char* operation) {
     X(vkGetBufferDeviceAddress) \
     X(vkCreateCommandPool) \
     X(vkResetCommandPool) \
+    X(vkCreateQueryPool) \
+    X(vkDestroyQueryPool) \
+    X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults) \
     X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) \
@@ -110,7 +118,23 @@ struct context {
     VkCommandPool pool{};
     VkCommandBuffer command{};
     VkFence fence{};
+    struct pending_submission {
+        VkCommandPool pool{};
+        VkCommandBuffer command{};
+        VkFence fence{};
+        VkQueryPool timestamps{};
+        bool pending = false;
+        int work = 0;
+    };
+    std::array<pending_submission, 3> pending{};
+    size_t next_submission = 0;
+    uint32_t timestamp_bits = 0;
+    double submission_ms = 0;
+    int64_t completed_work = 0;
+    bool synchronous = false;
     VkDescriptorPool descriptors{};
+    VkDescriptorSet descriptor{};
+    render_statistics* statistics = nullptr;
     VkDescriptorSetLayout layout{};
     VkPipelineLayout pipelineLayout{};
     VkShaderModule shader{};
@@ -122,7 +146,11 @@ struct context {
     VkPhysicalDeviceAccelerationStructurePropertiesKHR asProperties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
     std::vector<buffer> buffers;
-    std::vector<VkAccelerationStructureKHR> structures;
+    struct acceleration_structure {
+        VkAccelerationStructureKHR handle;
+        buffer storage;
+    };
+    std::vector<acceleration_structure> structures;
     std::atomic<int> validationErrors{0};
     static VKAPI_ATTR VkBool32 VKAPI_CALL message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                   VkDebugUtilsMessageTypeFlagsEXT,
@@ -158,7 +186,7 @@ struct context {
                 vkDestroyDescriptorSetLayout(device, layout, nullptr);
             }
             for (auto as : structures) {
-                vkDestroyAccelerationStructureKHR(device, as, nullptr);
+                vkDestroyAccelerationStructureKHR(device, as.handle, nullptr);
             }
             for (auto& b : buffers) {
                 if (b.mapped) {
@@ -170,6 +198,11 @@ struct context {
                 if (b.memory) {
                     vkFreeMemory(device, b.memory, nullptr);
                 }
+            }
+            for (auto& slot : pending) {
+                if (slot.timestamps) vkDestroyQueryPool(device, slot.timestamps, nullptr);
+                if (slot.fence) vkDestroyFence(device, slot.fence, nullptr);
+                if (slot.pool) vkDestroyCommandPool(device, slot.pool, nullptr);
             }
             if (fence) {
                 vkDestroyFence(device, fence, nullptr);
@@ -294,8 +327,8 @@ struct context {
             result.reason = "Required hardware ray-query features are disabled.";
             return result;
         }
-        if (props.properties.limits.maxPerStageDescriptorStorageBuffers < 13) {
-            result.reason = "At least 13 compute storage buffers are required.";
+        if (props.properties.limits.maxPerStageDescriptorStorageBuffers < 14) {
+            result.reason = "At least 14 compute storage buffers are required.";
             return result;
         }
         uint32_t n = 0;
@@ -377,10 +410,24 @@ struct context {
         check(vkAllocateCommandBuffers(device, &alloc, &command), "Allocate command buffer");
         VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         check(vkCreateFence(device, &f, nullptr, &fence), "Create submission fence");
+        timestamp_bits = queues[family].timestampValidBits;
+        for (auto& slot : pending) {
+            check(vkCreateCommandPool(device, &poolInfo, nullptr, &slot.pool), "Create queued command pool");
+            alloc.commandPool = slot.pool;
+            check(vkAllocateCommandBuffers(device, &alloc, &slot.command), "Allocate queued command buffer");
+            check(vkCreateFence(device, &f, nullptr, &slot.fence), "Create queued fence");
+            if (timestamp_bits) {
+                VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                query.queryCount = 2;
+                check(vkCreateQueryPool(device, &query, nullptr, &slot.timestamps), "Create GPU timer");
+            }
+        }
     }
     buffer allocate(VkDeviceSize bytes, VkBufferUsageFlags usage, bool host = false) {
-        size_t index = buffers.size();
-        buffers.push_back({});
+        auto free = std::find_if(buffers.begin(), buffers.end(), [](const buffer& b) { return !b.handle; });
+        const size_t index = size_t(free - buffers.begin());
+        if (free == buffers.end()) buffers.push_back({});
         auto& b = buffers[index];
         b.size = std::max<VkDeviceSize>(bytes, 16);
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -424,7 +471,55 @@ struct context {
         }
         return b;
     }
+    void finish(pending_submission& slot) {
+        if (!slot.pending) return;
+        VkResult result;
+        do {
+            result = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, 50000000);
+        } while (result == VK_TIMEOUT);
+        check(result, "Wait for queued GPU work");
+        if (slot.timestamps) {
+            uint64_t ticks[2]{};
+            check(vkGetQueryPoolResults(device, slot.timestamps, 0, 2, sizeof(ticks), ticks,
+                                       sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                  "Read GPU timer");
+            const uint64_t mask = timestamp_bits == 64 ? ~uint64_t(0) : (uint64_t(1) << timestamp_bits) - 1;
+            submission_ms = double((ticks[1] - ticks[0]) & mask) * properties.limits.timestampPeriod / 1e6;
+        }
+        completed_work += slot.work;
+        slot.pending = false;
+        if (validationErrors.load()) throw std::runtime_error("Vulkan validation reported an error.");
+    }
+    void drain() {
+        for (size_t i = 0; i < pending.size(); ++i) finish(pending[(next_submission + i) % pending.size()]);
+    }
+    template <class F> void enqueue(int work, F&& record) {
+        auto& slot = pending[next_submission];
+        finish(slot);
+        check(vkResetCommandPool(device, slot.pool, 0), "Reset queued command pool");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(slot.command, &begin), "Begin queued commands");
+        if (slot.timestamps) {
+            vkCmdResetQueryPool(slot.command, slot.timestamps, 0, 2);
+            vkCmdWriteTimestamp(slot.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.timestamps, 0);
+        }
+        record(slot.command);
+        if (slot.timestamps) vkCmdWriteTimestamp(slot.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.timestamps, 1);
+        check(vkEndCommandBuffer(slot.command), "End queued commands");
+        check(vkResetFences(device, 1, &slot.fence), "Reset queued fence");
+        VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &slot.command;
+        check(vkQueueSubmit(queue, 1, &info, slot.fence), "Queue tracing work");
+        if (statistics) ++statistics->submissions;
+        slot.work = work;
+        slot.pending = true;
+        next_submission = (next_submission + 1) % pending.size();
+        if (synchronous) finish(slot);
+    }
     template <class F> void submit(F&& record) {
+        drain();
         check(vkResetCommandPool(device, pool, 0), "Reset command pool");
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -436,6 +531,7 @@ struct context {
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
         check(vkQueueSubmit(queue, 1, &submit, fence), "Submit GPU work");
+        if (statistics) ++statistics->submissions;
         VkResult result;
         do {
             result = vkWaitForFences(device, 1, &fence, VK_TRUE, 50000000);
@@ -447,6 +543,7 @@ struct context {
     }
     // Call only after the owning submission's fence has completed.
     void release(buffer resource) {
+        if (!resource.handle) return;
         for (auto& owned : buffers) {
             if (owned.handle != resource.handle) {
                 continue;
@@ -493,7 +590,11 @@ struct context {
         VkAccelerationStructureKHR result{};
         check(vkCreateAccelerationStructureKHR(device, &create, nullptr, &result),
               "Create acceleration structure");
-        structures.push_back(result);
+        structures.push_back({result, storage});
+        if (statistics) {
+            if (type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) ++statistics->blas_builds;
+            else ++statistics->tlas_builds;
+        }
         auto alignment = asProperties.minAccelerationStructureScratchOffsetAlignment;
         auto scratch =
             allocate(sizes.buildScratchSize + alignment,
@@ -520,6 +621,14 @@ struct context {
         release(scratch);
         return result;
     }
+    void release_structure(VkAccelerationStructureKHR handle) {
+        auto found = std::find_if(structures.begin(), structures.end(),
+                                  [&](const acceleration_structure& as) { return as.handle == handle; });
+        if (found == structures.end()) return;
+        vkDestroyAccelerationStructureKHR(device, handle, nullptr);
+        release(found->storage);
+        structures.erase(found);
+    }
     VkDeviceAddress asAddress(VkAccelerationStructureKHR as) {
         VkAccelerationStructureDeviceAddressInfoKHR info{
             VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
@@ -535,9 +644,9 @@ struct point_light {
     f4 position, radiance;
 };
 struct pixel {
-    f4 sum, albedo, normal, variance;
+    f4 sum, albedo, normal, variance, indirect;
 };
-static_assert(sizeof(configuration) == 208 && sizeof(pixel) == 64);
+static_assert(sizeof(configuration) == 208 && sizeof(pixel) == 80);
 f4 pack(vec3 v, float w = 0) {
     return {float(v.x()), float(v.y()), float(v.z()), w};
 }
@@ -556,14 +665,22 @@ configuration configure(const camera& cam, const renderer& settings, const snaps
     c.defocusU = pack(radius * u);
     c.defocusV = pack(radius * v);
     c.background = pack(cam.background);
-    double angle = degrees_to_radians(std::clamp(cam.sun_angular_radius, 0.0, 90.0));
-    c.sunDirection = pack(safe_unit_vector(cam.sun_dir), float(4 * pi * std::pow(std::sin(angle / 2), 2)));
+    c.sunDirection = pack(safe_unit_vector(cam.sun_dir), float(cam.sun_solid_angle()));
     c.sunRadiance = pack(cam.sun_radiance, cam.use_sun ? 1.f : 0.f);
     c.image = {cam.image_width, cam.image_height, cam.samples_per_pixel, cam.max_depth};
     c.counts = {int(cam.point_lights.size()), int(scene.lights.size()), cam.direct_light_samples,
                 cam.sun_shadow_samples};
-    c.options = {cam.enable_mis ? 1 : 0, int(cam.sampling_method), settings.adaptive_sampling ? 1 : 0, 0};
-    c.adaptive = {float(std::max(2, settings.adaptive_min_samples)),
+    const bool opaque = std::all_of(scene.materials.begin(), scene.materials.end(),
+                                    [](const material_record& material) { return material.alpha.z != 0; });
+    const bool reference = std::getenv("DUSK_GPU_REFERENCE") != nullptr;
+    c.options = {cam.enable_mis ? 1 : 0, int(cam.sampling_method), settings.adaptive_sampling ? 1 : 0,
+                 reference ? 0 : 2 | 4 | (opaque ? 1 : 0)};
+    if(settings.gpu_firefly_filter) c.options.w |= 8;
+    const bool caustic_risk = cam.use_sun && std::any_of(scene.materials.begin(),scene.materials.end(),
+        [](const material_record& material) { return int(material.base.w)==2; });
+    const bool subsurface_risk=std::any_of(scene.materials.begin(),scene.materials.end(),
+        [](const material_record& material) { return material.subsurface.x>0; });
+    c.adaptive = {float(std::max(caustic_risk ? 256 : subsurface_risk ? 128 : 2, settings.adaptive_min_samples)),
                   float(std::max(1, settings.adaptive_check_interval)),
                   float(settings.adaptive_rel_threshold), float(settings.adaptive_abs_threshold)};
     return c;
@@ -572,7 +689,8 @@ render_result resolve(const pixel* pixels, int w, int h, const renderer& setting
                       std::vector<float>* linear, std::atomic<bool>* cancel,
                       const std::function<void(const std::string&)>& status) {
     size_t n = size_t(w) * h;
-    std::vector<float> hdr(n * 3), albedo, normal;
+    std::vector<float> hdr(n * 3), albedo, normal, indirect;
+    if(settings.gpu_firefly_filter) indirect.resize(n*3);
     if (final && settings.use_denoiser && settings.denoiser_strength > 0) {
         albedo.resize(n * 3);
         normal.resize(n * 3);
@@ -582,6 +700,10 @@ render_result resolve(const pixel* pixels, int w, int h, const renderer& setting
         for (int c = 0; c < 3; ++c) {
             float value = pixels[p].sum[c] / count;
             hdr[p * 3 + c] = std::isfinite(value) ? std::max(0.f, value) : 0;
+            if(!indirect.empty()) {
+                float energy=pixels[p].indirect[c]/count;
+                indirect[p*3+c]=std::isfinite(energy)?std::max(0.f,energy):0;
+            }
             if (!albedo.empty()) {
                 albedo[p * 3 + c] = pixels[p].albedo[c] / count;
                 normal[p * 3 + c] = pixels[p].normal[c] / count;
@@ -591,6 +713,7 @@ render_result resolve(const pixel* pixels, int w, int h, const renderer& setting
     if (linear) {
         *linear = hdr; // numerical comparisons precede denoising/exposure
     }
+    if(!indirect.empty()) dusk_fireflies::reconstruct(hdr,indirect,w,h,1);
     if (!albedo.empty()) {
         if (status) {
             status("GPU tracing finished. Denoising final image...");
@@ -624,75 +747,108 @@ render_result resolve(const pixel* pixels, int w, int h, const renderer& setting
     return result;
 }
 struct uploaded_scene {
-    buffer storage;
-    std::array<VkDescriptorBufferInfo, 14> ranges;
+    std::array<buffer, 15> buffers{};
+    std::array<content_key, 15> keys{};
+    std::array<VkDescriptorBufferInfo, 15> ranges{};
 };
 
-uploaded_scene upload_scene(context& c, const snapshot& scene, const camera& cam, const renderer& settings) {
-    configuration config = configure(cam, settings, scene);
+void upload_scene(context& c, uploaded_scene& uploaded, const snapshot& scene, const camera& cam,
+                  const renderer& settings) {
+    const configuration config = configure(cam, settings, scene);
     std::vector<point_light> points;
     for (const auto& l : cam.point_lights) {
         points.push_back({pack(l.position, float(l.range)), pack(l.radiance)});
     }
-    struct upload_slice {
-        const void* data;
-        size_t offset, bytes;
-    };
-    std::vector<upload_slice> slices;
-    size_t upload_size = 0;
-    std::array<VkDescriptorBufferInfo, 14> ranges{};
-    size_t alignment = std::max<size_t>(16, c.properties.limits.minStorageBufferOffsetAlignment);
+    // A small uniform mixture preserves support for every light. The CDF is
+    // independent of the shading point and costs only a binary search per ray.
+    double total_power = 0;
+    for (const auto& light : points) total_power += std::max(0., .2126*light.radiance.x + .7152*light.radiance.y + .0722*light.radiance.z);
+    double cumulative = 0;
+    for (auto& light : points) {
+        const double power = std::max(0., .2126*light.radiance.x + .7152*light.radiance.y + .0722*light.radiance.z);
+        cumulative += total_power > 0 ? .95*power/total_power + .05/points.size() : 1./points.size();
+        light.radiance.w = float(cumulative);
+    }
+    if (!points.empty()) points.back().radiance.w = 1;
+    // Fall back to uniform sampling if float CDF precision cannot retain support.
+    for (size_t i = 1; i < points.size(); ++i) {
+        if (points[i].radiance.w <= points[i-1].radiance.w) {
+            for (size_t j = 0; j < points.size(); ++j) points[j].radiance.w = float(double(j+1)/points.size());
+            break;
+        }
+    }
+    struct slice { const void* data; size_t bytes, offset; int binding; };
+    std::vector<slice> changed;
+    size_t staging_bytes = 0;
     auto append = [&](int binding, const void* data, size_t bytes) {
         if (bytes > c.properties.limits.maxStorageBufferRange) {
             throw std::runtime_error("Scene buffer exceeds this GPU's storage-buffer limit.");
         }
-        size_t offset = (upload_size + alignment - 1) & ~(alignment - 1);
-        upload_size = offset + std::max<size_t>(16, bytes);
-        if (bytes) {
-            slices.push_back({data, offset, bytes});
+        const auto key = identify_content(data, bytes);
+        auto& target = uploaded.buffers[binding];
+        if (target.handle && uploaded.keys[binding] == key) return;
+        if (!target.handle || target.size != std::max<size_t>(16, bytes)) {
+            c.release(target);
+            target = c.allocate(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
         }
-        ranges[binding].offset = offset;
-        ranges[binding].range = std::max<size_t>(16, bytes);
+        uploaded.keys[binding] = key;
+        uploaded.ranges[binding] = {target.handle, 0, target.size};
+        changed.push_back({data, bytes, staging_bytes, binding});
+        staging_bytes += target.size;
     };
     append(1, scene.geometries.data(), scene.geometries.size() * sizeof(geometry));
     append(2, scene.vertices.data(), scene.vertices.size() * sizeof(vertex));
     append(3, scene.instances.data(), scene.instances.size() * sizeof(instance));
-    append(4, scene.material_map.data(), scene.material_map.size() * 4);
+    append(4, scene.material_map.data(), scene.material_map.size() * sizeof(uint32_t));
     append(5, scene.materials.data(), scene.materials.size() * sizeof(material_record));
     append(6, scene.instructions.data(), scene.instructions.size() * sizeof(instruction));
     append(7, scene.textures.data(), scene.textures.size() * sizeof(texture_record));
-    append(8, scene.texels.data(), scene.texels.size() * 4);
+    append(8, scene.texels.data(), scene.texels.size() * sizeof(uint32_t));
     append(10, &config, sizeof(config));
     append(11, points.data(), points.size() * sizeof(point_light));
     append(12, scene.lights.data(), scene.lights.size() * sizeof(area_light));
-    append(13, scene.slots.data(), scene.slots.size() * 4);
-    auto staging = c.allocate(upload_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    for (const auto& range : ranges) {
-        if (range.range && range.range <= 16) {
-            std::memset(static_cast<uint8_t*>(staging.mapped) + range.offset, 0, size_t(range.range));
-        }
+    append(13, scene.slots.data(), scene.slots.size() * sizeof(uint32_t));
+    if (changed.empty()) return;
+    const auto staging = c.allocate(staging_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    for (const auto& slice : changed) {
+        auto* destination = static_cast<uint8_t*>(staging.mapped) + slice.offset;
+        std::memset(destination, 0, size_t(uploaded.buffers[slice.binding].size));
+        if (slice.bytes) std::memcpy(destination, slice.data, slice.bytes);
     }
-    for (const auto& slice : slices) {
-        std::memcpy(static_cast<uint8_t*>(staging.mapped) + slice.offset, slice.data, slice.bytes);
-    }
-    auto storage =
-        c.allocate(upload_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
     c.submit([&](VkCommandBuffer cmd) {
-        VkBufferCopy copy{0, 0, storage.size};
-        c.vkCmdCopyBuffer(cmd, staging.handle, storage.handle, 1, &copy);
+        for (const auto& slice : changed) {
+            const auto& target = uploaded.buffers[slice.binding];
+            const VkBufferCopy copy{slice.offset, 0, target.size};
+            c.vkCmdCopyBuffer(cmd, staging.handle, target.handle, 1, &copy);
+        }
         c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     });
+    if (c.statistics) c.statistics->uploaded_bytes += staging_bytes;
     c.release(staging);
-    return {storage, ranges};
+}
+
+std::vector<uint8_t> instance_masks(const snapshot& scene) {
+    std::vector<uint8_t> masks(scene.instances.size(), 1);
+    for (size_t i = 0; i < scene.instances.size(); ++i) {
+        const size_t first = size_t(scene.instances[i].data.y);
+        const size_t end = i+1 < scene.instances.size() ? size_t(scene.instances[i+1].data.y) : scene.material_map.size();
+        for (size_t j = first; j < end; ++j) {
+            if (scene.materials[scene.material_map[j]].alpha.z == 0) {
+                masks[i] = 2;
+                break;
+            }
+        }
+    }
+    return masks;
 }
 
 VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const uploaded_scene& uploaded,
-                                       std::atomic<bool>* cancel) {
+                                       std::atomic<bool>* cancel,
+                                       std::vector<VkAccelerationStructureKHR>& blas, const std::vector<uint8_t>& masks) {
     auto cancelled = [&] { return cancel && cancel->load(); };
     VkAabbPositionsKHR sphereBounds{-1, -1, -1, 1, 1, 1};
     auto bounds = c.allocate(sizeof(sphereBounds),
@@ -700,8 +856,9 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                              true);
     std::memcpy(bounds.mapped, &sphereBounds, sizeof(sphereBounds));
-    std::vector<VkAccelerationStructureKHR> blas(scene.geometries.size());
-    for (size_t i = 0; i < scene.geometries.size(); ++i) {
+    const bool reuse_blas = blas.size() == scene.geometries.size();
+    blas.resize(scene.geometries.size());
+    for (size_t i = 0; !reuse_blas && i < scene.geometries.size(); ++i) {
         if (cancelled()) {
             return {};
         }
@@ -720,7 +877,7 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
             t.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             t.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
             t.vertexData.deviceAddress =
-                uploaded.storage.address + uploaded.ranges[2].offset + size_t(geom.x) * sizeof(vertex);
+                uploaded.buffers[2].address + size_t(geom.x) * sizeof(vertex);
             t.vertexStride = sizeof(vertex);
             t.maxVertex = std::max(0, geom.z * 3 - 1);
             t.indexType = VK_INDEX_TYPE_NONE_KHR;
@@ -736,7 +893,7 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
         auto& target = instances[i];
         std::memcpy(target.transform.matrix, source.rows, sizeof(target.transform.matrix));
         target.instanceCustomIndex = uint32_t(i);
-        target.mask = 255;
+        target.mask = masks[i];
         target.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         target.accelerationStructureReference = c.asAddress(blas[source.data.x]);
     }
@@ -758,23 +915,24 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
     return tlas;
 }
 
-VkDescriptorSet create_pipeline(context& c, buffer storage, buffer output,
-                                std::array<VkDescriptorBufferInfo, 14> ranges,
+VkDescriptorSet create_pipeline(context& c, buffer output, buffer display,
+                                std::array<VkDescriptorBufferInfo, 15> ranges,
                                 VkAccelerationStructureKHR tlas) {
-    std::array<VkDescriptorSetLayoutBinding, 14> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 15> bindings{};
     for (uint32_t i = 0; i < bindings.size(); ++i) {
         bindings[i] = {
             i, i == 0 ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
             VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        ranges[i].buffer = storage.handle;
     }
     ranges[9] = {output.handle, 0, output.size};
+    ranges[14] = {display.handle, 0, display.size};
+    if (!c.layout) {
     VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layout.bindingCount = uint32_t(bindings.size());
     layout.pBindings = bindings.data();
     check(c.vkCreateDescriptorSetLayout(c.device, &layout, nullptr, &c.layout), "Create descriptor layout");
     VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13}};
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = 1;
     pool.poolSizeCount = 2;
@@ -784,13 +942,14 @@ VkDescriptorSet create_pipeline(context& c, buffer storage, buffer output,
     alloc.descriptorPool = c.descriptors;
     alloc.descriptorSetCount = 1;
     alloc.pSetLayouts = &c.layout;
-    VkDescriptorSet descriptor{};
-    check(c.vkAllocateDescriptorSets(c.device, &alloc, &descriptor), "Allocate descriptors");
+    check(c.vkAllocateDescriptorSets(c.device, &alloc, &c.descriptor), "Allocate descriptors");
+    }
+    const auto descriptor = c.descriptor;
     VkWriteDescriptorSetAccelerationStructureKHR asWrite{
         VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     asWrite.accelerationStructureCount = 1;
     asWrite.pAccelerationStructures = &tlas;
-    std::array<VkWriteDescriptorSet, 14> writes{};
+    std::array<VkWriteDescriptorSet, 15> writes{};
     for (uint32_t i = 0; i < writes.size(); ++i) {
         auto& write = writes[i];
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -805,6 +964,10 @@ VkDescriptorSet create_pipeline(context& c, buffer storage, buffer output,
         }
     }
     c.vkUpdateDescriptorSets(c.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    if (c.pipeline) {
+        if (c.statistics) c.statistics->reused_pipeline = true;
+        return descriptor;
+    }
     VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
     VkPipelineLayoutCreateInfo pipelineLayout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pipelineLayout.setLayoutCount = 1;
@@ -852,7 +1015,35 @@ VkDescriptorSet create_pipeline(context& c, buffer storage, buffer output,
     return descriptor;
 }
 
+struct render_session {
+    context gpu;
+    std::string device_id;
+    bool validation = false;
+    uploaded_scene uploaded;
+    content_key geometry_key, vertex_key, instance_key, mask_key;
+    VkAccelerationStructureKHR tlas{};
+    std::vector<VkAccelerationStructureKHR> blas;
+    buffer output, readback, convergence, display, display_readback;
+};
+std::mutex session_mutex;
+std::unique_ptr<render_session> retained_session;
+
+// Resetting a session on any exception prevents partially uploaded data or a
+// lost device from being reused. The context drains submissions before freeing.
+struct session_guard {
+    bool committed = false;
+    ~session_guard() {
+        if (!committed) retained_session.reset();
+        else retained_session->gpu.statistics = nullptr;
+    }
+};
+
 } // namespace
+
+void clear_cache() {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    retained_session.reset();
+}
 
 render_device_list enumerate() {
     context c;
@@ -870,7 +1061,7 @@ render_device_list enumerate() {
 render_result render(snapshot scene, camera cam, const renderer& settings, const std::string& device_id,
                      std::atomic<bool>* cancel, render_progress_state* progress,
                      const std::function<void(const render_result&)>& callback, std::vector<float>* linear,
-                     const std::function<void(const std::string&)>& status) {
+                     const std::function<void(const std::string&)>& status, render_statistics* statistics) {
     auto cancelled = [&] { return cancel && cancel->load(); };
     if (cancelled()) {
         return {};
@@ -882,9 +1073,6 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
         cam.samples_per_pixel < 1 || cam.max_depth < 0 || cam.max_depth > 128) {
         throw std::runtime_error(
             "GPU render dimensions, samples, or depth exceed supported limits (8192 pixels, depth 128).");
-    }
-    if (cam.enable_mnee) {
-        throw std::runtime_error("Experimental caustics require the CPU backend.");
     }
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
@@ -898,10 +1086,22 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
             last_stage = now;
         }
     };
-    context c;
-    c.open();
-    timed("instance");
-    c.select(device_id);
+    std::unique_lock<std::mutex> lock(session_mutex);
+    session_guard retain;
+    const bool validation = std::getenv("DUSK_VK_VALIDATION") != nullptr;
+    if (statistics) *statistics = {};
+    if (!retained_session || retained_session->device_id != device_id || retained_session->validation != validation) {
+        retained_session = std::make_unique<render_session>();
+        auto& fresh = *retained_session;
+        fresh.device_id = device_id;
+        fresh.validation = validation;
+        fresh.gpu.open();
+        timed("instance");
+        fresh.gpu.select(device_id);
+    } else if (statistics) statistics->reused_device = true;
+    auto& session = *retained_session;
+    auto& c = session.gpu;
+    c.statistics = statistics;
     timed("device");
     if (cancelled()) {
         return {};
@@ -909,12 +1109,29 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
     if (status) {
         status("Preparing GPU scene...");
     }
-    auto uploaded = upload_scene(c, scene, cam, settings);
+    auto& uploaded = session.uploaded;
+    upload_scene(c, uploaded, scene, cam, settings);
     if (cancelled()) {
         return {};
     }
     timed("upload");
-    auto tlas = build_world(c, scene, uploaded, cancel);
+    const auto masks = instance_masks(scene);
+    const auto mask_key = identify_content(masks.data(), masks.size());
+    const bool rebuild_geometry = session.geometry_key != uploaded.keys[1] || session.vertex_key != uploaded.keys[2];
+    if (!session.tlas || rebuild_geometry || session.instance_key != uploaded.keys[3] || session.mask_key != mask_key) {
+        c.release_structure(session.tlas);
+        session.tlas = {};
+        if (rebuild_geometry) {
+            for (auto blas : session.blas) c.release_structure(blas);
+            session.blas.clear();
+        }
+        session.tlas = build_world(c, scene, uploaded, cancel, session.blas, masks);
+        session.geometry_key = uploaded.keys[1];
+        session.vertex_key = uploaded.keys[2];
+        session.instance_key = uploaded.keys[3];
+        session.mask_key = mask_key;
+    }
+    const auto tlas = session.tlas;
     timed("acceleration structures");
     if (cancelled()) {
         return {};
@@ -926,25 +1143,38 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
     if (pixelBytes + output_header_bytes > c.properties.limits.maxStorageBufferRange) {
         throw std::runtime_error("Render resolution exceeds this GPU's storage-buffer limit.");
     }
-    auto output = c.allocate(pixelBytes + output_header_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    auto readback = c.allocate(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
-    auto convergence = c.allocate(sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    auto resize_buffer = [&](buffer& target, VkDeviceSize size, VkBufferUsageFlags flags, bool host = false) {
+        if (target.handle && target.size == std::max<VkDeviceSize>(size, 16)) return;
+        c.release(target);
+        target = c.allocate(size, flags, host);
+    };
+    resize_buffer(session.output, pixelBytes + output_header_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    resize_buffer(session.readback, pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    resize_buffer(session.convergence, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    const VkDeviceSize display_bytes = VkDeviceSize(cam.image_width) * cam.image_height * sizeof(uint32_t);
+    resize_buffer(session.display, display_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    resize_buffer(session.display_readback, display_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    const auto output = session.output, readback = session.readback, convergence = session.convergence;
     c.submit([&](VkCommandBuffer cmd) {
         c.vkCmdFillBuffer(cmd, output.handle, 0, output.size, 0);
         c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     });
-    auto descriptor = create_pipeline(c, uploaded.storage, output, uploaded.ranges, tlas);
+    auto descriptor = create_pipeline(c, output, session.display, uploaded.ranges, tlas);
     timed("pipeline");
     if (status) {
         status("Tracing on GPU...");
     }
     constexpr int tile = 256;
-    // Limit each submission to four sample tiles for responsive cancellation.
+    // Keep at most three submissions in flight. GPU timestamps tune sample
+    // batches toward short dispatches without changing per-pixel RNG sequences.
     int batch_samples = 4;
+    c.completed_work = 0;
+    c.submission_ms = 0;
+    c.synchronous = std::getenv("DUSK_GPU_SYNCHRONOUS") != nullptr;
+    const bool fixed_batch = std::getenv("DUSK_GPU_BATCH_SAMPLES") != nullptr;
     if (const char* override_samples = std::getenv("DUSK_GPU_BATCH_SAMPLES")) {
         batch_samples = std::clamp(std::atoi(override_samples), 1, 4);
     }
@@ -959,10 +1189,45 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
         progress->total_scanlines = cam.image_height;
         progress->completed_scanlines = 0;
     }
+    double preview_interval = .75;
+    if (const char* interval = std::getenv("DUSK_GPU_PREVIEW_MS")) preview_interval = std::clamp(std::atof(interval), 1., 5000.) / 1000.;
     auto lastReadback = clock::now();
     int completed = 0;
     bool stop = false;
     auto read = [&](bool final) {
+        if (!final) {
+            c.submit([&](VkCommandBuffer cmd) {
+                c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                c.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
+                c.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipelineLayout, 0, 1, &descriptor, 0, nullptr);
+                uint32_t constants[4]{};
+                const float exposure = float(settings.exposure);
+                std::memcpy(&constants[0], &exposure, sizeof(exposure));
+                c.vkCmdPushConstants(cmd, c.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+                c.vkCmdDispatch(cmd, (cam.image_width + 7) / 8, (cam.image_height + 7) / 8, 1);
+                c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                const VkBufferCopy copy{0, 0, display_bytes};
+                c.vkCmdCopyBuffer(cmd, session.display.handle, session.display_readback.handle, 1, &copy);
+                c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+            });
+            if (statistics) statistics->preview_readback_bytes += display_bytes;
+            render_result image;
+            image.width = cam.image_width;
+            image.height = cam.image_height;
+            image.pixels.resize(size_t(cam.image_width) * cam.image_height * 3);
+            const auto* packed = static_cast<const uint32_t*>(session.display_readback.mapped);
+            for (size_t p = 0; p < image.pixels.size() / 3; ++p) {
+                image.pixels[p*3] = uint8_t(packed[p]);
+                image.pixels[p*3+1] = uint8_t(packed[p] >> 8);
+                image.pixels[p*3+2] = uint8_t(packed[p] >> 16);
+            }
+            return image;
+        }
+        if (statistics) statistics->final_readback_bytes += pixelBytes;
         c.submit([&](VkCommandBuffer cmd) {
             c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -987,7 +1252,7 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                uint32_t(cam.image_width * cam.image_height);
     };
     int next_convergence_check = std::max(16, settings.adaptive_min_samples);
-    for (int sample = 0; sample < cam.samples_per_pixel && !stop; sample += batch_samples) {
+    for (int sample = 0; sample < cam.samples_per_pixel && !stop;) {
         const int samples = std::min(batch_samples, cam.samples_per_pixel - sample);
         for (int y = 0; y < cam.image_height && !stop; y += tile) {
             for (int x = 0; x < cam.image_width; x += tile) {
@@ -995,7 +1260,7 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                     stop = true;
                     break;
                 }
-                c.submit([&](VkCommandBuffer cmd) {
+                c.enqueue(samples, [&](VkCommandBuffer cmd) {
                     c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1013,15 +1278,19 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                 auto now = clock::now();
                 double elapsed = std::chrono::duration<double>(now - start).count();
                 if (progress) {
-                    progress->completed_tiles = completed;
+                    progress->completed_tiles = int(c.completed_work);
                     progress->elapsed_seconds = elapsed;
                     progress->eta_seconds = elapsed / completed * (total - completed);
                 }
-                if (callback && std::chrono::duration<double>(now - lastReadback).count() >= .75) {
+                if (callback && std::chrono::duration<double>(now - lastReadback).count() >= preview_interval) {
                     callback(read(false));
                     lastReadback = clock::now();
                 }
             }
+        }
+        if (!fixed_batch && c.submission_ms > 0) {
+            if (c.submission_ms < 2) batch_samples = std::min(16, batch_samples * 2);
+            else if (c.submission_ms > 8) batch_samples = std::max(1, batch_samples / 2);
         }
         if (!stop && settings.adaptive_sampling && sample + samples >= next_convergence_check) {
             next_convergence_check = sample + samples + std::max(16, settings.adaptive_check_interval);
@@ -1032,15 +1301,25 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                 break;
             }
         }
+        sample += samples;
     }
+    c.drain();
+    if (progress) progress->completed_tiles = int(c.completed_work);
     if (progress && !stop) {
         progress->completed_tiles = int(total);
         progress->completed_scanlines = cam.image_height;
         progress->eta_seconds = 0;
     }
     timed("tracing");
+    // Publish the completed raw preview before final OIDN. Timer throttling can
+    // otherwise skip the last batch, leaving the viewport at an older sample count.
+    if(callback && !stop) {
+        callback(read(false));
+        stop=cancelled();
+    }
     auto result = read(!stop);
     timed("resolve");
+    retain.committed = true;
     return result;
 }
 } // namespace dusk_gpu

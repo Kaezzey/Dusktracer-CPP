@@ -5,42 +5,48 @@
 #include <cmath>
 #include <algorithm>
 
-// Local PI constant to avoid M_PI portability issues
-static constexpr double SSS_PI = 3.14159265358979323846;
-
-// Simple Burley diffusion profile helpers (lightweight approximation)
 namespace sss {
-
-// Evaluate a Burley-like diffusion profile Rd(r).
-// This is a pragmatic, lightweight approximation useful for initial
-// integration. 'albedo' is a luminance-like scalar in [0,1], 'radius'
-// controls the falloff (mean free path).
-inline double burley_Rd(double r, double albedo, double radius) {
-    if (r <= 0.0) r = 1e-6;
-    double invR = 1.0 / std::max(1e-6, radius);
-    // Simple normalized exponential radial profile scaled by albedo.
-    // Normalization chosen so integral over 2D plane ~= albedo.
-    double norm = albedo * invR * invR / (2.0 * SSS_PI);
-    return norm * std::exp(-r * invR);
+constexpr double profile_pi = 3.14159265358979323846;
+// Normalized Burley diffusion: integral 2*pi*r*Rd(r) dr = albedo.
+// d is a world-space diffusion distance, not a brightness multiplier.
+inline double burley_Rd(double r, double albedo, double d) {
+    d = std::max(1e-6, d); r = std::max(1e-12, r);
+    return std::clamp(albedo, 0.0, 1.0) *
+        (std::exp(-r/d) + std::exp(-r/(3*d))) / (8*profile_pi*d*r);
 }
-
-// Sample radial distance r from an exponential profile with scale 'radius'
-// using a uniform u in [0,1). Returns r >= 0.
-inline double sample_r_exponential(double radius, double u) {
-    u = std::clamp(u, 1e-9, 1.0 - 1e-9);
-    return -radius * std::log(1.0 - u);
+inline double burley_pdf_area(double r, double d) { return burley_Rd(r, 1, d); }
+inline double sample_burley_radius(double d, double u) {
+    d = std::max(1e-6, d); u = std::clamp(u, 0.0, 1.0-1e-12);
+    // Radial density is a 1/4 : 3/4 mixture of exponentials.
+    return u < .25 ? -d*std::log1p(-4*u) : -3*d*std::log1p(-(u-.25)/.75);
 }
-
-// Area PDF for a radial-exponential sampling scheme where r is drawn from
-// p_r(r) = (1/radius) * exp(-r/radius) and theta uniform in [0,2pi).
-// The PDF over area (per unit area) is p_area(r) = p_r(r) / (2*pi*r)
-inline double pdf_area_from_radius(double r, double radius) {
-    if (r <= 0.0) r = 1e-6;
-    double invR = 1.0 / std::max(1e-6, radius);
-    double pr = invR * std::exp(-r * invR);
-    return pr / (2.0 * SSS_PI * r);
+inline double burley_cdf(double r, double d) {
+    d = std::max(1e-6, d);
+    return 1-.25*std::exp(-r/d)-.75*std::exp(-r/(3*d));
 }
-
+// Exact dielectric entry transmission, normalized over the incident hemisphere.
+inline double entry_transmission(double cosine, double eta) {
+    cosine = std::clamp(cosine, 0.0, 1.0);
+    eta = std::clamp(eta, 1.0, 4.0);
+    if (eta == 1) return 1;
+    double transmitted = std::sqrt(1-(1-cosine*cosine)/(eta*eta));
+    double rp = (eta*cosine-transmitted)/(eta*cosine+transmitted);
+    double rs = (cosine-eta*transmitted)/(cosine+eta*transmitted);
+    return 1-.5*(rp*rp+rs*rs);
+}
+inline double entry_directional(double cosine, double eta) {
+    if (cosine <= 0) return 0;
+    eta = std::clamp(eta, 1.0, 4.0);
+    thread_local double cached_eta = -1, normalization = 1;
+    if (cached_eta != eta) {
+        normalization = 0;
+        for (int i = 0; i < 128; ++i) {
+            double mu = (i+.5)/128;
+            normalization += 2*mu*entry_transmission(mu, eta)/128;
+        }
+        cached_eta = eta;
+    }
+    return entry_transmission(cosine, eta)/(normalization*profile_pi);
+}
 } // namespace sss
-
-#endif // SSS_H
+#endif

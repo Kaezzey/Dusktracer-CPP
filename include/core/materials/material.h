@@ -7,6 +7,7 @@
 #include "pbr_bsdf.h"
 #include <cstdio>
 #include <limits>
+#include <vector>
 
 // ISPC specular helper (defined in src/core). Forward declaration to avoid
 // pulling source headers into this public include.
@@ -67,6 +68,7 @@ struct bsdf_sample {
     double pdf = 0;
     bool delta = false;
     bool passthrough = false;
+    bool subsurface = false;
 };
 
 class material {
@@ -121,6 +123,10 @@ class material {
     virtual colour shade_sss(const hit_record& /*rec*/, const vec3& /*V*/, const vec3& /*Ldir*/, const colour& /*Li*/, const hittable& /*world*/, double /*vis*/ = 1.0) const {
         return colour(0,0,0);
     }
+
+    virtual bool sample_subsurface(const hit_record&, const hittable&, double,
+                                  double, double, double, double, hit_record&, colour&) const { return false; }
+    virtual double subsurface_directional(double) const { return 0; }
 
     virtual double bsdf_pdf(const hit_record& rec, const vec3& /*V*/, const vec3& Ldir) const {
         double NdotL = std::max(0.0, dot(rec.normal, unit_vector(Ldir)));
@@ -356,8 +362,8 @@ enum SSSModel {
     SSS_SINGLE_SCATTER = 1,
     SSS_MULTI_SINGLE_SCATTER = 2,
     SSS_DIPOLE_BURLEY = 3,
-    SSS_SKIN = 4,      // Skin-like surface scattering / transmission
-    SSS_FOLIAGE = 5    // Thin transmission model for leaves and petals
+    SSS_SKIN = 4,      // Legacy alias for Burley diffusion
+    SSS_FOLIAGE = 5    // Legacy alias for Burley diffusion
 };
 
 class pbr_material : public material {
@@ -377,18 +383,16 @@ public:
     // Dielectric F0 when metallic = 0 (0.04 is common)
     colour  dielectric_F0;
 
-    // Simple thin-subsurface approximation parameters
-    // sss_strength: [0,1] how much light is transmitted/scattered through the thin material
-    // sss_scale: user-facing scale controlling amount of transmission (mean free path)
-    // The SSS tint now uses the material albedo (baseColor) so no explicit
-    // sss tint colour is required.
+    // Spatial diffusion replaces this fraction of the diffuse substrate.
+    // Old scale/sample fields are retained for project-file compatibility;
+    // radius controls distance and pixel samples control convergence.
     double sss_strength = 0.0;
     double sss_scale = 1.0;
     // Dipole/diffusion parameters
     SSSModel sss_model = SSS_SINGLE_SCATTER;
-    int      sss_samples = 4;        // number of exit-point samples for dipole
+    int      sss_samples = 4;        // legacy project field
     double   sss_radius  = 1.0;      // mean free path / diffusion radius
-    double   sss_eta     = 1.3;      // relative index (not yet used)
+    double   sss_eta     = 1.3;      // entry interface IOR
     bool     sss_color_override = false;
     colour   sss_color_override_col = colour(1.0, 1.0, 1.0);
     // If true, sample combined textures using Unreal-style channel packing
@@ -532,7 +536,7 @@ public:
     struct surface {
         colour base, f0;
         vec3 n, geometry;
-        double metallic, alpha, specular_probability;
+        double metallic, alpha, specular_probability, subsurface_fraction;
         bool smooth;
     };
     surface prepare_surface(const hit_record& rec) const {
@@ -542,6 +546,7 @@ public:
         s.f0 = (1-s.metallic)*pbr::reflectance(dielectric_F0)+s.metallic*s.base;
         s.alpha = perceptual_to_alpha(rough); s.smooth = s.alpha < 1e-4;
         s.specular_probability = specular_sampling_probability(s.f0,s.metallic);
+        s.subsurface_fraction = sss_model == SSS_NONE ? 0 : clamp01(sss_strength);
         s.geometry = safe_unit_vector(rec.geometry_normal());
         s.n = safe_unit_vector(rec.normal,s.geometry);
         if (normal_tex) {
@@ -563,7 +568,7 @@ public:
         // dielectric interface. Do not add a full Lambert lobe on top of GGX.
         colour transmission_v = colour(1,1,1)-schlick_fresnel(nv,s.f0);
         colour transmission_l = colour(1,1,1)-schlick_fresnel(nl,s.f0);
-        colour f = s.base*((1-s.metallic)/pi)*transmission_v*transmission_l;
+        colour f = s.base*((1-s.metallic)*(1-s.subsurface_fraction)/pi)*transmission_v*transmission_l;
         if (!s.smooth) {
             vec3 h = safe_unit_vector(v+l,s.n);
             double d = pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha);
@@ -574,7 +579,7 @@ public:
     static double surface_pdf(const surface& s, const vec3& v, const vec3& l) {
         if (!above_surface(s,v,l)) return 0;
         double nv = dot(s.n,v), nl = dot(s.n,l);
-        double pdf = (1-s.specular_probability)*nl/pi;
+        double pdf = (1-s.specular_probability)*(1-s.subsurface_fraction)*nl/pi;
         if (!s.smooth) {
             vec3 h = safe_unit_vector(v+l,s.n);
             pdf += s.specular_probability*pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha)
@@ -590,6 +595,13 @@ public:
         surface s = prepare_surface(rec);
         vec3 view = safe_unit_vector(-incoming.direction());
         if (dot(s.geometry,view) <= 0 || dot(s.n,view) <= 0) return false;
+        double subsurface_probability = (1-s.specular_probability)*s.subsurface_fraction;
+        if (subsurface_probability > 0 && lobe >= 1-subsurface_probability) {
+            sample.subsurface = true;
+            sample.weight = (colour(1,1,1)-schlick_fresnel(dot(view,s.n),s.f0)) *
+                ((1-s.metallic)*s.subsurface_fraction/subsurface_probability);
+            return true;
+        }
         pbr::frame frame(s.n);
         vec3 direction;
         if (lobe < s.specular_probability) {
@@ -625,7 +637,7 @@ public:
     }
     bool scatter(const ray& incoming, const hit_record& rec, colour& attenuation, ray& scattered) const override {
         bsdf_sample sample;
-        if (!sample_bsdf(incoming,rec,sample)) return false;
+        if (!sample_bsdf(incoming,rec,sample) || sample.subsurface) return false;
         attenuation = sample.weight; scattered = sample.scattered; return true;
     }
     colour shade_direct(const hit_record& rec, const vec3& view, const vec3& light, const colour& radiance,
@@ -639,131 +651,66 @@ public:
         return surface_pdf(prepare_surface(rec),safe_unit_vector(view),safe_unit_vector(light));
     }
 
-    // pbr_material: SSS-only shading hook (called by renderer after BRDF)
-    colour shade_sss(const hit_record& rec, const vec3& V, const vec3& Ldir, const colour& Li, const hittable& world, double vis = 1.0) const override {
-        if (sss_strength <= 0.0 || sss_model == SSS_NONE) return colour(0,0,0);
-
-        double alpha_sss = 1.0;
-        if (alpha_tex) alpha_sss = alpha_tex->mask_alpha_at(rec.u, rec.v, rec.p);
-        else if (base_tex) alpha_sss = base_tex->alpha_at(rec.u, rec.v, rec.p);
-        if ((alpha_double_sided || rec.front_face) && (alpha_sss <= 0.0 || alpha_sss < alpha_cutoff)) {
-            return colour(0,0,0);
-        }
-
-        vec3 L = unit_vector(Ldir);
-        vec3 Vn = unit_vector(V);
-        double NdotL_geom = dot(rec.normal, L);
-        double NdotV_geom = std::max(0.0, dot(rec.normal, Vn));
-        colour sss_tint = sss_color_override ? sss_color_override_col : albedo(rec);
-
-        colour baseColor_dummy(1,1,1);
-        double metallic = 0.0;
-        double rough_dummy = 0.5;
-        sample_surface_params(rec, baseColor_dummy, metallic, rough_dummy);
-
-        double strength = sss_strength * (1.0 - metallic);
-        strength *= vis; // Opacity is sampled once by the integrator.
-        if (strength <= 0.0) return colour(0,0,0);
-
-        auto transmission_tint = [&](double optical_depth, const colour& channel_bias) {
-            optical_depth = std::max(0.0, optical_depth);
-            return colour(
-                std::pow(std::clamp(sss_tint.x(), 0.02, 0.999), optical_depth * channel_bias.x()),
-                std::pow(std::clamp(sss_tint.y(), 0.02, 0.999), optical_depth * channel_bias.y()),
-                std::pow(std::clamp(sss_tint.z(), 0.02, 0.999), optical_depth * channel_bias.z())
-            );
-        };
-
-        auto estimate_thickness = [&](double fallback, double& thickness_ws) {
-            thickness_ws = fallback;
-            vec3 inside_dir = -L;
-            ray into_ray(rec.p + inside_dir * 0.001, inside_dir, 0.0);
-            hit_record exit_rec;
-            double max_distance = std::max(0.05, sss_radius * 6.0);
-            if (!world.hit(into_ray, interval(0.001, max_distance), exit_rec)) return false;
-            thickness_ws = std::max(0.0, (exit_rec.p - rec.p).length());
-            return thickness_ws > 1e-6;
-        };
-
-        if (sss_model == SSS_FOLIAGE) {
-            double thickness_ws = std::max(0.05, sss_radius);
-            estimate_thickness(thickness_ws, thickness_ws);
-            double optical_depth = thickness_ws / std::max(0.05, sss_scale);
-            colour trans_color = transmission_tint(optical_depth, colour(0.75, 1.0, 1.25));
-
-            double lambert = clamp01(NdotL_geom);
-            double wrapped = std::clamp((NdotL_geom + 0.35) / 1.35, 0.0, 1.0);
-            double wrap_gain = std::max(0.0, wrapped - lambert);
-            double view_through = clamp01(dot(-Vn, L));
-            double back_scatter = clamp01(-NdotL_geom) * (0.35 + 0.65 * view_through);
-            double scatter_term = wrap_gain * 0.35 + back_scatter;
-            return trans_color * Li * (float)(strength * scatter_term);
-        }
-
-        if (sss_model == SSS_SKIN) {
-            double thickness_ws = std::max(0.05, sss_radius);
-            estimate_thickness(thickness_ws, thickness_ws);
-            double optical_depth = thickness_ws / std::max(0.05, sss_scale);
-            colour back_color = transmission_tint(optical_depth, colour(0.45, 1.0, 2.0));
-
-            double lambert = clamp01(NdotL_geom);
-            double wrapped = std::clamp((NdotL_geom + 0.45) / 1.45, 0.0, 1.0);
-            double forward_scatter = std::max(0.0, wrapped - lambert);
-            double back_scatter = clamp01(-NdotL_geom) * NdotV_geom;
-            colour scatter_color =
-                sss_tint * (float)(forward_scatter * 0.75) +
-                back_color * (float)(back_scatter * 0.5);
-            return scatter_color * Li * (float)strength;
-        }
-
-        if (sss_model == SSS_DIPOLE_BURLEY) {
-            double NdotL = clamp01(NdotL_geom);
-            if (NdotL <= 0.0) return colour(0,0,0);
-
-            colour sss_acc(0,0,0);
-            int ns = std::max(1, sss_samples);
-            vec3 T = rec.tangent;
-            vec3 B = rec.bitangent;
-            for (int si = 0; si < ns; ++si) {
-                double u1 = random_double();
-                double u2 = random_double();
-                double r = sss::sample_r_exponential(sss_radius, u1);
-                double theta = 2.0 * pi * u2;
-                double dx = r * std::cos(theta);
-                double dy = r * std::sin(theta);
-
-                point3 exit_probe = rec.p + T * (float)dx + B * (float)dy;
-                point3 ray_origin = exit_probe + rec.normal * (float)(sss_radius * 0.5);
-                ray probe_ray(ray_origin, -rec.normal, 0.0);
-                hit_record exit_rec;
-                if (!world.hit(probe_ray, interval(0.001, sss_radius * 2.0), exit_rec)) continue;
-
-                double scatter_dist = (exit_rec.p - rec.p).length();
-                double trans = std::exp(-scatter_dist / std::max(1e-6, sss_radius));
-                double Rd = sss::burley_Rd(r, std::max(0.1, luminance(sss_tint)), sss_radius);
-                double pdf_area = sss::pdf_area_from_radius(r, sss_radius);
-                if (pdf_area <= 1e-9) continue;
-
-                double NdotV_exit = std::max(0.0, dot(exit_rec.normal, Vn));
-                if (NdotV_exit <= 0.0) continue;
-
-                colour contrib = sss_tint * (float)(strength * trans * Rd / pdf_area)
-                                 * Li * (float)NdotL * (float)NdotV_exit;
-                sss_acc += contrib;
+    // Spatial BSSRDF transport replaces part of the diffuse substrate. Legacy
+    // nonzero model IDs map to normalized Burley diffusion.
+    double subsurface_distance() const { return std::max(1e-6, sss_radius); }
+    double subsurface_directional(double cosine) const override {
+        return sss::entry_directional(cosine, sss_eta);
+    }
+    bool sample_subsurface(const hit_record& out, const hittable& world, double time,
+                           double axis_u, double radius_u, double phi_u, double pick_u,
+                           hit_record& entry, colour& weight) const override {
+        if (!out.object || sss_strength <= 0 || sss_model == SSS_NONE) return false;
+        double d = subsurface_distance(), extent = 30*d;
+        pbr::frame frame(safe_unit_vector(out.geometry_normal()));
+        vec3 axes[3] = {frame.t, frame.b, frame.n};
+        const double probabilities[3] = {.25, .25, .5};
+        int axis = axis_u < .5 ? 2 : axis_u < .75 ? 0 : 1;
+        double r = sss::sample_burley_radius(d, radius_u);
+        if (r >= extent) return false; // Tiny tail is absorption, never renormalized.
+        double phi = 2*pi*phi_u;
+        point3 center = out.p + r*(std::cos(phi)*axes[(axis+1)%3] + std::sin(phi)*axes[(axis+2)%3]);
+        auto intersections = [&](int a, const point3& c, std::vector<hit_record>* hits) {
+            vec3 delta = c-out.p;
+            double projected2 = delta.length_squared()-std::pow(dot(delta,axes[a]),2);
+            if (projected2 >= extent*extent) return 0;
+            double half = std::sqrt(std::max(0.0,extent*extent-projected2));
+            ray probe(c-half*axes[a], axes[a], time);
+            double minimum = 1e-6;
+            int found = 0;
+            hit_record hit;
+            for (int step = 0; step < 256 && world.hit(probe,interval(minimum,2*half),hit); ++step) {
+                minimum = hit.t+1e-6;
+                if (hit.object != out.object || hit.mat.get() != this) continue;
+                vec3 outward = hit.front_face ? hit.geometry_normal() : -hit.geometry_normal();
+                if (!hit.front_face) hit.normal = -hit.normal;
+                hit.geometric_normal = outward;
+                hit.front_face = true;
+                if (opacity_at(hit) <= 0) continue;
+                ++found;
+                if (hits) hits->push_back(hit);
             }
-            return sss_acc * (float)(1.0 / std::max(1, sss_samples));
+            return found;
+        };
+        std::vector<hit_record> candidates;
+        int found = intersections(axis,center,&candidates);
+        if (!found) return false;
+        entry = candidates[std::min(found-1,int(std::clamp(pick_u,0.0,1.0)*found))];
+        vec3 delta = entry.p-out.p;
+        double pdf = 0;
+        // Include intersection selection for every projection axis; ignoring it
+        // biases thin and curved objects.
+        for (int a = 0; a < 3; ++a) {
+            point3 projected = entry.p-dot(delta,axes[a])*axes[a];
+            int n = a == axis ? found : intersections(a,projected,nullptr);
+            double projected_r = (projected-out.p).length();
+            if (n) pdf += probabilities[a]*sss::burley_pdf_area(projected_r,d)*
+                std::abs(dot(entry.geometry_normal(),axes[a]))/n;
         }
-
-        double thickness_ws = std::max(0.05, sss_radius);
-        estimate_thickness(thickness_ws, thickness_ws);
-        double optical_depth = thickness_ws / std::max(0.05, sss_scale);
-        colour trans_color = transmission_tint(optical_depth, colour(0.65, 1.0, 1.4));
-        double wrapped = std::clamp((NdotL_geom + 0.3) / 1.3, 0.0, 1.0);
-        double back_scatter = clamp01(-NdotL_geom);
-        double scatter_term = (sss_model == SSS_MULTI_SINGLE_SCATTER)
-            ? (wrapped * 0.55 + back_scatter * 0.85)
-            : (wrapped * 0.35 + back_scatter * 0.75);
-        return trans_color * Li * (float)(strength * scatter_term);
+        if (pdf <= 0 || !std::isfinite(pdf)) return false;
+        colour tint = pbr::reflectance(sss_color_override ? sss_color_override_col : albedo(out));
+        weight = tint*(sss::burley_Rd(delta.length(),1,d)*opacity_at(entry)/pdf);
+        return true;
     }
 
     bool is_masked_transparent(const hit_record& rec) const override {

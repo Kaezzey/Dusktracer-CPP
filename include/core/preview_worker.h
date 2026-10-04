@@ -42,6 +42,12 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<result> results; results.swap(completed_); ready_.notify_one(); return results;
     }
+    // Project switches can discard queued snapshots without waiting for the
+    // active job. Its eventual result still carries the old caller revision.
+    void discard_pending() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.clear(); completed_.clear(); ready_.notify_one();
+    }
     void stop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);

@@ -221,20 +221,17 @@ inline std::shared_ptr<cached_mesh_data> build_cached_mesh_data(
                 p1 = (p1 - pivot) * scale;
                 p2 = (p2 - pivot) * scale;
 
-                // normals
-                vec3 n0(mesh->mNormals[i0].x, mesh->mNormals[i0].y, mesh->mNormals[i0].z);
-                vec3 n1(mesh->mNormals[i1].x, mesh->mNormals[i1].y, mesh->mNormals[i1].z);
-                vec3 n2(mesh->mNormals[i2].x, mesh->mNormals[i2].y, mesh->mNormals[i2].z);
-
-                if (z_up) {
-                    n0 = rotate_Zup_to_Yup(n0);
-                    n1 = rotate_Zup_to_Yup(n1);
-                    n2 = rotate_Zup_to_Yup(n2);
-                }
-
-                n0 = unit_vector(n0);
-                n1 = unit_vector(n1);
-                n2 = unit_vector(n2);
+                // Assimp cannot generate tangent frames for meshes without UVs.
+                // Missing or degenerate normals also need a finite fallback.
+                const vec3 face_normal = safe_unit_vector(cross(p1 - p0, p2 - p0));
+                auto direction = [&](const aiVector3D* values, int index) {
+                    if (!values) return vec3(0, 0, 0);
+                    vec3 value(values[index].x, values[index].y, values[index].z);
+                    return z_up ? rotate_Zup_to_Yup(value) : value;
+                };
+                const vec3 n0 = safe_unit_vector(direction(mesh->mNormals, i0), face_normal);
+                const vec3 n1 = safe_unit_vector(direction(mesh->mNormals, i1), face_normal);
+                const vec3 n2 = safe_unit_vector(direction(mesh->mNormals, i2), face_normal);
 
                 // UVs
                 double u0 = 0.0, v0u = 0.0;
@@ -252,32 +249,16 @@ inline std::shared_ptr<cached_mesh_data> build_cached_mesh_data(
                     v2u = mesh->mTextureCoords[0][i2].y;
                 }
 
-                // tangents/bitangents
-                vec3 t0(mesh->mTangents[i0].x,   mesh->mTangents[i0].y,   mesh->mTangents[i0].z);
-                vec3 t1(mesh->mTangents[i1].x,   mesh->mTangents[i1].y,   mesh->mTangents[i1].z);
-                vec3 t2(mesh->mTangents[i2].x,   mesh->mTangents[i2].y,   mesh->mTangents[i2].z);
-
-                vec3 b0(mesh->mBitangents[i0].x, mesh->mBitangents[i0].y, mesh->mBitangents[i0].z);
-                vec3 b1(mesh->mBitangents[i1].x, mesh->mBitangents[i1].y, mesh->mBitangents[i1].z);
-                vec3 b2(mesh->mBitangents[i2].x, mesh->mBitangents[i2].y, mesh->mBitangents[i2].z);
-
-                if (z_up) {
-                    t0 = rotate_Zup_to_Yup(t0);
-                    t1 = rotate_Zup_to_Yup(t1);
-                    t2 = rotate_Zup_to_Yup(t2);
-
-                    b0 = rotate_Zup_to_Yup(b0);
-                    b1 = rotate_Zup_to_Yup(b1);
-                    b2 = rotate_Zup_to_Yup(b2);
-                }
-
-                t0 = unit_vector(t0);
-                t1 = unit_vector(t1);
-                t2 = unit_vector(t2);
-
-                b0 = unit_vector(b0);
-                b1 = unit_vector(b1);
-                b2 = unit_vector(b2);
+                auto tangent_frame = [&](int index, const vec3& normal) {
+                    hit_record frame;
+                    frame.normal = normal;
+                    frame.set_tangent_frame(direction(mesh->mTangents, index),
+                                            direction(mesh->mBitangents, index));
+                    return frame;
+                };
+                const auto frame0 = tangent_frame(i0, n0);
+                const auto frame1 = tangent_frame(i1, n1);
+                const auto frame2 = tangent_frame(i2, n2);
 
                 cached_triangle_geom tri;
                 tri.p0 = point3(p0.x(), p0.y(), p0.z());
@@ -288,13 +269,13 @@ inline std::shared_ptr<cached_mesh_data> build_cached_mesh_data(
                 tri.n1 = n1;
                 tri.n2 = n2;
 
-                tri.t0 = t0;
-                tri.t1 = t1;
-                tri.t2 = t2;
+                tri.t0 = frame0.tangent;
+                tri.t1 = frame1.tangent;
+                tri.t2 = frame2.tangent;
 
-                tri.b0 = b0;
-                tri.b1 = b1;
-                tri.b2 = b2;
+                tri.b0 = frame0.bitangent;
+                tri.b1 = frame1.bitangent;
+                tri.b2 = frame2.bitangent;
 
                 tri.u0 = u0;   tri.v0 = v0u;
                 tri.u1 = u1;   tri.v1 = v1u;

@@ -208,6 +208,7 @@ public:
 
         rec.set_tangent_frame(interpT,interpB);
         rec.mat       = mat;
+        rec.object = this;
 
         return true;
     }
@@ -299,7 +300,9 @@ public:
 
     bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
         if (!accel) return false;
-        return accel->hit(r, ray_t, rec);
+        if (!accel->hit(r, ray_t, rec)) return false;
+        rec.object = this;
+        return true;
     }
 
     aabb bounding_box() const override {

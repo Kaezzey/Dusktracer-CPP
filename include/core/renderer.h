@@ -41,6 +41,9 @@ public:
     double denoiser_strength = 1.0;
     // Progressive denoising: apply OIDN to partial results during render (like Cycles)
     bool progressive_denoise = false;
+    // GPU display reconstruction removes isolated indirect outliers while
+    // retaining the raw HDR estimator and camera-visible light/specular energy.
+    bool gpu_firefly_filter = true;
 
     // Photon mapping removed: no-op (was used for caustic photon pre-pass)
 

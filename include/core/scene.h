@@ -56,16 +56,14 @@ struct scene_material_parameters {
     double fuzz             = 0.0;                    // metal fuzz
     double ior              = 1.5;                    // dielectric IOR
     vec3   emission         = vec3(0, 0, 0);          // diffuse_light color
-    // Sub-surface scattering (thin/translucent approximation)
-    // - sss_strength: [0..1] amount of subsurface transmission
-    // - sss_scale: mean free path / scattering scale (larger -> more transmission)
-    // Note: the SSS tint uses the material albedo (base_color).
+    // Spatial Burley diffusion, shared by CPU and GPU.
+    // sss_strength replaces part of the diffuse substrate; sss_radius is a
+    // world-space diffusion distance. Tint defaults to the evaluated albedo.
     bool   use_sss      = false;                      // Enable subsurface scattering
     double sss_strength = 0.0;
     double sss_scale    = 1.0;
-    // Extended dipole/diffusion parameters (editor-facing). sss_model maps
-    // directly to runtime SSSModel values.
-    int    sss_model    = 1;    // 0=none,1=single,2=multi-single,3=dipole,4=skin,5=foliage
+    // Legacy nonzero model IDs all select normalized Burley diffusion.
+    int    sss_model    = 1;    // 0=None, nonzero=Burley
     int    sss_samples  = 4;
     double sss_radius   = 1.0;
     double sss_eta      = 1.3;
@@ -170,8 +168,8 @@ struct scene_light {
     // Directional light: direction *from light toward scene*, normalized
     vec3   direction = vec3(-1, -1, -1);
 
-    // Directional light angular radius (degrees). 0 = delta directional
-    double angular_radius_deg = 0.0;
+    // Sun angular radius (degrees). Legacy zero uses a 0.266-degree disc
+    double angular_radius_deg = 0.266;
 
     // Point light: world position + simple range
     point3 position  = point3(0, 5, 0);

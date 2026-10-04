@@ -101,6 +101,8 @@ static render_selection    g_render_selection;
 static editor_camera_state g_editor_cam;
 static std::atomic<bool>   g_cancel_flag{false};
 static bool                g_scene_initialized = false;
+// Legacy manifests are read for migration; project sessions save complete documents.
+static bool g_project_session_active = false;
 static ImFont*             g_ui_font_body = nullptr;
 static ImFont*             g_ui_font_heading = nullptr;
 
@@ -316,6 +318,7 @@ static void LoadAssetsManifest();
 
 static void SaveMeshMaterialDefaults()
 {
+    if (g_project_session_active) return;
     std::ofstream out(kMeshMatDefaultsFile);
     if (!out) return;
     for (const auto& mesh : g_scene.meshes) {
@@ -402,6 +405,7 @@ static bool        g_render_in_progress = false;
 static std::atomic<bool> g_render_has_result{false};
 static render_result g_render_result;
 static std::string g_render_diagnostic;
+static std::string g_render_output_path;
 static std::atomic<bool> g_render_final_image_ready{false};
 
 // Progress window (separate OS window) to show progressive render
@@ -608,20 +612,6 @@ static GLuint GetOrCreateModelThumbnail(int mesh_index)
     return t;
 }
 
-// Gizmo (lines) shader + buffers
-static GLuint g_lineShader     = 0;
-static GLuint g_gizmoVAO       = 0;
-static GLuint g_gizmoVBO       = 0;
-static GLuint g_gizmoConeVAO   = 0;
-static GLuint g_gizmoConeVBO   = 0;
-static int    g_gizmoConeVertexCount = 0;
-// Legacy gizmo buffers (directional gizmo removed)
-// CPU-side copy of cone triangle positions for precise hit-testing
-static std::vector<vec3> g_gizmoConeTriangles;
-static int g_gizmoConeSegments = 16;
-static double g_gizmoConeLen = 0.18;
-static double g_gizmoBaseRad = 0.06;
-
 // Snapshot for object transform to support undo/redo
 struct ObjSnapshot {
     point3 center;
@@ -634,10 +624,6 @@ struct ObjSnapshot {
 static std::unordered_map<int, ObjSnapshot> g_obj_snapshot_before;
 
 static bool   g_show_gizmo     = false;
-static int    g_active_gizmo_axis = -1; // -1 = none, 0=X,1=Y,2=Z
-static vec3   g_gizmo_hit_point;       // world-space closest point on axis at mouse down
-static vec3   g_gizmo_initial_obj_translation;
-
 // 0 = Ray Traced, 1 = Rasterised
 static int g_viewport_mode = 1;
 
@@ -653,30 +639,6 @@ static void glfw_error_callback(int error, const char* description)
 static inline double dot3(const vec3& a, const vec3& b)
 {
     return a.x()*b.x() + a.y()*b.y() + a.z()*b.z();
-}
-
-// Ray-triangle intersection (Möller–Trumbore). Returns true and sets outT to ray parameter if hit.
-static bool RayIntersectsTriangle(const ray& r, const vec3& v0, const vec3& v1, const vec3& v2, double& outT)
-{
-    const double EPS = 1e-8;
-    vec3 edge1 = v1 - v0;
-    vec3 edge2 = v2 - v0;
-    vec3 h = cross(r.direction(), edge2);
-    double a = dot(edge1, h);
-    if (std::fabs(a) < EPS) return false; // parallel
-    double f = 1.0 / a;
-    vec3 s = r.origin() - v0;
-    double u = f * dot(s, h);
-    if (u < 0.0 || u > 1.0) return false;
-    vec3 q = cross(s, edge1);
-    double v = f * dot(r.direction(), q);
-    if (v < 0.0 || u + v > 1.0) return false;
-    double t = f * dot(edge2, q);
-    if (t > EPS) {
-        outT = t;
-        return true;
-    }
-    return false;
 }
 
 // Case-insensitive extension check
@@ -737,7 +699,7 @@ static void export_scene_as_cpp(const scene& scn, const std::string& path)
         std::fprintf(stderr, "Warning: failed to create parent directory for %s\n", path.c_str());
     }
 
-    std::ofstream out(path);
+    std::ofstream out(std::filesystem::u8path(path));
     if (!out.is_open()) {
         std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
         return;
@@ -1331,31 +1293,6 @@ static void BuildPickShader()
     g_pickShader = CompileShader(vs, fs);
 }
 
-// Line shader (vertex color) for gizmo axes
-static void BuildLineShader()
-{
-    const char* vs = R"(#version 130
-        in vec3 aPos;
-        in vec3 aColor;
-        out vec3 vColor;
-        uniform mat4 uModel;
-        uniform mat4 uView;
-        uniform mat4 uProj;
-        void main() {
-            vColor = aColor;
-            gl_Position = uProj * uView * uModel * vec4(aPos, 1.0);
-        }
-    )";
-
-    const char* fs = R"(#version 130
-        in vec3 vColor;
-        out vec4 FragColor;
-        void main() { FragColor = vec4(vColor, 1.0); }
-    )";
-
-    g_lineShader = CompileShader(vs, fs);
-}
-
 static void make_lookat(const vec3& eye, const vec3& center, const vec3& up, float out[16])
 {
     vec3 f = unit_vector(center - eye);
@@ -1572,6 +1509,7 @@ static bool try_load_assimp_mesh(const std::string& full_path,
 // Persist imported textures and meshes between launches.
 static void SaveAssetsManifest()
 {
+    if (g_project_session_active) return;
     std::ofstream out(kAssetsManifestFile);
     if (!out) return;
     // Textures
@@ -1641,6 +1579,7 @@ static void LoadAssetsManifest()
 // Persist editor materials between launches.
 static void SaveMaterialsManifest()
 {
+    if (g_project_session_active) return;
     const char* fname = "materials.txt";
     std::ofstream out(fname);
     if (!out) return;
@@ -1661,7 +1600,7 @@ static void SaveMaterialsManifest()
     }
 }
 
-// Batch persistence after editing settles; shutdown still flushes pending edits.
+// Compatibility debounce for legacy manifest tools; project sessions use explicit Save.
 static void TickMaterialPersistence() {
     if (g_materials_dirty && !ImGui::IsAnyItemActive()
         && std::chrono::steady_clock::now()-g_materials_last_edit >= std::chrono::milliseconds(350)) {
@@ -1785,6 +1724,7 @@ static void EnsureRasterFBO(int width, int height)
 }
 
 #include "editor_raster.inl"
+#include "editor_material_sphere.inl"
 
 // Render rasterised scene into g_rasterColorTex
 static void RenderRasterToTexture(int width, int height) {
@@ -1818,59 +1758,6 @@ static void RenderRasterToTexture(int width, int height) {
     make_perspective(g_editor_cam.vfov, (float)width / (float)height, 0.01f, 500.0f, proj);
 
     RenderRasterScene(view, proj, pos, width, height);
-
-    // Draw gizmo (render into raster FBO so it appears in the preview)
-    if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size() &&
-        g_lineShader != 0) {
-        const auto& obj = g_scene.objects[g_selected_object];
-        float model[16];
-        vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-        // Build gizmo model without object rotation so axes remain world-aligned
-        vec3 rot = vec3(0, 0, 0);
-        // gizmo scale based on object's radius (mesh/cube) for reasonable size
-        float gizmo_scale = 0.5f * (float)std::max(0.5, obj.radius);
-        vec3 scl = vec3(gizmo_scale, gizmo_scale, gizmo_scale);
-        make_model_trs(trans, rot, scl, model);
-
-        // Save depth state
-        GLboolean wasDepthTest = glIsEnabled(GL_DEPTH_TEST);
-        GLint prevDepthFunc = 0;
-        glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
-        // Draw on top of scene
-        glDisable(GL_DEPTH_TEST);
-
-        glUseProgram(g_lineShader);
-        GLint locModelL = glGetUniformLocation(g_lineShader, "uModel");
-        GLint locViewL = glGetUniformLocation(g_lineShader, "uView");
-        GLint locProjL = glGetUniformLocation(g_lineShader, "uProj");
-        glUniformMatrix4fv(locViewL, 1, GL_FALSE, view);
-        glUniformMatrix4fv(locProjL, 1, GL_FALSE, proj);
-        glUniformMatrix4fv(locModelL, 1, GL_FALSE, model);
-
-        // draw axis lines (slightly thicker)
-        glLineWidth(2.0f);
-        glBindVertexArray(g_gizmoVAO);
-        glDrawArrays(GL_LINES, 0, 6);
-        glBindVertexArray(0);
-        glLineWidth(1.0f);
-
-        // draw cone arrowheads (triangles) using same shader (vertex color baked)
-        glBindVertexArray(g_gizmoConeVAO);
-        if (g_gizmoConeVertexCount > 0) {
-            glDrawArrays(GL_TRIANGLES, 0, g_gizmoConeVertexCount);
-        }
-        glBindVertexArray(0);
-
-        glUseProgram(0);
-
-        // Restore depth state
-        if (wasDepthTest) {
-            glEnable(GL_DEPTH_TEST);
-        } else {
-            glDisable(GL_DEPTH_TEST);
-        }
-        glDepthFunc(prevDepthFunc);
-    }
 
     glBindVertexArray(0);
     glUseProgram(0);
@@ -2011,65 +1898,23 @@ static int PerformPick(int width, int height, int click_x, int click_y)
     return picked_id - 1;
 }
 
-// Convert screen (texture-local) coords to a world-space ray using editor camera
-static ray ScreenPointToRay(const editor_camera_state& cam, int tex_w, int tex_h, float sx, float sy)
-{
-    // sx,sy are in texture-local pixels (origin top-left)
-    const double PI = 3.14159265358979323846;
-    double u = (sx + 0.5) / (double)tex_w; // [0,1]
-    double v = (sy + 0.5) / (double)tex_h; // [0,1]
-
-    // NDC-like coords with y flipped so +y is up
-    double ndc_x = (u - 0.5) * 2.0; // -1..1
-    double ndc_y = (0.5 - v) * 2.0; // -1..1 (flip)
-
-    double fov_rad = cam.vfov * (PI / 180.0);
-    double tan_fov = std::tan(fov_rad * 0.5);
-    double aspect = (double)tex_w / (double)tex_h;
-
-    double px = ndc_x * aspect * tan_fov;
-    double py = ndc_y * tan_fov;
-
-    vec3 dir = unit_vector(cam.forward + cam.right * (float)px + cam.up * (float)py);
-    return ray(cam.position, dir, 0.0);
-}
-
-// Closest points between two infinite lines (p1 + s*d1, p2 + t*d2)
-// Returns true if solved; out_s and out_t are parameters along the lines.
-static bool ClosestPointsBetweenLines(const vec3& p1, const vec3& d1, const vec3& p2, const vec3& d2,
-                                      double& out_s, double& out_t)
-{
-    const double EPS = 1e-9;
-    double a = dot(d1, d1);
-    double b = dot(d1, d2);
-    double c = dot(d2, d2);
-    vec3 r = p1 - p2;
-    double d = dot(d1, r);
-    double e = dot(d2, r);
-
-    double denom = a * c - b * b;
-    if (std::fabs(denom) < EPS) return false; // parallel or nearly
-
-    out_s = (b * e - c * d) / denom;
-    out_t = (a * e - b * d) / denom;
-    return true;
-}
+#include "editor_transform_gizmo.inl"
 
 // -----------------------------------------------------------------------------
 // Engine init
 // -----------------------------------------------------------------------------
 
-static void init_engine_once()
+static void init_engine_once(bool opening_project = false)
 {
     if (g_scene_initialized)
         return;
 
-    build_default_scene(g_scene);
-    LoadMaterialsManifest();
-    // Load persisted mesh default material assignments (if present)
-    LoadMeshMaterialDefaults();
-    // Load persisted imported assets (textures / meshes)
-    LoadAssetsManifest();
+    if (!opening_project) {
+        build_default_scene(g_scene);
+        LoadMaterialsManifest();
+        LoadAssetsManifest();
+        LoadMeshMaterialDefaults();
+    }
 
     // Editor camera pose
     g_editor_cam.vfov = 40.0f;
@@ -2091,8 +1936,8 @@ static void init_engine_once()
     g_camera.direct_light_samples = 1;
     UpdateMNEEFromScene();
 
-    // Add a default sun to the scene and mirror into the preview camera (nice default lighting)
-    {
+    // The demo sun belongs only to the initial untitled scene.
+    if (!opening_project) {
         scene_light sun;
         sun.name = "Sun";
         sun.type = scene_light_type::directional;
@@ -2113,114 +1958,6 @@ static void init_engine_once()
     BuildUnitCubeMesh();
     BuildRasterShader();
     BuildPickShader();
-    BuildLineShader();
-
-    // Create gizmo VAO/VBO (6 verts: 3 axes, each a line of 2 verts)
-    // Vertex format: pos.xyz, color.xyz
-    float gizmo_verts[] = {
-        // X axis (red)
-         0.0f, 0.0f, 0.0f,   1.0f, 0.0f, 0.0f,
-         1.0f, 0.0f, 0.0f,   1.0f, 0.0f, 0.0f,
-        // Y axis (green)
-         0.0f, 0.0f, 0.0f,   0.0f, 1.0f, 0.0f,
-         0.0f, 1.0f, 0.0f,   0.0f, 1.0f, 0.0f,
-        // Z axis (blue)
-         0.0f, 0.0f, 0.0f,   0.0f, 0.0f, 1.0f,
-         0.0f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f
-    };
-
-    // Build smoother cone arrowheads (procedural) for each axis
-    std::vector<float> gizmo_cones;
-    // use global constants so hit-test can reuse identical geometry
-    const int cone_segments = g_gizmoConeSegments;
-    const float cone_len    = (float)g_gizmoConeLen; // along axis from base to apex
-    const float base_rad    = (float)g_gizmoBaseRad; // radius of cone base
-
-    // Also store triangle positions (model-space) into g_gizmoConeTriangles
-    g_gizmoConeTriangles.clear();
-    auto push_vertex = [&](float px, float py, float pz, float r, float g, float b) {
-        gizmo_cones.push_back(px); gizmo_cones.push_back(py); gizmo_cones.push_back(pz);
-        gizmo_cones.push_back(r);  gizmo_cones.push_back(g);  gizmo_cones.push_back(b);
-        g_gizmoConeTriangles.emplace_back((double)px, (double)py, (double)pz);
-    };
-
-    // X axis (red) - base circle centered at x=1.0, apex at x=1.0 + cone_len
-    for (int s = 0; s < cone_segments; ++s) {
-        float t0 = (float)s / (float)cone_segments;
-        float t1 = (float)(s+1) / (float)cone_segments;
-        float a0 = t0 * 2.0f * 3.14159265f;
-        float a1 = t1 * 2.0f * 3.14159265f;
-        // apex
-        float ax = 1.0f + cone_len; float ay = 0.0f; float az = 0.0f;
-        // base points in YZ plane
-        float b0x = 1.0f, b0y = std::cos(a0) * base_rad, b0z = std::sin(a0) * base_rad;
-        float b1x = 1.0f, b1y = std::cos(a1) * base_rad, b1z = std::sin(a1) * base_rad;
-        push_vertex(ax, ay, az, 1.0f, 0.0f, 0.0f);
-        push_vertex(b0x, b0y, b0z, 1.0f, 0.0f, 0.0f);
-        push_vertex(b1x, b1y, b1z, 1.0f, 0.0f, 0.0f);
-    }
-
-    // Y axis (green) - base circle centered at y=1.0, apex at y=1.0 + cone_len
-    for (int s = 0; s < cone_segments; ++s) {
-        float t0 = (float)s / (float)cone_segments;
-        float t1 = (float)(s+1) / (float)cone_segments;
-        float a0 = t0 * 2.0f * 3.14159265f;
-        float a1 = t1 * 2.0f * 3.14159265f;
-        float ax = 0.0f, ay = 1.0f + cone_len, az = 0.0f;
-        // base points in XZ plane
-        float b0x = std::cos(a0) * base_rad, b0y = 1.0f, b0z = std::sin(a0) * base_rad;
-        float b1x = std::cos(a1) * base_rad, b1y = 1.0f, b1z = std::sin(a1) * base_rad;
-        push_vertex(ax, ay, az, 0.0f, 1.0f, 0.0f);
-        push_vertex(b0x, b0y, b0z, 0.0f, 1.0f, 0.0f);
-        push_vertex(b1x, b1y, b1z, 0.0f, 1.0f, 0.0f);
-    }
-
-    // Z axis (blue) - base circle centered at z=1.0, apex at z=1.0 + cone_len
-    for (int s = 0; s < cone_segments; ++s) {
-        float t0 = (float)s / (float)cone_segments;
-        float t1 = (float)(s+1) / (float)cone_segments;
-        float a0 = t0 * 2.0f * 3.14159265f;
-        float a1 = t1 * 2.0f * 3.14159265f;
-        float ax = 0.0f, ay = 0.0f, az = 1.0f + cone_len;
-        // base points in XY plane
-        float b0x = std::cos(a0) * base_rad, b0y = std::sin(a0) * base_rad, b0z = 1.0f;
-        float b1x = std::cos(a1) * base_rad, b1y = std::sin(a1) * base_rad, b1z = 1.0f;
-        push_vertex(ax, ay, az, 0.0f, 0.0f, 1.0f);
-        push_vertex(b0x, b0y, b0z, 0.0f, 0.0f, 1.0f);
-        push_vertex(b1x, b1y, b1z, 0.0f, 0.0f, 1.0f);
-    }
-
-    glGenVertexArrays(1, &g_gizmoVAO);
-    glGenBuffers(1, &g_gizmoVBO);
-    glBindVertexArray(g_gizmoVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_gizmoVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(gizmo_verts), gizmo_verts, GL_STATIC_DRAW);
-    // pos
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    // color
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glBindVertexArray(0);
-
-    // Cone geometry
-    glGenVertexArrays(1, &g_gizmoConeVAO);
-    glGenBuffers(1, &g_gizmoConeVBO);
-    glBindVertexArray(g_gizmoConeVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_gizmoConeVBO);
-    g_gizmoConeVertexCount = 0;
-    if (!gizmo_cones.empty()) {
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gizmo_cones.size() * sizeof(float)), gizmo_cones.data(), GL_STATIC_DRAW);
-        g_gizmoConeVertexCount = (int)gizmo_cones.size() / 6; // each vertex = pos(3) + color(3)
-    } else {
-        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STATIC_DRAW);
-    }
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glBindVertexArray(0);
-
     g_scene_initialized = true;
     g_world_dirty       = true;
     g_cached_world.reset();
@@ -2342,12 +2079,15 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     float move_right   = 0.0f;
     float move_up      = 0.0f;
 
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move_forward += 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move_forward -= 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move_right   += 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move_right   -= 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move_up      += 1.0f;
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move_up      -= 1.0f;
+    if (!ImGui::GetIO().WantTextInput && !transform_gizmo::drag.active &&
+        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move_forward += 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move_forward -= 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move_right   += 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move_right   -= 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move_up      += 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move_up      -= 1.0f;
+    }
 
     if (move_forward != 0.0f || move_right != 0.0f || move_up != 0.0f) {
         g_editor_cam.move_speed = (double)g_camera_move_speed;
@@ -2361,7 +2101,7 @@ static void update_editor_camera_from_input(GLFWwindow* window, double dt)
     static double last_x   = 0.0;
     static double last_y   = 0.0;
 
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
+    if (!transform_gizmo::drag.active && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
     {
         double x, y;
         glfwGetCursorPos(window, &x, &y);
@@ -2759,54 +2499,36 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         if (mat.use_sss) {
             ImGui::Indent();
             
-            // Editor exposes SSS strength in [0..1] for convenience, but the
-            // renderer expects a smaller physical scale. Map UI [0..1] -> internal [0..0.1].
-            float sss_ui = (float)std::clamp(mat.sss_strength / 0.1, 0.0, 1.0);
+            // Fraction of the diffuse substrate replaced by spatial scattering.
+            float sss_ui = (float)std::clamp(mat.sss_strength, 0.0, 1.0);
             if (ImGui::SliderFloat("SSS Strength", &sss_ui, 0.0f, 1.0f)) {
-                mat.sss_strength = (double)(sss_ui * 0.1f);
+                mat.sss_strength = (double)sss_ui;
                 g_world_dirty = true;
             }
 
             float sss_radius_f = (float)mat.sss_radius;
             if (ImGui::SliderFloat("SSS Radius", &sss_radius_f, 0.01f, 10.0f)) {
                 mat.sss_radius = (double)sss_radius_f;
-                // Keep legacy sss_scale in sync for the single-scatter fallback
+                // Keep the legacy project scale field in sync with the diffusion distance
                 mat.sss_scale = mat.sss_radius;
                 g_world_dirty = true;
             }
 
-            // Compact model selector: None / Single / Multi-Single / Dipole / Skin / Foliage
-            const char* sss_items_simple[] = { "None", "Single", "Multi-Single", "Dipole (Burley)", "Skin", "Foliage" };
-            int sss_model_idx = 0;
-            // Map runtime enum values to combo index
-            if (mat.sss_model == SSS_NONE) sss_model_idx = 0;
-            else if (mat.sss_model == SSS_SINGLE_SCATTER) sss_model_idx = 1;
-            else if (mat.sss_model == SSS_MULTI_SINGLE_SCATTER) sss_model_idx = 2;
-            else if (mat.sss_model == SSS_DIPOLE_BURLEY) sss_model_idx = 3;
-            else if (mat.sss_model == SSS_SKIN) sss_model_idx = 4;
-            else if (mat.sss_model == SSS_FOLIAGE) sss_model_idx = 5;
-
-            if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items_simple, IM_ARRAYSIZE(sss_items_simple))) {
-                if (sss_model_idx == 0) mat.sss_model = SSS_NONE;
-                else if (sss_model_idx == 1) mat.sss_model = SSS_SINGLE_SCATTER;
-                else if (sss_model_idx == 2) mat.sss_model = SSS_MULTI_SINGLE_SCATTER;
-                else if (sss_model_idx == 3) mat.sss_model = SSS_DIPOLE_BURLEY;
-                else if (sss_model_idx == 4) mat.sss_model = SSS_SKIN;
-                else mat.sss_model = SSS_FOLIAGE;
+            const char* sss_items[] = { "None", "Burley diffusion" };
+            int sss_model_idx = mat.sss_model == SSS_NONE ? 0 : 1;
+            if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items, IM_ARRAYSIZE(sss_items))) {
+                mat.sss_model = sss_model_idx == 0 ? SSS_NONE : SSS_DIPOLE_BURLEY;
                 g_world_dirty = true;
             }
 
             // (Unreal PBR checkbox moved to the Textures section)
 
-            // Only expose sample count when Dipole is selected (advanced)
-            if (mat.sss_model == SSS_DIPOLE_BURLEY) {
-                int sss_samples_i = mat.sss_samples;
-                if (ImGui::SliderInt("SSS Samples (advanced)", &sss_samples_i, 1, 32)) {
-                    mat.sss_samples = sss_samples_i;
-                    g_world_dirty = true;
-                }
+            float eta = (float)mat.sss_eta;
+            if (ImGui::SliderFloat("SSS IOR", &eta, 1.0f, 2.5f)) {
+                mat.sss_eta = eta;
+                g_world_dirty = true;
             }
-            
+
             // SSS Color Override (only when SSS is enabled)
             if (ImGui::Checkbox("Override SSS Color", &mat.sss_color_override_enabled)) {
                 g_world_dirty = true;
@@ -2929,6 +2651,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 }
 
 #include "material_graph_editor.inl"
+#include "editor_projects.inl"
 
 // -----------------------------------------------------------------------------
 // File-drop
@@ -2950,27 +2673,33 @@ static void process_dropped_files()
         return;
 
     bool imported_any = false;
+    for (const auto& path : g_dropped_files) {
+        std::error_code error;
+        const bool folder = std::filesystem::is_directory(std::filesystem::u8path(path), error);
+        if (folder || has_extension_ci(path, ".dusk")) {
+            RequestProjectAction(folder ? project_ui::action::open_folder : project_ui::action::open_scene,
+                                 std::filesystem::u8path(path));
+            g_dropped_files.clear(); g_graph_file_drop_material = -1;
+            return;
+        }
+    }
 
     for (const std::string& full_path : g_dropped_files) {
-        // Copy dropped files into project Assets folders (textures/ or models/)
-        auto ensure_dir = [](const std::string& dir){
-            try { std::filesystem::create_directories(dir); } catch(...) {}
-        };
-        auto base_name = [](const std::string& p)->std::pair<std::string,std::string>{
-            size_t slash = p.find_last_of("/\\");
-            std::string name = (slash==std::string::npos)? p : p.substr(slash+1);
-            size_t dot = name.find_last_of('.');
-            if (dot==std::string::npos) return {name, std::string{}};
-            return { name.substr(0,dot), name.substr(dot) };
-        };
-        auto unique_dest = [&](const std::string& dir, const std::string& stem, const std::string& ext){
-            std::string candidate = dir + "/" + stem + ext;
-            int idx = 1;
-            while (std::filesystem::exists(candidate)) {
-                candidate = dir + "/" + stem + "_" + std::to_string(idx++) + ext;
+        const auto source = std::filesystem::u8path(full_path);
+        const std::string stem = source.stem().u8string();
+        std::string imported_path;
+        if (dusk_project::classify(source) != dusk_project::asset_kind::unsupported) {
+            try {
+                // Untitled sessions keep source references until their first Save
+                // packages them. Named projects own imports immediately.
+                imported_path = project_ui::file.empty()
+                    ? std::filesystem::weakly_canonical(std::filesystem::absolute(source)).u8string()
+                    : dusk_project::import_asset(source, ProjectRoot()).u8string();
+            } catch (const std::exception& e) {
+                project_ui::notice = e.what();
+                continue;
             }
-            return candidate;
-        };
+        }
 
         // Textures
         if (has_extension_ci(full_path, ".png")  ||
@@ -2981,12 +2710,13 @@ static void process_dropped_files()
             has_extension_ci(full_path, ".hdr")  ||
             has_extension_ci(full_path, ".ppm"))
         {
-            // Copy into textures/
-            ensure_dir("textures");
-            auto [stem, ext] = base_name(full_path);
-            std::string dest = unique_dest("textures", stem, ext.empty()? std::string{}: ext);
-            try { std::filesystem::copy_file(full_path, dest, std::filesystem::copy_options::overwrite_existing); }
-            catch(...) { /* ignore copy failure; fallback to original path */ dest = full_path; }
+            const std::string& dest = imported_path;
+            auto existing = std::find_if(g_scene.textures.begin(), g_scene.textures.end(),
+                [&](const scene_texture& texture) { return texture.path == dest; });
+            if (existing != g_scene.textures.end()) {
+                MaterialGraphImportedTexture(int(existing - g_scene.textures.begin()));
+                continue;
+            }
 
             scene_texture tex;
             tex.name = stem;
@@ -3005,12 +2735,20 @@ static void process_dropped_files()
         else if (has_extension_ci(full_path, ".fbx") ||
                  has_extension_ci(full_path, ".obj"))
         {
-            // Copy into models/
-            ensure_dir("models");
-            auto [stem, ext] = base_name(full_path);
-            std::string dest = unique_dest("models", stem, ext.empty()? std::string{}: ext);
-            try { std::filesystem::copy_file(full_path, dest, std::filesystem::copy_options::overwrite_existing); }
-            catch(...) { dest = full_path; }
+            const std::string& dest = imported_path;
+            auto existing = std::find_if(g_scene.meshes.begin(), g_scene.meshes.end(),
+                [&](const scene_mesh_asset& mesh) { return mesh.file_path == dest; });
+            if (existing != g_scene.meshes.end()) {
+                scene_object object;
+                object.name = existing->name;
+                object.type = scene_object_type::mesh_instance;
+                object.mesh_index = int(existing - g_scene.meshes.begin());
+                object.mesh_slot_materials = existing->slot_default_materials;
+                object.translation = vec3(0, 0, -1);
+                g_scene.objects.push_back(std::move(object));
+                imported_any = true;
+                continue;
+            }
 
             std::printf("Importing mesh (Assimp): %s\n", dest.c_str());
 
@@ -3102,7 +2840,7 @@ static void process_dropped_files()
 
 #include "editor_scene_panels.inl"
 
-int main()
+int main(int argc, char** argv)
 {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
@@ -3160,18 +2898,26 @@ int main()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    init_engine_once();
+    init_engine_once(argc > 1);
+    g_project_session_active = true;
+    project_ui::saved_fingerprint = dusk_project::fingerprint(CurrentProjectView());
+    if (argc > 1) OpenProjectLocation(dusk_project::command_line_scene(argv[1]));
 
     bool   show_demo_window = false;
     double last_time        = glfwGetTime();
-    static bool s_viewport_match_render = true;
     static bool s_content_drawer_open = false;
     static bool s_focus_content_drawer = false;
     static float s_content_drawer_anim = 0.0f;
 
-    while (!glfwWindowShouldClose(window))
+    while (!project_ui::exit_requested)
     {
         glfwPollEvents();
+        if (glfwWindowShouldClose(window)) {
+            glfwSetWindowShouldClose(window, GLFW_FALSE);
+            RequestProjectAction(project_ui::action::close);
+        }
+        ProcessProjectActions(window);
+        if (project_ui::exit_requested) break;
         process_dropped_files();
 
         double current_time = glfwGetTime();
@@ -3205,7 +2951,7 @@ int main()
                 g_progress_popup_pending = false;
                 // Save final image to disk using existing helper
                 if (!g_render_result.pixels.empty()) {
-                    const std::string out_path = "Renders/LastRender.ppm";
+                    const std::string out_path = g_render_output_path;
                     bool saved = write_ppm(out_path, g_render_result);
                     if (saved) {
                         std::printf("Saved render to '%s'\n", out_path.c_str());
@@ -3233,6 +2979,13 @@ int main()
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        if (transform_gizmo::drag.active && ImGui::IsKeyPressed(ImGuiKey_Escape,false)) transform_gizmo::finish(true);
+        if (transform_gizmo::drag.active && !ImGui::IsMouseDown(0)) {
+            transform_gizmo::update(io.MousePos,transform_gizmo::snapping || io.KeyCtrl);
+            transform_gizmo::finish();
+        }
+        ProjectShortcuts();
+        DrawProjectDialogs(window);
 
         // Ctrl+Z / Ctrl+Y handling (undo/redo) using GLFW key state; debounce on key transition
         static bool s_prev_ctrlz = false;
@@ -3245,10 +2998,10 @@ int main()
         bool cur_ctrlz = ctrl_down && z_down && !io.KeyShift;
         bool cur_ctrly = ctrl_down && (y_down || (io.KeyShift && z_down));
         bool cur_ctrlspace = ctrl_down && space_down;
-        if (cur_ctrlz && !s_prev_ctrlz && !io.WantTextInput) {
+        if (cur_ctrlz && !s_prev_ctrlz && !io.WantTextInput && !transform_gizmo::drag.active) {
             UndoManager::Instance().undo();
         }
-        if (cur_ctrly && !s_prev_ctrly && !io.WantTextInput) {
+        if (cur_ctrly && !s_prev_ctrly && !io.WantTextInput && !transform_gizmo::drag.active) {
             UndoManager::Instance().redo();
         }
         if (cur_ctrlspace && !s_prev_ctrlspace) {
@@ -3262,7 +3015,8 @@ int main()
         // Global Delete key: remove selected object when Delete pressed.
         // Allow Delete when viewport is focused even if ImGui requests keyboard capture
         ImGuiIO& io = ImGui::GetIO();
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && (g_viewport_focused || !io.WantCaptureKeyboard)) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !io.WantTextInput && !transform_gizmo::drag.active &&
+            (g_viewport_focused || !io.WantCaptureKeyboard)) {
             if (g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
                 int del_idx = g_selected_object;
                 scene_object removed = g_scene.objects[del_idx];
@@ -3367,14 +3121,15 @@ int main()
 
                 if (ImGui::BeginMenu("File"))
                 {
+                    DrawProjectMenu();
                     bool canExport = !g_render_in_progress;
                     if (ImGui::MenuItem("Export Scene as C++...", nullptr, false, canExport)) {
-                        const std::string out = "Renders/scene_export.cpp";
+                        const std::string out = ProjectOutputPath("scene_export.cpp");
                         export_scene_as_cpp(g_scene, out);
                     }
 
                     if (ImGui::MenuItem("Exit")) {
-                        glfwSetWindowShouldClose(window, GLFW_TRUE);
+                        RequestProjectAction(project_ui::action::close);
                     }
                     ImGui::EndMenu();
                 }
@@ -3464,6 +3219,14 @@ int main()
                 content_drawer_flags |= ImGuiWindowFlags_NoInputs;
             }
             ImGui::Begin("Content Drawer", nullptr, content_drawer_flags);
+            if (!project_ui::file.empty()) {
+                ImGui::TextDisabled("Project: %s", ProjectRoot().filename().u8string().c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ProjectRoot().u8string().c_str());
+                ImGui::SameLine();
+                ImGui::BeginDisabled(g_render_in_progress);
+                if (ImGui::SmallButton("Refresh assets")) RequestProjectAction(project_ui::action::refresh);
+                ImGui::EndDisabled();
+            }
             ImGui::TextDisabled("Drop files to import. Drag assets into the scene or graph. Ctrl+Space to close.");
             g_thumb_budget_per_frame = g_thumb_budget_default;
             ImGui::Separator();
@@ -3918,6 +3681,8 @@ int main()
 
         // Denoiser (OpenImageDenoise) controls
         {
+            ImGui::Checkbox("GPU Firefly Suppression", &g_renderer.gpu_firefly_filter);
+            if(ImGui::IsItemHovered()) ImGui::SetTooltip("Suppress isolated bright indirect pixels in GPU previews and final images.\nPreserves direct highlights and raw HDR samples. Disable for unfiltered reference renders.\nVery small indirect highlights may be softened.");
             bool use_dn = g_renderer.use_denoiser;
             if (ImGui::Checkbox("Use Denoiser (OIDN)", &use_dn)) {
                 g_renderer.use_denoiser = use_dn;
@@ -3968,8 +3733,8 @@ int main()
 
         DrawSectionLabel("Resolution");
 
-        static int res_w = g_camera.image_width;
-        static int res_h = g_camera.image_height;
+        int res_w = g_camera.image_width;
+        int res_h = g_camera.image_height;
 
         // Common 16:9 presets + custom
         static const char* res_names[] = {
@@ -3985,8 +3750,9 @@ int main()
         static const int res_vals[][2] = {
             {640,360}, {854,480}, {1280,720}, {1600,900}, {1920,1080}, {2560,1440}, {3840,2160}, {0,0}
         };
-        // Default to 1920 x 1080 preset (index 4)
-        static int res_preset = 4;
+        int res_preset = 7;
+        for (int i = 0; i < 7; ++i)
+            if (res_vals[i][0] == res_w && res_vals[i][1] == res_h) res_preset = i;
 
         if (ImGui::Combo("Resolution Preset", &res_preset, res_names, IM_ARRAYSIZE(res_names))) {
             if (res_preset >= 0 && res_preset < (int)(IM_ARRAYSIZE(res_names) - 1)) {
@@ -3999,16 +3765,16 @@ int main()
         }
 
         if (ImGui::InputInt("Width", &res_w)) {
-            if (res_w < 16) res_w = 16;
+            res_w = std::clamp(res_w, 16, 32768);
             res_preset = -1;
             g_camera.image_width = res_w; // apply immediately for custom edits
         }
         if (ImGui::InputInt("Height", &res_h)) {
-            if (res_h < 16) res_h = 16;
+            res_h = std::clamp(res_h, 16, 32768);
             res_preset = -1;
             g_camera.image_height = res_h; // apply immediately for custom edits
         }
-        if (ImGui::Checkbox("Viewport matches Render Resolution", &s_viewport_match_render)) {
+        if (ImGui::Checkbox("Viewport matches Render Resolution", &g_viewport_match_render)) {
             // no immediate action; viewport will pick this up next frame
         }
         ImGui::TextDisabled("Changes take effect next render.");
@@ -4980,7 +4746,7 @@ int main()
                 // viewport to match the configured render resolution, sync
                 // using the camera's image size so the ray tracer uses that
                 // resolution instead of the current ImGui viewport size.
-                if (s_viewport_match_render) {
+                if (g_viewport_match_render) {
                     sync_camera_from_editor((float)g_camera.image_width, (float)g_camera.image_height);
                 } else {
                     sync_camera_from_editor(render_area.x, render_area.y);
@@ -5008,6 +4774,7 @@ int main()
                 g_render_progress.elapsed_seconds.store(0.0);
 
                 g_cancel_flag.store(false);
+                g_render_output_path = ProjectOutputPath("LastRender.ppm");
                 g_render_in_progress = true;
 
                 g_progress_popup_pending = false;
@@ -5047,85 +4814,6 @@ int main()
                     g_render_thread = std::thread([world_copy, cam_copy, settings_copy, selection_copy, scene_copy]() mutable {
                         try {
                             size_t pixel_count = (size_t)cam_copy.image_width * (size_t)cam_copy.image_height;
-                            
-                            // Build caustics photon map once before render. Build when
-                            // we have either a sun or point lights so point-light
-                            // caustics are captured even if the sun is disabled.
-                            if (cam_copy.enable_mnee && (cam_copy.use_sun || !cam_copy.point_lights.empty())) {
-                                caustics_config cfg;
-                                cfg.photon_count   = (int)std::clamp<size_t>(pixel_count / 3, 150000, 750000);
-                                cfg.max_bounces    = std::max(2, std::min(8, cam_copy.max_depth));
-                                cfg.deposit_radius = 0.18;
-                                cfg.intensity_scale= 100.0;
-                                cfg.knn_k          = 0;
-
-                                int caustic_emitters = (cam_copy.use_sun ? 1 : 0) + (!cam_copy.point_lights.empty() ? 1 : 0);
-                                int sun_budget = cam_copy.use_sun ? std::max(1, cfg.photon_count / std::max(1, caustic_emitters)) : 0;
-                                int point_budget = !cam_copy.point_lights.empty() ? std::max(1, cfg.photon_count - sun_budget) : 0;
-
-                                photon_map pm;
-
-                                // Build sun caustics if enabled
-                                if (cam_copy.use_sun) {
-                                    caustics_config sun_cfg = cfg;
-                                    sun_cfg.photon_count = sun_budget;
-                                    build_sun_caustics(cam_copy.sun_dir, cam_copy.sun_radiance,
-                                                       *world_copy, sun_cfg, pm);
-                                }
-
-                                // Also emit photons from point lights so they contribute
-                                // to caustics (MNEE/photon capture). Share the budget
-                                // equally across point lights to keep it simple.
-                                if (!cam_copy.point_lights.empty()) {
-                                    int npl = (int)cam_copy.point_lights.size();
-                                    // Cap per-light photons so point-light caustics don't dominate render startup.
-                                    int photons_per_pl = std::min(75000, std::max(1, point_budget / npl));
-
-                                    for (const auto& pl : cam_copy.point_lights) {
-                                        for (int pi = 0; pi < photons_per_pl; ++pi) {
-                                            // Sample a random direction (uniform on sphere)
-                                            double z = 1.0 - 2.0 * random_double();
-                                            double r = std::sqrt(std::max(0.0, 1.0 - z*z));
-                                            double phi = 2.0 * M_PI * random_double();
-                                            double x = r * std::cos(phi);
-                                            double y = r * std::sin(phi);
-                                            vec3 dir = unit_vector(vec3((float)x, (float)y, (float)z));
-
-                                            ray r0(pl.position, dir, 0.0);
-                                            colour throughput = pl.radiance * (float)(1.0 / std::max(1, photons_per_pl));
-
-                                            bool saw_dielectric = false;
-                                            int spec_events = 0;
-                                            for (int b = 0; b < cfg.max_bounces; ++b) {
-                                                hit_record rec;
-                                                if (!world_copy->hit(r0, interval(0.001, infinity), rec)) break;
-
-                                                if (!rec.mat || (!rec.mat->is_specular())) {
-                                                    if (saw_dielectric && spec_events >= cfg.min_specular_events) {
-                                                        photon ph;
-                                                        ph.pos = rec.p;
-                                                        ph.dir = unit_vector(r0.direction());
-                                                        ph.power = throughput;
-                                                        pm.insert(ph);
-                                                    }
-                                                    break; // terminate on diffuse
-                                                }
-
-                                                // specular event
-                                                ray scattered;
-                                                colour atten;
-                                                if (!rec.mat->scatter(r0, rec, atten, scattered)) break;
-                                                throughput = throughput * atten;
-                                                if (rec.mat && rec.mat->is_dielectric()) saw_dielectric = true;
-                                                ++spec_events;
-                                                r0 = scattered;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                cam_copy.set_caustics(pm, cfg.deposit_radius);
-                            }
                             
                             // Sanity check render dimensions to avoid massive allocations
                             if (cam_copy.image_width <= 0 || cam_copy.image_height <= 0) {
@@ -5249,7 +4937,7 @@ int main()
                 g_progress_popup_pending = false;
             }
         } else {
-            ImGui::TextDisabled("RMB look | WASD move");
+            ImGui::TextDisabled("RMB + WASD fly | W/E/R transform");
         }
 
         ImGui::SameLine();
@@ -5305,6 +4993,8 @@ int main()
             ImGui::Text("Elapsed: %.0fs | Remaining: %d:%02d", el, rem_min, rem_sec);
         }
 
+        transform_gizmo::shortcuts();
+        transform_gizmo::toolbar();
         ImGui::Separator();
         ImVec2 vp_size = ImGui::GetContentRegionAvail();
         if (request_render) {
@@ -5328,8 +5018,8 @@ int main()
                 ImGui::Text("No render yet. Click 'Render Current View'.");
             }
         } else {
-            int tex_w = s_viewport_match_render ? g_camera.image_width : (int)vp_size.x;
-            int tex_h = s_viewport_match_render ? g_camera.image_height : (int)vp_size.y;
+            int tex_w = g_viewport_match_render ? g_camera.image_width : (int)vp_size.x;
+            int tex_h = g_viewport_match_render ? g_camera.image_height : (int)vp_size.y;
             if (vp_size.x > 0.0f && vp_size.y > 0.0f && tex_w > 0 && tex_h > 0) {
                 const viewport_image_layout layout =
                     ComputeViewportImageLayout(vp_size, tex_w, tex_h);
@@ -5344,216 +5034,31 @@ int main()
                     panel_screen.y + layout.offset.y
                 );
 
-                RenderRasterToTexture(tex_w, tex_h);
-
-                // Handle mouse click / drag -> gizmo interaction or pick
-                ImGuiIO& io = ImGui::GetIO();
-                if (g_viewport_hovered && layout.size.x > 0.0f && layout.size.y > 0.0f) {
-                    ImVec2 m = io.MousePos;
-                    float local_x = m.x - image_screen.x;
-                    float local_y = m.y - image_screen.y;
-
-                    // Map the mouse position in fitted viewport pixels to texture-local coords.
-                    double scale_x = (double)tex_w / (double)layout.size.x;
-                    double scale_y = (double)tex_h / (double)layout.size.y;
-                    double sx = (double)local_x * scale_x;
-                    double sy = (double)local_y * scale_y;
-
-                    if (sx >= 0 && sx < tex_w && sy >= 0 && sy < tex_h) {
-                        // Mouse down: attempt gizmo axis hit first, otherwise pick scene
-                        if (ImGui::IsMouseClicked(0)) {
-                            bool did_hit_gizmo = false;
-                            if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size()) {
-                                // build ray (map to texture coords sx,sy)
-                                ray r = ScreenPointToRay(g_editor_cam, tex_w, tex_h, (float)sx, (float)sy);
-                                // gizmo origin and axes in world space
-                                const auto& obj = g_scene.objects[g_selected_object];
-                                vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-                                // Use world-aligned axes (gizmo should follow world X/Y/Z)
-                                vec3 axis_world[3] = { vec3(1,0,0), vec3(0,1,0), vec3(0,0,1) };
-
-                                // test closest distance to each axis and to arrow tip (cone)
-                                double best_dist = 1e9; int best_axis = -1; vec3 best_cp1, best_cp2;
-                                for (int a=0;a<3;++a) {
-                                    double s,t;
-                                    if (!ClosestPointsBetweenLines(origin, axis_world[a], r.origin(), r.direction(), s, t)) continue;
-                                    vec3 cp_axis = origin + axis_world[a] * (float)s;
-                                    vec3 cp_ray  = r.origin() + r.direction() * (float)t;
-                                    double dist = (cp_axis - cp_ray).length();
-
-                                    // threshold based on object size for axis-line hit
-                                    double gizmo_scale = 0.5 * std::max(0.5, obj.radius);
-                                    double axis_thresh = gizmo_scale * 0.12; // heuristic
-
-                                    bool axis_hit = (dist < axis_thresh);
-
-                                    // Precise cone-triangle intersection for arrowhead: transform cone triangles for this axis
-                                    // Cone triangles are stored in g_gizmoConeTriangles in model-space, grouped per-axis.
-                                    // Build full model matrix used when rendering the gizmo so we transform triangles the same way.
-
-                                    // Build cone triangle model without object rotation so arrowheads point along world axes
-                                    vec3 trans = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-                                    float modelFull[16];
-                                    vec3 scl = vec3((float)gizmo_scale, (float)gizmo_scale, (float)gizmo_scale);
-                                    make_model_trs(trans, vec3(0,0,0), scl, modelFull);
-
-                                    // helper to transform a model-space point (includes translation)
-                                    auto transform_point_by_model = [&](const float M[16], const vec3& v) {
-                                        return vec3(
-                                            M[0]*v.x() + M[1]*v.y() + M[2]*v.z() + M[12],
-                                            M[4]*v.x() + M[5]*v.y() + M[6]*v.z() + M[13],
-                                            M[8]*v.x() + M[9]*v.y() + M[10]*v.z() + M[14]
-                                        );
-                                    };
-
-                                    // cone triangles per axis: cone_segments triangles, each triangle = 3 consecutive vec3 in g_gizmoConeTriangles
-                                    int segs = g_gizmoConeSegments;
-                                    int verts_per_axis = segs * 3; // number of vec3 entries per axis
-                                    int axis_offset = a * verts_per_axis;
-
-                                    double best_t_tri = 1e18;
-                                    bool tri_hit = false;
-                                    vec3 tri_hit_point;
-
-                                    for (int sidx = 0; sidx < segs; ++sidx) {
-                                        int base = axis_offset + sidx * 3;
-                                        if (base + 2 >= (int)g_gizmoConeTriangles.size()) break;
-                                        vec3 v0 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 0]);
-                                        vec3 v1 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 1]);
-                                        vec3 v2 = transform_point_by_model(modelFull, g_gizmoConeTriangles[base + 2]);
-                                        double ttri;
-                                        if (RayIntersectsTriangle(r, v0, v1, v2, ttri)) {
-                                            if (ttri > 0.0 && ttri < best_t_tri) {
-                                                best_t_tri = ttri;
-                                                tri_hit = true;
-                                                tri_hit_point = r.origin() + r.direction() * (float)ttri;
-                                            }
-                                        }
-                                    }
-
-                                    if (tri_hit && best_t_tri < best_dist) {
-                                        best_dist = best_t_tri;
-                                        best_axis = a;
-                                        best_cp1 = tri_hit_point;
-                                        best_cp2 = tri_hit_point; // both points approximate
-                                    } else if (axis_hit && dist < best_dist) {
-                                        best_dist = dist;
-                                        best_axis = a;
-                                        best_cp1 = cp_axis;
-                                        best_cp2 = cp_ray;
-                                    }
-                                }
-
-                                if (best_axis >= 0) {
-                                    // begin gizmo drag
-                                    g_active_gizmo_axis = best_axis;
-                                    g_gizmo_hit_point = best_cp1;
-                                    g_gizmo_initial_obj_translation = g_scene.objects[g_selected_object].translation;
-                                    // capture snapshot for undo at drag start
-                                    int sidx = g_selected_object;
-                                    if (sidx >= 0) {
-                                        auto& o = g_scene.objects[sidx];
-                                        g_obj_snapshot_before[sidx] = ObjSnapshot{ o.center, o.translation, o.rotation_deg, o.scale, o.radius };
-                                    }
-                                    did_hit_gizmo = true;
-                                }
-                            }
-
-                            if (!did_hit_gizmo) {
-                                int picked = PerformPick(tex_w, tex_h, (int)sx, (int)sy);
-                                if (picked >= 0 && picked < (int)g_scene.objects.size()) {
-                                    SelectSceneObject(picked);
-                                    g_show_gizmo = true;
-                                } else {
-                                    g_selected_object = -1;
-                                    g_show_gizmo = false;
-                                }
-                                g_active_gizmo_axis = -1;
-                            }
-                        }
-
-                        // Mouse dragging: if active axis, compute new closest point and move object
-                        if (g_active_gizmo_axis >= 0 && ImGui::IsMouseDown(0) && g_selected_object >= 0) {
-                            ray rnow = ScreenPointToRay(g_editor_cam, tex_w, tex_h, (float)sx, (float)sy);
-                            const auto& obj = g_scene.objects[g_selected_object];
-                            vec3 origin = obj.translation + vec3(obj.center.x(), obj.center.y(), obj.center.z());
-                            // World-aligned axis for dragging
-                            vec3 axis_world = vec3(0,0,0);
-                            if (g_active_gizmo_axis == 0) axis_world = vec3(1,0,0);
-                            else if (g_active_gizmo_axis == 1) axis_world = vec3(0,1,0);
-                            else if (g_active_gizmo_axis == 2) axis_world = vec3(0,0,1);
-                            axis_world = unit_vector(axis_world);
-
-                            double s_now, t_now;
-                            if (ClosestPointsBetweenLines(origin, axis_world, rnow.origin(), rnow.direction(), s_now, t_now)) {
-                                vec3 cp_axis_now = origin + axis_world * (float)s_now;
-                                float move_along = (float)dot(cp_axis_now - g_gizmo_hit_point, axis_world);
-                                vec3 new_trans = g_gizmo_initial_obj_translation + axis_world * move_along;
-                                g_scene.objects[g_selected_object].translation = new_trans;
-                                g_world_dirty = true;
-                                g_cached_world.reset();
-                            }
-                        }
-
-                        // Mouse release: if we were dragging a gizmo axis, push an undo action
-                        if (!ImGui::IsMouseDown(0)) {
-                            if (g_active_gizmo_axis >= 0 && g_selected_object >= 0) {
-                                int idx = g_selected_object;
-                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
-                                    auto& obj = g_scene.objects[idx];
-                                    ObjSnapshot after{ obj.center, obj.translation, obj.rotation_deg, obj.scale, obj.radius };
-                                    ObjSnapshot before = g_obj_snapshot_before[idx];
-                                    // only push if something changed
-                                    bool changed = (
-                                        std::abs(after.translation.x() - before.translation.x()) > 1e-6 ||
-                                        std::abs(after.translation.y() - before.translation.y()) > 1e-6 ||
-                                        std::abs(after.translation.z() - before.translation.z()) > 1e-6 ||
-                                        std::abs(after.center.x() - before.center.x()) > 1e-6 ||
-                                        std::abs(after.center.y() - before.center.y()) > 1e-6 ||
-                                        std::abs(after.center.z() - before.center.z()) > 1e-6 ||
-                                        std::abs(after.rotation_deg.x() - before.rotation_deg.x()) > 1e-6 ||
-                                        std::abs(after.rotation_deg.y() - before.rotation_deg.y()) > 1e-6 ||
-                                        std::abs(after.rotation_deg.z() - before.rotation_deg.z()) > 1e-6 ||
-                                        std::abs(after.scale.x() - before.scale.x()) > 1e-6 ||
-                                        std::abs(after.scale.y() - before.scale.y()) > 1e-6 ||
-                                        std::abs(after.scale.z() - before.scale.z()) > 1e-6 ||
-                                        std::abs(after.radius - before.radius) > 1e-9
-                                    );
-                                    if (changed) {
-                                        UndoManager::Instance().push(std::make_unique<LambdaAction>(
-                                            [idx, before]() {
-                                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
-                                                    auto& o = g_scene.objects[idx];
-                                                    o.center = before.center;
-                                                    o.translation = before.translation;
-                                                    o.rotation_deg = before.rotation_deg;
-                                                    o.scale = before.scale;
-                                                    o.radius = before.radius;
-                                                    g_world_dirty = true;
-                                                    g_cached_world.reset();
-                                                }
-                                            },
-                                            [idx, after]() {
-                                                if (idx >= 0 && idx < (int)g_scene.objects.size()) {
-                                                    auto& o = g_scene.objects[idx];
-                                                    o.center = after.center;
-                                                    o.translation = after.translation;
-                                                    o.rotation_deg = after.rotation_deg;
-                                                    o.scale = after.scale;
-                                                    o.radius = after.radius;
-                                                    g_world_dirty = true;
-                                                    g_cached_world.reset();
-                                                }
-                                            },
-                                            "Transform Object"
-                                        ));
-                                    }
-                                }
-                            }
-                            g_active_gizmo_axis = -1;
+                auto& io = ImGui::GetIO();
+                auto inside_image = [&](ImVec2 mouse) {
+                    return mouse.x >= image_screen.x && mouse.y >= image_screen.y &&
+                        mouse.x < image_screen.x+layout.size.x && mouse.y < image_screen.y+layout.size.y;
+                };
+                transform_gizmo::frame gizmo_frame;
+                if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < int(g_scene.objects.size()))
+                    gizmo_frame = transform_gizmo::build_frame(g_scene.objects[g_selected_object],
+                                                              g_editor_cam,image_screen,layout.size);
+                if (transform_gizmo::drag.active) {
+                    if (transform_gizmo::drag.object != g_selected_object) transform_gizmo::finish(true);
+                    else transform_gizmo::update(io.MousePos,transform_gizmo::snapping || io.KeyCtrl);
+                } else {
+                    transform_gizmo::hovered = g_viewport_hovered && inside_image(io.MousePos) && !ImGui::IsMouseDown(1)
+                        ? transform_gizmo::pick(gizmo_frame,io.MousePos) : transform_gizmo::none;
+                    if (g_viewport_hovered && inside_image(io.MousePos) && ImGui::IsMouseClicked(0) && !ImGui::IsMouseDown(1)) {
+                        bool grabbed = transform_gizmo::begin(gizmo_frame,transform_gizmo::hovered,io.MousePos,g_selected_object);
+                        if (!grabbed) {
+                            int sx = int((io.MousePos.x-image_screen.x)*tex_w/layout.size.x);
+                            int sy = int((io.MousePos.y-image_screen.y)*tex_h/layout.size.y);
+                            SelectSceneObject(PerformPick(tex_w,tex_h,sx,sy));
                         }
                     }
                 }
+                RenderRasterToTexture(tex_w, tex_h);
 
                 if (g_rasterColorTex != 0) {
                     ImGui::SetCursorPos(draw_cursor);
@@ -5563,6 +5068,13 @@ int main()
                         ImVec2(0, 1),
                         ImVec2(1, 0)  // flip Y
                     );
+                    if (g_show_gizmo && g_selected_object >= 0 && g_selected_object < int(g_scene.objects.size())) {
+                        gizmo_frame = transform_gizmo::build_frame(g_scene.objects[g_selected_object],
+                                                                  g_editor_cam,image_screen,layout.size);
+                        transform_gizmo::draw(ImGui::GetWindowDrawList(),gizmo_frame);
+                        if (transform_gizmo::hovered != transform_gizmo::none || transform_gizmo::drag.active)
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    }
                 } else {
                     ImGui::Text("Raster texture not ready.");
                 }
@@ -5597,7 +5109,7 @@ int main()
             glfwMakeContextCurrent(backup_current_context);
         }
 
-        // Auto-save materials if modified
+        // Retain the legacy debounce without writing manifests in project sessions.
         TickMaterialPersistence();
 
         glfwSwapBuffers(window);
@@ -5645,9 +5157,6 @@ int main()
     if (g_pickDepthRBO)   glDeleteRenderbuffers(1, &g_pickDepthRBO);
     if (g_pickFBO)        glDeleteFramebuffers(1, &g_pickFBO);
 
-    if (g_lineShader)     glDeleteProgram(g_lineShader);
-    if (g_gizmoVBO)       glDeleteBuffers(1, &g_gizmoVBO);
-    if (g_gizmoVAO)       glDeleteVertexArrays(1, &g_gizmoVAO);
 
     for (auto& item : g_material_thumb_cache) if (item.second) glDeleteTextures(1,&item.second);
     g_material_thumb_cache.clear();

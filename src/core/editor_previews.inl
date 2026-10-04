@@ -1,9 +1,11 @@
 #include "core/preview_worker.h"
 #include "core/preview_cache.h"
+#include "core/material_preview_camera.h"
 #include <iomanip>
 #include <deque>
 
 static constexpr int MATERIAL_THUMB_SIZE = 128;
+static constexpr int MATERIAL_SPHERE_SIZE = 1024;
 static std::unordered_map<int, GLuint> g_material_thumb_cache;
 static preview_worker g_editor_previews;
 static preview_worker g_texture_previews;
@@ -21,6 +23,8 @@ struct sphere_preview_state {
     preview_state image;
     GLuint texture = 0;
     float yaw = 0, pitch = 0, zoom = 1;
+    uint64_t texture_revision = 0;
+    bool gpu = false;
 };
 static std::unordered_map<int, sphere_preview_state> g_sphere_preview_states;
 
@@ -61,8 +65,8 @@ static std::shared_ptr<texture> LoadPreviewTexture(const std::string& path, text
 
 static uint64_t MaterialPreviewStamp(const scene& assets, const scene_material& m) {
     std::ostringstream key;
-    key << std::setprecision(17) << int(m.model) << '|' << m.base_color << '|' << m.metallic << '|'
-        << m.roughness << '|' << m.fuzz << '|' << m.ior << '|' << m.emission << '|' << m.emission_intensity
+    key << "orbit-camera-v2|" << std::setprecision(17) << int(m.model) << '|' << m.base_color << '|'
+        << m.metallic << '|' << m.roughness << '|' << m.fuzz << '|' << m.ior << '|' << m.emission << '|' << m.emission_intensity
         << '|' << m.dielectric_F0 << '|' << m.normal_strength << '|' << m.alpha_cutoff << '|'
         << m.alpha_double_sided << '|' << m.unreal_pbr << '|' << m.use_sss << '|' << m.sss_strength << '|'
         << m.sss_scale << '|' << m.sss_model << '|' << m.sss_samples << '|' << m.sss_radius << '|'
@@ -91,33 +95,20 @@ static uint64_t MaterialPreviewStamp(const scene& assets, const scene_material& 
 static preview_image RenderMaterialPreview(const scene& assets, const scene_material& description, int size,
                                            float yaw = 0, float pitch = 0, float zoom = 1) {
     auto runtime = build_rt_material(assets, description, LoadPreviewTexture);
-    // Shade in sphere-local coordinates. Rotating the view and studio lights
-    // together leaves lighting fixed while the sphere's UVs and normals turn.
-    const double cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
-    auto local = [=](vec3 v) {
-        const vec3 y(cy*v.x()-sy*v.z(), v.y(), sy*v.x()+cy*v.z());
-        return vec3(y.x(), cp*y.y()+sp*y.z(), -sp*y.y()+cp*y.z());
-    };
+    const material_preview_camera camera(yaw, pitch, zoom);
     hittable_list empty_world;
     preview_image image;
     image.width = image.height = size;
     image.pixels.resize(size * size * 4);
-    const vec3 view = local(vec3(0, 0, 1)), key = local(unit_vector(vec3(-.5, .7, 1.2))),
-               fill = local(unit_vector(vec3(.8, .1, .4)));
+    const vec3 key = unit_vector(vec3(-.5, .7, 1.2)), fill = unit_vector(vec3(.8, .1, .4));
     for (int y = 0; y < size; ++y) {
         for (int x = 0; x < size; ++x) {
-            double sx = (2.0 * (x + .5) / size - 1) / (.88 * zoom),
-                   sy = (1 - 2.0 * (y + .5) / size) / (.88 * zoom);
+            const double sx = 2.0 * (x + .5) / size - 1;
+            const double sy = 1 - 2.0 * (y + .5) / size;
             colour background(.028, .039, .052), c = background;
-            double r2 = sx * sx + sy * sy;
-            if (r2 < 1) {
-                hit_record rec{};
-                rec.p = rec.normal = local(vec3(sx, sy, std::sqrt(1 - r2)));
-                rec.front_face = true;
-                rec.u = (std::atan2(-rec.p.z(), rec.p.x()) + pi) / (2 * pi);
-                rec.v = std::acos(-rec.p.y()) / pi;
-                rec.set_tangent_frame(vec3(rec.p.z(), 0, -rec.p.x()),
-                                      cross(rec.normal, vec3(rec.p.z(), 0, -rec.p.x())));
+            hit_record rec{};
+            vec3 view;
+            if (camera.surface(sx, sy, rec, view)) {
                 c = runtime->albedo(rec) * .12 + runtime->emitted(rec.u, rec.v, rec.p) +
                     runtime->shade_direct(rec, view, key, colour(3.8, 3.6, 3.4), empty_world) +
                     runtime->shade_direct(rec, view, fill, colour(.8, 1, 1.3), empty_world);
@@ -309,14 +300,20 @@ static void InvalidateAllMaterialThumbnails() {
     }
 }
 
-static GLuint GetMaterialSpherePreview(int index, bool interactive) {
+static bool RenderMaterialSpherePreview(int index);
+static void StopMaterialSpherePreview();
+
+static GLuint GetMaterialSpherePreview(int index) {
     PumpEditorPreviews();
     if (index < 0 || index >= int(g_scene.materials.size())) {
         return 0;
     }
     auto& preview = g_sphere_preview_states[index];
+    if (RenderMaterialSpherePreview(index)) {
+        return preview.texture;
+    }
     auto& state = preview.image;
-    const int size = interactive ? 192 : 512;
+    constexpr int size = MATERIAL_SPHERE_SIZE;
     const auto now = std::chrono::steady_clock::now();
     if ((state.dirty || state.requested_size != size) && state.requested == state.displayed &&
         (state.requested == 0 || now - state.submitted >= std::chrono::milliseconds(33))) {
@@ -358,7 +355,7 @@ static void DrawMaterialSpherePreview(int index) {
         preview.zoom = std::clamp(preview.zoom + io.MouseWheel * .08f, .55f, 1.1f);
         preview.image.dirty = true;
     }
-    const auto texture = GetMaterialSpherePreview(index, dragging || ImGui::IsAnyItemActive());
+    const auto texture = GetMaterialSpherePreview(index);
     if (texture) {
         ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)texture, start,
                                              ImVec2(start.x + side, start.y + side));
@@ -368,9 +365,9 @@ static void DrawMaterialSpherePreview(int index) {
                                             "Preparing material preview...");
     }
     if (hovered) {
-        ImGui::SetTooltip("Drag to rotate  /  Scroll to zoom");
+        ImGui::SetTooltip("Drag to orbit camera  /  Scroll to zoom");
     }
-    ImGui::TextDisabled("Drag to rotate");
+    ImGui::TextDisabled("Drag to orbit camera");
     ImGui::SameLine();
     if (ImGui::SmallButton("Reset")) {
         preview.yaw = preview.pitch = 0;
@@ -382,6 +379,7 @@ static void DrawMaterialSpherePreview(int index) {
     ImGui::Separator();
 }
 static void StopEditorPreviews() {
+    StopMaterialSpherePreview();
     g_sphere_previews.stop();
     g_texture_previews.stop();
     g_editor_previews.stop();

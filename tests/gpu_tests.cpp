@@ -1,5 +1,6 @@
 #include "core/dusktracer.h"
 #include "core/denoise.h"
+#include "core/firefly_filter.h"
 #include "core/render_backend.h"
 #include "core/gpu_scene.h"
 #include "core/hittable_list.h"
@@ -57,6 +58,7 @@ renderer raw_settings() {
     renderer settings;
     settings.use_denoiser = false;
     settings.adaptive_sampling = false;
+    settings.gpu_firefly_filter = false;
     return settings;
 }
 double channel_mean(const std::vector<float>& image, int channel) {
@@ -228,6 +230,13 @@ void check_meshes(const std::string& device, const std::filesystem::path& folder
     cam.sun_radiance = vec3(2, 2, 2);
     cam.sun_shadow_samples = 1;
     compare_render(source, cam, device, "Mesh normal maps and nonuniform scale", .5);
+    for(auto& material:source.materials) {
+        material.use_sss=true; material.sss_strength=.5;
+        material.sss_model=SSS_DIPOLE_BURLEY; material.sss_radius=.08;
+        material.sss_color_override_enabled=true; material.sss_color_override_color=vec3(.2,.5,.7);
+    }
+    cam.samples_per_pixel=1024;
+    compare_render(source,cam,device,"Mesh SSS slots, normals and transformed instances",3);
 }
 
 void check_transport(const std::string& device) {
@@ -237,6 +246,26 @@ void check_transport(const std::string& device) {
     source.objects[0].scale = vec3(1.3, 1.3, 1.3);
     auto cam = test_camera(24, 24, 256);
     compare_render(source, cam, device, "Transformed glass entry and exit", 2);
+    // Physical-disc sunlight must survive dielectric entry/exit on both backends,
+    // including legacy scenes that saved zero radius and experimental flags.
+    {
+        auto sunlight_camera = test_camera(8,8,256);
+        sunlight_camera.vfov = .02;
+        sunlight_camera.background = vec3();
+        sunlight_camera.use_sun = true;
+        sunlight_camera.sun_dir = vec3(0,0,-1);
+        sunlight_camera.sun_angular_radius = 0;
+        sunlight_camera.sun_radiance = vec3(1,1,1)*sunlight_camera.sun_solid_angle();
+        sunlight_camera.enable_mnee = true;
+        auto glass_source = source;
+        glass_source.materials[0].ior = 1;
+        glass_source.materials[0].base_color = vec3(1,1,1);
+        std::vector<float> linear;
+        dusk_gpu::render(dusk_gpu::compile_scene(glass_source),sunlight_camera,raw_settings(),
+                         device,nullptr,nullptr,{},&linear);
+        near(channel_mean(linear,0),1,2e-4,"GPU legacy zero-radius sun is visible through glass");
+        compare_render(glass_source,sunlight_camera,device,"Physical sunlight through glass",.1);
+    }
     cam.lookfrom = point3(0, 0, 0);
     cam.lookat = point3(.1, .2, -1);
     compare_render(source, cam, device, "Glass camera inside medium", 2);
@@ -307,7 +336,7 @@ void check_transport(const std::string& device) {
     std::atomic<bool> cancelled{false};
     render_progress_state progress;
     bool partial = false;
-    cam = test_camera(64, 64, 100000);
+    cam = test_camera(64, 64, 10000000);
     auto start = std::chrono::steady_clock::now();
     auto result = dusk_gpu::render(dusk_gpu::compile_scene(source), cam, raw_settings(), device, &cancelled,
                                    &progress, [&](const render_result& image) {
@@ -373,6 +402,8 @@ static void check_pipeline_cache() {
     }
     require(cache::read(device, 101).empty(), "truncated pipeline cache is ignored");
 }
+#include "gpu_optimisation_tests.inl"
+
 static void check_gpu_scheduling(const std::string& device) {
     auto source = sphere_scene(scene_material_model::pbr);
     auto cam = test_camera(128, 96, 65);
@@ -448,11 +479,14 @@ static void check_denoiser() {
             "bad guides preserve the unfiltered image");
 #endif
 }
+#include "gpu_firefly_regressions.inl"
+#include "gpu_subsurface_regressions.inl"
 
 int main(int argc, char** argv) {
     check_denoiser();
     std::cout << std::unitbuf;
     try {
+        check_firefly_reconstruction();
         const std::filesystem::path output = argc > 1 ? argv[1] : "gpu-validation.png";
 #ifndef DUSK_ENABLE_VULKAN_RT
         auto source = sphere_scene(scene_material_model::lambert);
@@ -481,11 +515,21 @@ int main(int argc, char** argv) {
         std::string id = compatible->id;
         check_pipeline_cache();
         check_gpu_scheduling(id);
+        check_material_optimisation();
+        check_gpu_cache(id);
+        check_shadow_specialisation(id);
+        check_compact_preview(id);
+        if (argc > 2 && std::string(argv[2]) == "--performance") {
+            benchmark_gpu_optimisations(id);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "--scheduling") {
             return 0;
         }
         auto fixture_folder = std::filesystem::absolute(output).parent_path() / "gpu-fixtures";
         std::filesystem::create_directories(fixture_folder);
+        check_gpu_fireflies(id,fixture_folder);
+        check_gpu_subsurface(id,fixture_folder);
         check_graphs(id, fixture_folder);
         check_meshes(id, fixture_folder);
         check_transport(id);
@@ -578,16 +622,12 @@ int main(int argc, char** argv) {
         std::atomic<bool> cancel{true};
         require(dusk_gpu::render(data, cam, settings, id, &cancel, nullptr, {}).pixels.empty(),
                 "cancel before GPU initialization");
-        auto unsupported = source;
-        unsupported.materials[0].use_sss = true;
-        unsupported.materials[0].sss_strength = .5;
-        bool rejected = false;
-        try {
-            (void)dusk_gpu::compile_scene(unsupported);
-        } catch (const std::exception&) {
-            rejected = true;
-        }
-        require(rejected, "unsupported SSS is rejected explicitly");
+        auto subsurface_source = source;
+        subsurface_source.materials[0].use_sss = true;
+        subsurface_source.materials[0].sss_model = SSS_DIPOLE_BURLEY;
+        subsurface_source.materials[0].sss_strength = .5;
+        require(dusk_gpu::compile_scene(subsurface_source).materials[0].subsurface.x==.5f,
+                "SSS compiles for hardware rendering");
 
         // A shareable chart through the actual hardware backend.
         source.objects.clear();
