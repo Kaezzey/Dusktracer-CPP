@@ -166,9 +166,25 @@ static void benchmark_gpu_optimisations(const std::string& device) {
         std::printf("GPU BENCH %s: %.2f ms, %llu submissions, %llu bytes uploaded (512x384, 128 spp, 3 warm runs)\n",
                     label,sum/3,static_cast<unsigned long long>(stats.submissions),static_cast<unsigned long long>(stats.uploaded_bytes));
     };
-    run("synchronous/four samples","1","4",reference);
-    run("queued/adaptive batches","","",result);
+    gpu_option("DUSK_GPU_TILE_GROUP","1");
+    run("one tile/four samples","","4",reference);
+    gpu_option("DUSK_GPU_TILE_GROUP","4");
+    run("four tiles/four samples","","4",result);
+    require(reference==result,"tile grouping alone preserves every HDR pixel");
+    gpu_option("DUSK_GPU_TILE_GROUP","1");
+    run("one tile/queued/adaptive","","",reference);
+    gpu_option("DUSK_GPU_TILE_GROUP","4");
+    run("four tiles/queued/adaptive","","",result);
     require(reference == result,"queued/adaptive scheduling preserves every HDR pixel across multiple tiles");
     gpu_option("DUSK_GPU_SYNCHRONOUS","");
     gpu_option("DUSK_GPU_BATCH_SAMPLES","");
+    cam.image_width=513; cam.image_height=289; cam.samples_per_pixel=7;
+    gpu_option("DUSK_GPU_TILE_GROUP","1");
+    dusk_gpu::render(data,cam,settings,device,nullptr,nullptr,{},&reference);
+    gpu_option("DUSK_GPU_TILE_GROUP","4");
+    render_progress_state progress;
+    dusk_gpu::render(data,cam,settings,device,nullptr,&progress,{},&result);
+    require(reference==result,"grouped tiles preserve trailing pixels and partial sample batches");
+    require(progress.completed_tiles==progress.total_tiles,"grouped dispatch counts all completed tile samples");
+    gpu_option("DUSK_GPU_TILE_GROUP","");
 }

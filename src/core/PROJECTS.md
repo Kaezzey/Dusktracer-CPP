@@ -33,8 +33,12 @@ shader graphs (including layout), texture bindings, mesh material defaults and
 instance overrides, camera pose and lens, image dimensions, sampling and caustic
 settings, denoiser and exposure settings, CPU/GPU device selection, and viewport
 resolution mode. GPU resources and acceleration structures are rebuilt on open.
-Version 2 also stores GPU firefly suppression. Version 1 scenes remain readable
-and enable suppression by default; new saves use version 2.
+Version 2 stores GPU firefly suppression. Version 3 adds SSS profiles and RGB
+diffusion distances. Version 1 and 2 scenes remain readable with neutral RGB
+distances; version 1 enables firefly suppression by default. Version 4 adds the
+SSS shading model and Unreal Subsurface/Subsurface Profile parameters; older
+scenes load as legacy Burley diffusion. Version 5 adds Multiply by Base Color
+for Unreal Subsurface; earlier scenes load with it off. New saves use version 5.
 
 ```text
 Studio/

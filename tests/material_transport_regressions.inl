@@ -47,6 +47,35 @@ static void check_dielectric_sun() {
     world.objects.pop_back();
     near(trace_mean(sun,world,receiver,5,80000),sunlight,.03,
          "old MNEE and photon settings do not boost diffuse caustic receivers");
+    sun.sun_spheres.push_back({point3(0,0,1),.5,1.5});
+    near(trace_mean(sun,world,receiver,5,24000),sunlight,.025,
+         "sphere manifold sampling agrees with independent backward path tracing");
+    double targeted=trace_mean(sun,world,receiver,5,24000);
+    sun.sun_shadow_samples=4;
+    near(trace_mean(sun,world,receiver,5,12000),targeted,.015,"sphere caustic energy is invariant to sun sample count");
+    // Check the solid-angle focusing factor against a numerical 3D map,
+    // independently of the analytic angular derivative and root solver.
+    for(double ratio:{1.05,1.3,1.7,3.0}) {
+        sun_sphere::lens lens{point3(0,0,ratio),1,1.5};
+        sun_sphere::map mapping(ratio,1.5);
+        for(double theta:{.02,.1,.2}) {
+            auto c=sun_sphere::connect(lens,point3(),vec3(0,0,1),vec3(1,0,0),theta);
+            near(dot(c.outgoing,vec3(1,0,0)),std::sin(mapping.angle(theta)),1e-9,"spherical Snell mapping matches analytic angle");
+            double eps=1e-5;
+            auto a=sun_sphere::connect(lens,point3(),vec3(0,0,1),vec3(1,0,0),theta+eps);
+            auto b=sun_sphere::connect(lens,point3(),vec3(0,0,1),vec3(std::cos(eps),std::sin(eps),0),theta);
+            double measured=std::abs(dot(c.outgoing,cross((a.outgoing-c.outgoing)/eps,(b.outgoing-c.outgoing)/eps)))/std::sin(theta);
+            near(measured,c.jacobian,1e-3,"sphere solid-angle Jacobian matches independent finite differences");
+            std::array<double,3> roots;
+            int found=mapping.roots(mapping.angle(theta),roots);
+            require(found>0,"sphere solver finds transmitted manifold branches");
+            bool recovered=false;
+            for(int i=0;i<found;++i) {near(mapping.angle(roots[i]),mapping.angle(theta),1e-7,"each sphere branch reaches the requested light direction"); recovered|=std::abs(roots[i]-theta)<1e-6;}
+            require(recovered,"sphere solver recovers the known branch even across caustic folds");
+        }
+    }
+    std::array<double,3> folded;
+    require(sun_sphere::map(1.1,1.5).roots(.01,folded)==3,"sphere caustic solver enumerates all three folded branches");
 }
 static void check_subsurface_transport() {
     // Independent midpoint quadrature of the profile and its radial moments.
@@ -189,4 +218,92 @@ static void render_material_transport_samples(const std::filesystem::path& folde
     save("subsurface-off.png");
     skin->sss_strength = 1;
     save("subsurface-on.png");
+}
+
+// Unreal Subsurface transmission and Subsurface Profile dual specular.
+static std::shared_ptr<pbr_material> unreal_subsurface_material() {
+    auto mat = std::make_shared<pbr_material>(colour(.6,.4,.3),0,.45);
+    mat->sss_transmission = true; mat->sss_transmission_color = colour(.9,.35,.25);
+    mat->sss_opacity = .35; mat->sss_transmission_distance = .5;
+    return mat;
+}
+static void check_unreal_subsurface_transport() {
+    near(sss::unreal_transmission(1,1,0),1/(2*pi)+(1-1/(2*pi))*3,1e-12,"opacity zero in-scatter follows Unreal's lerp");
+    near(sss::unreal_transmission(.5,-1,1),.5/(2*pi),1e-12,"opacity one back-scatter follows the half vector");
+
+    // The one-sample lobe mixture must be unbiased: E[weight] equals the
+    // integral of the surface lobes plus the ambient-only Lambert lobe.
+    auto mat = unreal_subsurface_material();
+    mat->lobe_scale0 = .75; mat->lobe_scale1 = 1.3; mat->lobe_mix = .85;
+    hittable_list empty; auto hit = surface();
+    ray view(point3(.3,.2,1),vec3(-.3,-.2,-1),.5);
+    vec3 v = unit_vector(vec3(.3,.2,1));
+    colour quadrature(0,0,0);
+    const int rings = 600, segments = 1200;
+    for (int i = 0; i < rings; ++i) for (int j = 0; j < segments; ++j) {
+        double theta = (i+.5)*pi/rings, phi = (j+.5)*2*pi/segments;
+        vec3 l(std::sin(theta)*std::cos(phi),std::sin(theta)*std::sin(phi),std::cos(theta));
+        quadrature += mat->shade_direct(hit,v,l,colour(1,1,1),empty)*(std::sin(theta)*(pi/rings)*(2*pi/segments));
+    }
+    colour ambient = pbr_material::unreal_ambient(colour(.9,.35,.25),colour(.6,.4,.3),0);
+    near(ambient.x(),.4,1e-12,"ambient subsurface colour stays within unit diffuse albedo");
+    near(ambient.z(),.25,1e-12,"ambient subsurface colour is unchanged below unit albedo");
+    colour estimate(0,0,0); const int samples = 400000; int indirect = 0;
+    for (int i = 0; i < samples; ++i) {
+        bsdf_sample sample;
+        if (mat->sample_surface(view,hit,sequence(i,2),sequence(i,3),sequence(i,5),sample)) {
+            estimate += sample.weight; indirect += sample.indirect_only;
+        }
+    }
+    estimate /= samples;
+    for (int c = 0; c < 3; ++c) near(estimate[c]/(quadrature[c]+ambient[c]),1,.01,"Unreal ambient and dual specular sampling is unbiased");
+    require(indirect > samples/20,"ambient samples gather indirect light only");
+    near(mat->bsdf_pdf(hit,v,vec3(0,0,-1)),0,1e-12,"transmission is never BSDF sampled");
+    require(mat->shade_transmission(hit,v,vec3(0,0,-1),colour(1,1,1)).x() > 0,"transmission reaches back-facing lights");
+
+    // A backlit sphere: light crosses its full diameter. NEE uses the closed form.
+    mat = unreal_subsurface_material();
+    hittable_list world; world.add(std::make_shared<sphere>(point3(),1,mat));
+    // Off-axis, so the half vector of Unreal's term is well defined.
+    vec3 toward_sun = safe_unit_vector(vec3(.25,.1,-1));
+    camera cam; cam.background = colour(); cam.use_sun = true; cam.sun_dir = toward_sun;
+    cam.sun_radiance = colour(1,1,1); cam.sun_angular_radius = .01; cam.sun_shadow_samples = 1;
+    ray center(point3(0,0,3),vec3(0,0,-1),.5);
+    hit_record front; require(world.hit(center,interval(.001,infinity),front),"backlit sphere fixture intersects");
+    double chord = -2*dot(front.p-point3(),toward_sun);
+    colour lobe = mat->shade_transmission(front,vec3(0,0,1),toward_sun,colour(1,1,1));
+    double inscatter = std::pow(-dot(toward_sun,vec3(0,0,1)),12)*(3+(.1-3)*.35);
+    require(lobe.x() > .9*inscatter*.9,"in-scatter dominates when looking toward the light");
+    double expected = lobe.x()*std::exp(-chord/.5);
+    near(trace_mean(cam,world,center,1,20000),expected,expected*.02,
+         "backlit Unreal Subsurface transmits through its thickness");
+    mat->sss_transmission_distance = 1;
+    require(trace_mean(cam,world,center,1,2000) > expected*2,"a longer transmission distance passes more light");
+    mat->sss_transmission_distance = .5;
+
+    // Transmission is counted once, by light sampling: estimates do not depend
+    // on the number of light samples or on MIS.
+    cam.sun_angular_radius = 15; cam.sun_dir = safe_unit_vector(vec3(.3,.2,-1));
+    ray oblique(point3(.2,.1,3),vec3(-.05,-.03,-1),.5);
+    double reference = trace_mean(cam,world,oblique,1,200000);
+    require(reference > .01,"oblique backlight transmits through the body");
+    cam.direct_light_samples = 4; cam.sun_shadow_samples = 4;
+    near(trace_mean(cam,world,oblique,1,100000),reference,reference*.03,
+         "Unreal transmission is invariant to the light sample count");
+    cam.enable_mis = false; cam.direct_light_samples = 1; cam.sun_shadow_samples = 1;
+    near(trace_mean(cam,world,oblique,1,200000),reference,reference*.03,
+         "Unreal transmission does not depend on MIS");
+    cam.enable_mis = true;
+    world.add(std::make_shared<quad>(point3(-100,-100,-2),vec3(200,0,0),vec3(0,200,0),
+                                  std::make_shared<lambertian>(colour(0,0,0))));
+    near(trace_mean(cam,world,center,1,20000),0,1e-12,"external blockers stop transmitted light");
+    world.objects.pop_back();
+    // Indirect light sees at most unit albedo, so bounces cannot amplify it.
+    cam.use_sun = false; cam.background = colour(1,1,1);
+    double furnace = trace_mean(cam,world,center,1,100000);
+    std::cout << "Unreal Subsurface white furnace " << furnace << '\n';
+    require(furnace > .4 && furnace < 1.01,"Unreal Subsurface ambient keeps unit albedo in a white furnace");
+    cam.use_sun = true; cam.background = colour();
+    mat->sss_transmission = false;
+    near(trace_mean(cam,world,center,1,4000),0,1e-12,"without the Unreal model, a backlit opaque sphere stays dark");
 }

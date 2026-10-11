@@ -69,6 +69,9 @@ struct bsdf_sample {
     bool delta = false;
     bool passthrough = false;
     bool subsurface = false;
+    // The continuation gathers indirect light only (Unreal Subsurface ambient
+    // lobe): emitters and the sun it reaches are counted by light sampling.
+    bool indirect_only = false;
 };
 
 class material {
@@ -103,6 +106,8 @@ class material {
     // Identify dielectric materials explicitly (glass, water, etc.)
     // Default false; overridden by dielectric.
     virtual bool is_dielectric() const { return false; }
+    virtual double dielectric_ior() const { return 1; }
+    virtual colour transmission_tint(const hit_record&) const { return colour(1,1,1); }
 
     // Direct-shading hook for direct lights. Default is
     // Lambertian: albedo * Li * (NdotL / pi). V is the view direction
@@ -127,6 +132,13 @@ class material {
     virtual bool sample_subsurface(const hit_record&, const hittable&, double,
                                   double, double, double, double, hit_record&, colour&) const { return false; }
     virtual double subsurface_directional(double) const { return 0; }
+    // Extinction length for light crossing this material's own body to reach
+    // back-facing directions; zero when the material has no such transport.
+    virtual double body_transmission_distance() const { return 0; }
+    // Direct-light-only Unreal Subsurface transmission; it has no BSDF
+    // sampling counterpart, so light sampling counts it without MIS.
+    virtual colour shade_transmission(const hit_record&, const vec3&, const vec3&, const colour&,
+                                      double = 1) const { return colour(0,0,0); }
 
     virtual double bsdf_pdf(const hit_record& rec, const vec3& /*V*/, const vec3& Ldir) const {
         double NdotL = std::max(0.0, dot(rec.normal, unit_vector(Ldir)));
@@ -283,6 +295,8 @@ class dielectric : public material {
     
     bool is_specular() const override { return true; }
     bool is_dielectric() const override { return true; }
+    double dielectric_ior() const override { return refraction_index; }
+    colour transmission_tint(const hit_record& rec) const override { return tex->value(rec.u,rec.v,rec.p); }
 
     // A perfect dielectric is a delta BSDF. Analytic-light highlights require
     // a rough dielectric model; inventing a finite GGX lobe double-counts energy.
@@ -392,9 +406,18 @@ public:
     SSSModel sss_model = SSS_SINGLE_SCATTER;
     int      sss_samples = 4;        // legacy project field
     double   sss_radius  = 1.0;      // mean free path / diffusion radius
+    vec3 sss_radius_rgb = vec3(1,1,1);
     double   sss_eta     = 1.3;      // entry interface IOR
     bool     sss_color_override = false;
     colour   sss_color_override_col = colour(1.0, 1.0, 1.0);
+    // Diffusion tint multiplier (Unreal profile Tint) and dual specular lobes.
+    colour   sss_tint_scale = colour(1, 1, 1);
+    double   lobe_scale0 = 1, lobe_scale1 = 1, lobe_mix = 0;
+    // Unreal "Subsurface" transmission lobe; see sss::unreal_transmission.
+    bool     sss_transmission = false;
+    colour   sss_transmission_color = colour(0, 0, 0);
+    bool     sss_transmission_base = false; // multiply the colour by the base colour
+    double   sss_opacity = 1, sss_transmission_distance = 1;
     // If true, sample combined textures using Unreal-style channel packing
     // (green = roughness, blue = metallic)
     bool     use_unreal_pbr = false;
@@ -534,9 +557,10 @@ public:
 
   private:
     struct surface {
-        colour base, f0;
+        colour base, f0, transmission, ambient;
         vec3 n, geometry;
-        double metallic, alpha, specular_probability, subsurface_fraction;
+        double metallic, alpha, alpha1, alpha_mean, lobe_mix, specular_probability,
+               subsurface_fraction, ambient_probability, opacity;
         bool smooth;
     };
     surface prepare_surface(const hit_record& rec) const {
@@ -544,9 +568,23 @@ public:
         sample_surface_params(rec,s.base,s.metallic,rough);
         s.base = pbr::reflectance(s.base);
         s.f0 = (1-s.metallic)*pbr::reflectance(dielectric_F0)+s.metallic*s.base;
-        s.alpha = perceptual_to_alpha(rough); s.smooth = s.alpha < 1e-4;
+        s.lobe_mix = std::clamp(lobe_mix,0.0,1.0);
+        if (s.lobe_mix > 0) {
+            // Unreal dual specular: both lobes scale one roughness; masking
+            // uses their mixed roughness.
+            double r0 = std::clamp(clamp01(rough)*lobe_scale0,.02,1.0), r1 = std::clamp(clamp01(rough)*lobe_scale1,.02,1.0);
+            double mean = r0+(r1-r0)*s.lobe_mix;
+            s.alpha = r0*r0; s.alpha1 = r1*r1; s.alpha_mean = mean*mean;
+        } else s.alpha = s.alpha1 = s.alpha_mean = perceptual_to_alpha(rough);
+        s.smooth = s.alpha < 1e-4;
         s.specular_probability = specular_sampling_probability(s.f0,s.metallic);
         s.subsurface_fraction = sss_model == SSS_NONE ? 0 : clamp01(sss_strength);
+        s.transmission = sss_transmission ? pbr::reflectance(sss_transmission_color) : colour(0,0,0);
+        if (sss_transmission_base) s.transmission = s.transmission*s.base;
+        s.ambient = unreal_ambient(s.transmission,s.base,s.metallic);
+        double ambient_weight = luminance(s.ambient);
+        s.ambient_probability = ambient_weight/(1+ambient_weight);
+        s.opacity = clamp01(sss_opacity);
         s.geometry = safe_unit_vector(rec.geometry_normal());
         s.n = safe_unit_vector(rec.normal,s.geometry);
         if (normal_tex) {
@@ -561,7 +599,18 @@ public:
     static bool above_surface(const surface& s, const vec3& v, const vec3& l) {
         return dot(s.geometry,v) > 0 && dot(s.geometry,l) > 0 && dot(s.n,v) > 0 && dot(s.n,l) > 0;
     }
-    static colour evaluate_surface(const surface& s, const vec3& v, const vec3& l) {
+    static bool viewable(const surface& s, const vec3& v) { return dot(s.geometry,v) > 0 && dot(s.n,v) > 0; }
+    static double specular_distribution(const surface& s, double nh) {
+        double d = pbr::distribution(nh,s.alpha);
+        return s.lobe_mix > 0 ? d+(pbr::distribution(nh,s.alpha1)-d)*s.lobe_mix : d;
+    }
+    static double specular_pdf(const surface& s, double nh, double nv) {
+        double p = pbr::distribution(nh,s.alpha)*pbr::masking(nv,s.alpha);
+        if (s.lobe_mix > 0) p += (pbr::distribution(nh,s.alpha1)*pbr::masking(nv,s.alpha1)-p)*s.lobe_mix;
+        return p/(4*nv);
+    }
+    // Surface lobes (diffuse substrate and GGX) times cosine.
+    static colour evaluate_cosine(const surface& s, const vec3& v, const vec3& l) {
         if (!above_surface(s,v,l)) return colour(0,0,0);
         double nv = std::clamp(dot(s.n,v),0.0,1.0), nl = std::clamp(dot(s.n,l),0.0,1.0);
         // A diffuse substrate loses light on both entry and exit through its
@@ -571,30 +620,38 @@ public:
         colour f = s.base*((1-s.metallic)*(1-s.subsurface_fraction)/pi)*transmission_v*transmission_l;
         if (!s.smooth) {
             vec3 h = safe_unit_vector(v+l,s.n);
-            double d = pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha);
-            f += schlick_fresnel(dot(v,h),s.f0)*(d*pbr::visibility(nv,nl,s.alpha));
+            double d = specular_distribution(s,std::clamp(dot(s.n,h),0.0,1.0));
+            f += schlick_fresnel(dot(v,h),s.f0)*(d*pbr::visibility(nv,nl,s.alpha_mean));
         }
-        return f;
+        return f*nl;
     }
+    // Density of the surface lobes. The ambient lobe only gathers indirect
+    // light, so light sampling never competes with it.
     static double surface_pdf(const surface& s, const vec3& v, const vec3& l) {
         if (!above_surface(s,v,l)) return 0;
         double nv = dot(s.n,v), nl = dot(s.n,l);
         double pdf = (1-s.specular_probability)*(1-s.subsurface_fraction)*nl/pi;
         if (!s.smooth) {
             vec3 h = safe_unit_vector(v+l,s.n);
-            pdf += s.specular_probability*pbr::distribution(std::clamp(dot(s.n,h),0.0,1.0),s.alpha)
-                *pbr::masking(nv,s.alpha)/(4*nv);
+            pdf += s.specular_probability*specular_pdf(s,std::clamp(dot(s.n,h),0.0,1.0),nv);
         }
-        return pdf;
+        return pdf*(1-s.ambient_probability);
     }
 
   public:
+    // Unreal treats Subsurface Color as extra diffuse for indirect light. A
+    // path tracer bounces repeatedly, so the sum stays within unit albedo.
+    static colour unreal_ambient(const colour& subsurface, const colour& base, double metallic) {
+        colour ambient;
+        for (int c = 0; c < 3; ++c) ambient[c] = std::clamp(std::min(subsurface[c],1-(1-metallic)*base[c]),0.0,1.0);
+        return ambient;
+    }
     // Exposed deterministic variates support reproducible sampler validation.
     bool sample_surface(const ray& incoming, const hit_record& rec, double lobe, double u, double v, bsdf_sample& sample) const {
         sample = {};
         surface s = prepare_surface(rec);
         vec3 view = safe_unit_vector(-incoming.direction());
-        if (dot(s.geometry,view) <= 0 || dot(s.n,view) <= 0) return false;
+        if (!viewable(s,view)) return false;
         double subsurface_probability = (1-s.specular_probability)*s.subsurface_fraction;
         if (subsurface_probability > 0 && lobe >= 1-subsurface_probability) {
             sample.subsurface = true;
@@ -602,18 +659,31 @@ public:
                 ((1-s.metallic)*s.subsurface_fraction/subsurface_probability);
             return true;
         }
+        double ambient = s.ambient_probability, specular = (1-ambient)*s.specular_probability;
         pbr::frame frame(s.n);
         vec3 direction;
-        if (lobe < s.specular_probability) {
+        if (ambient > 0 && lobe >= 1-ambient) {
+            // Indirect-only Lambert lobe: direct light reaches this material
+            // through the Unreal transmission term instead.
+            direction = frame.world(sample_cosine_hemisphere(u,v));
+            if (!above_surface(s,view,direction)) return false;
+            sample.weight = s.ambient/ambient;
+            sample.pdf = ambient*dot(s.n,direction)/pi;
+            sample.indirect_only = true;
+            sample.scattered = ray(rec.p,direction,incoming.time());
+            return true;
+        }
+        if (lobe < specular) {
             if (s.smooth) {
                 direction = reflect(-view,s.n);
                 if (!above_surface(s,view,direction)) return false;
                 sample.delta = true; sample.pdf = 0;
-                sample.weight = schlick_fresnel(dot(view,s.n),s.f0)/s.specular_probability;
+                sample.weight = schlick_fresnel(dot(view,s.n),s.f0)/specular;
                 sample.scattered = ray(rec.p,direction,incoming.time());
                 return true;
             }
-            vec3 h = frame.world(pbr::visible_normal(frame.local(view),s.alpha,u,v));
+            double alpha = s.lobe_mix > 0 && lobe < specular*s.lobe_mix ? s.alpha1 : s.alpha;
+            vec3 h = frame.world(pbr::visible_normal(frame.local(view),alpha,u,v));
             direction = reflect(-view,h);
         } else direction = frame.world(sample_cosine_hemisphere(u,v));
         // Samples below the real surface are absorption events. Redirecting or
@@ -621,7 +691,7 @@ public:
         if (!above_surface(s,view,direction)) return false;
         sample.pdf = surface_pdf(s,view,direction);
         if (sample.pdf <= 0) return false;
-        sample.weight = evaluate_surface(s,view,direction)*(dot(s.n,direction)/sample.pdf);
+        sample.weight = evaluate_cosine(s,view,direction)/sample.pdf;
         sample.scattered = ray(rec.p,direction,incoming.time());
         return true;
     }
@@ -644,11 +714,26 @@ public:
                         const hittable&, double visibility = 1) const override {
         if (opacity_at(rec) <= 0) return colour(0,0,0);
         auto s = prepare_surface(rec); vec3 v = safe_unit_vector(view), l = safe_unit_vector(light);
-        return evaluate_surface(s,v,l)*radiance*(std::max(0.0,dot(s.n,l))*visibility);
+        return evaluate_cosine(s,v,l)*radiance*visibility;
+    }
+    // Unreal Subsurface transmission for a direct light on either side. It
+    // already includes its geometry term. Callers pass ordinary visibility
+    // for lights in front of the geometric surface and the body
+    // transmittance for lights behind it.
+    colour shade_transmission(const hit_record& rec, const vec3& view, const vec3& light, const colour& radiance,
+                              double visibility = 1) const override {
+        if (!sss_transmission || opacity_at(rec) <= 0) return colour(0,0,0);
+        auto s = prepare_surface(rec); vec3 v = safe_unit_vector(view), l = safe_unit_vector(light);
+        if (!viewable(s,v)) return colour(0,0,0);
+        vec3 h = safe_unit_vector(v+l,s.n);
+        return s.transmission*radiance*(sss::unreal_transmission(dot(s.n,h),-dot(l,v),s.opacity)*visibility);
     }
     double bsdf_pdf(const hit_record& rec, const vec3& view, const vec3& light) const override {
         if (opacity_at(rec) <= 0) return 0;
         return surface_pdf(prepare_surface(rec),safe_unit_vector(view),safe_unit_vector(light));
+    }
+    double body_transmission_distance() const override {
+        return sss_transmission ? std::max(1e-6,sss_transmission_distance) : 0;
     }
 
     // Spatial BSSRDF transport replaces part of the diffuse substrate. Legacy
@@ -661,11 +746,16 @@ public:
                            double axis_u, double radius_u, double phi_u, double pick_u,
                            hit_record& entry, colour& weight) const override {
         if (!out.object || sss_strength <= 0 || sss_model == SSS_NONE) return false;
-        double d = subsurface_distance(), extent = 30*d;
+        vec3 distances = subsurface_distance()*sss_radius_rgb;
+        for (int c=0;c<3;++c) distances[c]=std::max(1e-6,distances[c]);
+        double extent = 30*std::max({distances.x(),distances.y(),distances.z()});
         pbr::frame frame(safe_unit_vector(out.geometry_normal()));
         vec3 axes[3] = {frame.t, frame.b, frame.n};
         const double probabilities[3] = {.25, .25, .5};
         int axis = axis_u < .5 ? 2 : axis_u < .75 ? 0 : 1;
+        // Remap the axis variate to an independent uniform spectral proposal.
+        double channel_u = axis == 2 ? 2*axis_u : axis == 0 ? 4*(axis_u-.5) : 4*(axis_u-.75);
+        double d = distances[std::clamp(int(3*channel_u),0,2)];
         double r = sss::sample_burley_radius(d, radius_u);
         if (r >= extent) return false; // Tiny tail is absorption, never renormalized.
         double phi = 2*pi*phi_u;
@@ -704,12 +794,18 @@ public:
             point3 projected = entry.p-dot(delta,axes[a])*axes[a];
             int n = a == axis ? found : intersections(a,projected,nullptr);
             double projected_r = (projected-out.p).length();
-            if (n) pdf += probabilities[a]*sss::burley_pdf_area(projected_r,d)*
-                std::abs(dot(entry.geometry_normal(),axes[a]))/n;
+            if (n) {
+                double mixture = 0;
+                for (int c=0;c<3;++c) mixture += sss::burley_pdf_area(projected_r,distances[c])/3;
+                pdf += probabilities[a]*mixture*std::abs(dot(entry.geometry_normal(),axes[a]))/n;
+            }
         }
         if (pdf <= 0 || !std::isfinite(pdf)) return false;
-        colour tint = pbr::reflectance(sss_color_override ? sss_color_override_col : albedo(out));
-        weight = tint*(sss::burley_Rd(delta.length(),1,d)*opacity_at(entry)/pdf);
+        colour tint = sss_color_override ? pbr::reflectance(sss_color_override_col)
+            : pbr::reflectance(albedo(out))*pbr::reflectance(sss_tint_scale);
+        colour profile;
+        for (int c=0;c<3;++c) profile[c]=sss::burley_Rd(delta.length(),1,distances[c]);
+        weight = tint*profile*(opacity_at(entry)/pdf);
         return true;
     }
 

@@ -481,6 +481,7 @@ static void check_denoiser() {
 }
 #include "gpu_firefly_regressions.inl"
 #include "gpu_subsurface_regressions.inl"
+#include "gpu_sphere_caustic_regressions.inl"
 
 int main(int argc, char** argv) {
     check_denoiser();
@@ -528,8 +529,14 @@ int main(int argc, char** argv) {
         }
         auto fixture_folder = std::filesystem::absolute(output).parent_path() / "gpu-fixtures";
         std::filesystem::create_directories(fixture_folder);
+        if(argc>2 && std::string(argv[2])=="--caustics") {check_gpu_sphere_caustics(id,fixture_folder);return 0;}
+        if(argc>2 && std::string(argv[2])=="--skin") {check_gpu_skin_shadow(id,fixture_folder);return 0;}
+        if(argc>2 && std::string(argv[2])=="--unreal") {check_gpu_unreal_subsurface(id,fixture_folder);return 0;}
         check_gpu_fireflies(id,fixture_folder);
+        check_gpu_sphere_caustics(id,fixture_folder);
         check_gpu_subsurface(id,fixture_folder);
+        check_gpu_skin_shadow(id,fixture_folder);
+        check_gpu_unreal_subsurface(id,fixture_folder);
         check_graphs(id, fixture_folder);
         check_meshes(id, fixture_folder);
         check_transport(id);

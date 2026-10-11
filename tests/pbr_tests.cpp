@@ -290,7 +290,7 @@ static void render_chart(const std::string& path) {
 #include "material_transport_regressions.inl"
 
 int main(int argc, char** argv) {
-    check_bsdf(); check_geometry(); check_transport(); check_dielectric_sun(); check_subsurface_transport();
+    check_bsdf(); check_geometry(); check_transport(); check_dielectric_sun(); check_subsurface_transport(); check_unreal_subsurface_transport();
     if (argc > 1) render_chart(argv[1]);
     if (argc > 2 && std::string(argv[2]) == "--materials")
         render_material_transport_samples(std::filesystem::path(argv[1]).parent_path());

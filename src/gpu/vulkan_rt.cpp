@@ -664,7 +664,8 @@ configuration configure(const camera& cam, const renderer& settings, const snaps
     double radius = cam.focus_dist * std::tan(degrees_to_radians(cam.defocus_angle) / 2);
     c.defocusU = pack(radius * u);
     c.defocusV = pack(radius * v);
-    c.background = pack(cam.background);
+    c.background = pack(cam.background,float(scene.instances.size()));
+    if(std::getenv("DUSK_GPU_NO_SPHERE_NEE")) c.background.w=0;
     c.sunDirection = pack(safe_unit_vector(cam.sun_dir), float(cam.sun_solid_angle()));
     c.sunRadiance = pack(cam.sun_radiance, cam.use_sun ? 1.f : 0.f);
     c.image = {cam.image_width, cam.image_height, cam.samples_per_pixel, cam.max_depth};
@@ -679,7 +680,7 @@ configuration configure(const camera& cam, const renderer& settings, const snaps
     const bool caustic_risk = cam.use_sun && std::any_of(scene.materials.begin(),scene.materials.end(),
         [](const material_record& material) { return int(material.base.w)==2; });
     const bool subsurface_risk=std::any_of(scene.materials.begin(),scene.materials.end(),
-        [](const material_record& material) { return material.subsurface.x>0; });
+        [](const material_record& material) { return material.subsurface.x>0 || material.specular_lobes.w>0; });
     c.adaptive = {float(std::max(caustic_risk ? 256 : subsurface_risk ? 128 : 2, settings.adaptive_min_samples)),
                   float(std::max(1, settings.adaptive_check_interval)),
                   float(settings.adaptive_rel_threshold), float(settings.adaptive_abs_threshold)};
@@ -1168,6 +1169,9 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
         status("Tracing on GPU...");
     }
     constexpr int tile = 256;
+    int tile_group = 4;
+    if(const char* override_tiles=std::getenv("DUSK_GPU_TILE_GROUP"))
+        tile_group=std::clamp(std::atoi(override_tiles),1,16);
     // Keep at most three submissions in flight. GPU timestamps tune sample
     // batches toward short dispatches without changing per-pixel RNG sequences.
     int batch_samples = 4;
@@ -1254,13 +1258,13 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
     int next_convergence_check = std::max(16, settings.adaptive_min_samples);
     for (int sample = 0; sample < cam.samples_per_pixel && !stop;) {
         const int samples = std::min(batch_samples, cam.samples_per_pixel - sample);
-        for (int y = 0; y < cam.image_height && !stop; y += tile) {
-            for (int x = 0; x < cam.image_width; x += tile) {
+        for (int first_tile = 0; first_tile < columns*rows && !stop; first_tile += tile_group) {
+                const int tiles=std::min(tile_group,columns*rows-first_tile);
                 if (cancelled()) {
                     stop = true;
                     break;
                 }
-                c.enqueue(samples, [&](VkCommandBuffer cmd) {
+                c.enqueue(samples*tiles, [&](VkCommandBuffer cmd) {
                     c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1268,13 +1272,14 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                     c.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
                     c.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipelineLayout, 0, 1,
                                               &descriptor, 0, nullptr);
-                    uint32_t constants[] = {uint32_t(sample), uint32_t(x), uint32_t(y), uint32_t(samples)};
+                    // Z workgroups cover independent tiles in one dispatch;
+                    // there is no barrier or host wait between these blocks.
+                    uint32_t constants[] = {uint32_t(sample), uint32_t(first_tile), UINT32_MAX, uint32_t(samples)};
                     c.vkCmdPushConstants(cmd, c.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                          sizeof(constants), constants);
-                    c.vkCmdDispatch(cmd, (std::min(tile, cam.image_width - x) + 7) / 8,
-                                    (std::min(tile, cam.image_height - y) + 7) / 8, 1);
+                    c.vkCmdDispatch(cmd, tile/8, tile/8, tiles);
                 });
-                completed += samples;
+                completed += samples*tiles;
                 auto now = clock::now();
                 double elapsed = std::chrono::duration<double>(now - start).count();
                 if (progress) {
@@ -1286,7 +1291,6 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
                     callback(read(false));
                     lastReadback = clock::now();
                 }
-            }
         }
         if (!fixed_batch && c.submission_ms > 0) {
             if (c.submission_ms < 2) batch_samples = std::min(16, batch_samples * 2);

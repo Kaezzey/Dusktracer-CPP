@@ -34,7 +34,8 @@ struct Instance {
     ivec4 data;
 };
 struct Material {
-    vec4 base, parameters, f0, emission, alpha, subsurface, scatterTint;
+    vec4 base, parameters, f0, emission, alpha, subsurface, scatterTint, subsurfaceDistances;
+    vec4 subsurfaceColour, specularLobes, profileTint;
     ivec4 programs[5];
 };
 struct Instruction {
@@ -423,6 +424,24 @@ float visibility(vec3 origin, vec3 direction, float maxT) {
     return 0;
 }
 
+// Light crossing the receiver's own body to a back-facing direction, as on
+// the CPU: thickness to its surface nearest the light, other blockers by opacity.
+float bodyVisibility(Hit receiver, vec3 origin, vec3 direction, float maxT, float distance) {
+    float other = 1, thickness = 0, minT = .001;
+    Hit hit;
+    for (int i = 0; i < 1024 && minT < maxT && traceRange(origin, direction, minT, maxT, hit); ++i) {
+        if (hit.instance == receiver.instance && hit.material == receiver.material) {
+            thickness = hit.distance;
+        } else {
+            other *= 1 - opacity(hit);
+            if (other <= 1e-6) {
+                return 0;
+            }
+        }
+        minT = hit.distance + .001;
+    }
+    return other * exp(-thickness / distance);
+}
 float diffusionProfile(float radius,float distance) {
     radius=max(radius,1e-12);
     return (exp(-radius/distance)+exp(-radius/(3*distance)))/(8*PI*distance*radius);
@@ -451,9 +470,12 @@ int projectionHits(Hit exitHit,mat3 axes,int axis,vec3 center,float extent,bool 
 }
 bool sampleSubsurface(Hit exitHit,vec3 base,out Hit entry,out vec3 weight) {
     Material m=materials[exitHit.material];
-    float distance=m.subsurface.y,extent=30*distance,selection=random();
+    vec3 distances=max(m.subsurfaceDistances.rgb,vec3(1e-6));
+    float extent=30*max(distances.x,max(distances.y,distances.z)),selection=random();
     mat3 axes=frame(exitHit.g);
     int axis=selection<.5?2:selection<.75?0:1;
+    float channelU=axis==2?2*selection:axis==0?4*(selection-.5):4*(selection-.75);
+    float distance=distances[clamp(int(3*channelU),0,2)];
     float u=random();
     float radius=u<.25?-distance*log(max(1e-8,1-4*u)):-3*distance*log(max(1e-8,1-(u-.25)/.75));
     if(radius>=extent) return false; // The same truncated tail as the CPU is absorption.
@@ -466,16 +488,23 @@ bool sampleSubsurface(Hit exitHit,vec3 base,out Hit entry,out vec3 weight) {
         vec3 projected=entry.p-dot(delta,axes[a])*axes[a];
         Hit ignored;
         int count=a==axis?found:projectionHits(exitHit,axes,a,projected,extent,false,ignored);
-        if(count>0) pdf+=(a==2?.5:.25)*diffusionProfile(length(projected-exitHit.p),distance)*abs(dot(entry.g,axes[a]))/count;
+        if(count>0) {
+            float r=length(projected-exitHit.p);
+            float mixture=(diffusionProfile(r,distances.x)+diffusionProfile(r,distances.y)+diffusionProfile(r,distances.z))/3;
+            pdf+=(a==2?.5:.25)*mixture*abs(dot(entry.g,axes[a]))/count;
+        }
     }
     if(pdf<=0 || isnan(pdf) || isinf(pdf)) return false;
-    vec3 tint=m.scatterTint.w!=0?clamp(finiteColour(m.scatterTint.rgb),0,1):base;
-    weight=tint*(diffusionProfile(length(delta),distance)*opacity(entry)/pdf);
+    vec3 tint=m.scatterTint.w!=0?clamp(finiteColour(m.scatterTint.rgb),0,1):base*clamp(finiteColour(m.profileTint.rgb),0,1);
+    float r=length(delta);
+    weight=tint*vec3(diffusionProfile(r,distances.x),diffusionProfile(r,distances.y),diffusionProfile(r,distances.z))*(opacity(entry)/pdf);
     return true;
 }
 struct Surface {
-    vec3 base, f0, n, g;
+    vec3 base, f0, n, g, transmission, ambient;
     float metal, alpha, q, subsurface, entryIOR, entryNormalization;
+    // Dual specular lobes, Unreal Subsurface transmission, ambient lobe and body extinction.
+    float alpha1, alphaMean, lobeMix, ambientProbability, opacity, bodyDistance;
     bool deltaSurface;
     int model;
 };
@@ -501,6 +530,27 @@ Surface prepare(Hit h, Value base) {
     }
     s.f0 = mix(clamp(m.f0.rgb, 0, 1), s.base, s.metal);
     s.alpha = rough * rough;
+    s.alpha1 = s.alpha;
+    s.alphaMean = s.alpha;
+    s.lobeMix = s.model == MODEL_PBR ? clamp(m.specularLobes.z, 0, 1) : 0;
+    if (s.lobeMix > 0) {
+        float r0 = clamp(rough * m.specularLobes.x, .02, 1), r1 = clamp(rough * m.specularLobes.y, .02, 1);
+        float mean = r0 + (r1 - r0) * s.lobeMix;
+        s.alpha = r0 * r0;
+        s.alpha1 = r1 * r1;
+        s.alphaMean = mean * mean;
+    }
+    s.bodyDistance = s.model == MODEL_PBR ? m.specularLobes.w : 0;
+    s.transmission = s.bodyDistance > 0 ? clamp(finiteColour(m.subsurfaceColour.rgb), 0, 1) : vec3(0);
+    if (m.profileTint.w > 0) {
+        s.transmission *= s.base;
+    }
+    // Unreal treats Subsurface Color as extra diffuse for indirect light,
+    // kept within unit albedo as on the CPU (pbr_material::unreal_ambient).
+    s.ambient = clamp(min(s.transmission, 1 - (1 - s.metal) * s.base), 0, 1);
+    float ambientWeight = clamp(luminance(s.ambient), 0, 1);
+    s.ambientProbability = ambientWeight / (1 + ambientWeight);
+    s.opacity = clamp(m.subsurfaceColour.w, 0, 1);
     s.deltaSurface = s.alpha < 1e-4;
     s.q = s.metal >= 1 ? 1 : clamp(max(s.f0.x, max(s.f0.y, s.f0.z)), .05, .98);
     s.n = h.n;
@@ -543,6 +593,16 @@ float entryTransmission(float cosine,float eta) {
     float rs=(cosine-eta*transmitted)/(cosine+eta*transmitted);
     return 1-.5*(rp*rp+rs*rs);
 }
+float specularD(Surface s, vec3 h) {
+    float d = D(s.n, h, s.alpha);
+    return s.lobeMix > 0 ? d + (D(s.n, h, s.alpha1) - d) * s.lobeMix : d;
+}
+// Unreal Subsurface wrap/back-scatter/in-scatter term; see sss::unreal_transmission.
+float unrealTransmission(float nh, float back, float opacity) {
+    float inScatter = pow(clamp(back, 0, 1), 12) * (3 + (.1 - 3) * opacity);
+    float backScatter = clamp(nh * opacity + 1 - opacity, 0, 1) / (2 * PI);
+    return backScatter + (1 - backScatter) * inScatter;
+}
 bool above(Surface s, vec3 v, vec3 l) {
     return dot(s.g, v) > 0 && dot(s.g, l) > 0 && dot(s.n, v) > 0 && dot(s.n, l) > 0;
 }
@@ -555,18 +615,29 @@ vec3 directBSDF(Surface s, vec3 v, vec3 l) {
     if (s.model == MODEL_LAMBERT) {
         return s.base * nl / PI;
     }
-    if (s.model != MODEL_PBR || !above(s, v, l)) {
+    if (s.model != MODEL_PBR) {
         return vec3(0);
     }
-    float nv = clamp(dot(s.n, v), 0, 1);
-    nl = clamp(nl, 0, 1);
-    vec3 f = s.base * ((1 - s.metal)*(1-s.subsurface) / PI) * (1 - fresnel(nv, s.f0)) * (1 - fresnel(nl, s.f0));
-    if (!s.deltaSurface) {
-        vec3 h = safeNormal(v + l, s.n);
-        float vis = .5 / (nl * smithRoot(nv, s.alpha) + nv * smithRoot(nl, s.alpha));
-        f += fresnel(dot(v, h), s.f0) * D(s.n, h, s.alpha) * vis;
+    vec3 result = vec3(0);
+    if (above(s, v, l)) {
+        float nv = clamp(dot(s.n, v), 0, 1);
+        nl = clamp(nl, 0, 1);
+        vec3 f = s.base * ((1 - s.metal)*(1-s.subsurface) / PI) * (1 - fresnel(nv, s.f0)) * (1 - fresnel(nl, s.f0));
+        if (!s.deltaSurface) {
+            vec3 h = safeNormal(v + l, s.n);
+            float vis = .5 / (nl * smithRoot(nv, s.alphaMean) + nv * smithRoot(nl, s.alphaMean));
+            f += fresnel(dot(v, h), s.f0) * specularD(s, h) * vis;
+        }
+        result = f * nl;
     }
-    return f * nl;
+    return result;
+}
+// Direct-light-only Unreal Subsurface transmission, geometry term included.
+vec3 transmissionBSDF(Surface s, vec3 v, vec3 l) {
+    if (s.model != MODEL_PBR || s.bodyDistance <= 0 || dot(s.g, v) <= 0 || dot(s.n, v) <= 0) {
+        return vec3(0);
+    }
+    return s.transmission * unrealTransmission(dot(s.n, safeNormal(v + l, s.n)), -dot(l, v), s.opacity);
 }
 float bsdfPDF(Surface s, vec3 v, vec3 l) {
     if (s.model == MODEL_ISOTROPIC) {
@@ -575,12 +646,20 @@ float bsdfPDF(Surface s, vec3 v, vec3 l) {
     if (s.model == MODEL_LAMBERT || s.model==MODEL_SUBSURFACE_ENTRY) {
         return max(0, dot(s.n, l)) / PI;
     }
-    if (s.model != MODEL_PBR || !above(s, v, l)) {
+    if (s.model != MODEL_PBR || dot(s.g, v) <= 0 || dot(s.n, v) <= 0) {
         return 0;
     }
-    float nv = dot(s.n, v), nl = dot(s.n, l), pdf = (1 - s.q)*(1-s.subsurface) * nl / PI;
-    if (!s.deltaSurface) {
-        pdf += s.q * D(s.n, safeNormal(v + l, s.n), s.alpha) * G1(nv, s.alpha) / (4 * nv);
+    float pdf = 0;
+    if (above(s, v, l)) {
+        float nv = dot(s.n, v), nl = dot(s.n, l);
+        pdf = (1 - s.q)*(1-s.subsurface) * nl / PI;
+        if (!s.deltaSurface) {
+            vec3 h = safeNormal(v + l, s.n);
+            float lobe = D(s.n, h, s.alpha) * G1(nv, s.alpha);
+            if (s.lobeMix > 0) lobe += (D(s.n, h, s.alpha1) * G1(nv, s.alpha1) - lobe) * s.lobeMix;
+            pdf += s.q * lobe / (4 * nv);
+        }
+        pdf *= 1 - s.ambientProbability;
     }
     return pdf;
 }
@@ -594,10 +673,11 @@ vec3 visibleNormal(vec3 v, float a) {
     return normalize(vec3(a * n.xy, max(0, n.z)));
 }
 bool scatter(Surface s, Hit hit, vec3 view, out vec3 direction, out vec3 weight, out float pdf,
-             out bool delta, out bool subsurface) {
+             out bool delta, out bool subsurface, out bool indirectOnly) {
     Material m = materials[hit.material];
     delta = false;
     subsurface = false;
+    indirectOnly = false;
     pdf = 0;
     weight = vec3(0);
     if (s.model == MODEL_EMISSION) {
@@ -643,14 +723,24 @@ bool scatter(Surface s, Hit hit, vec3 view, out vec3 direction, out vec3 weight,
         weight=(1-fresnel(dot(view,s.n),s.f0))*((1-s.metal)*s.subsurface/probability);
         return true;
     }
-    if (lobe < s.q) {
+    float ambient = s.ambientProbability, specular = (1 - ambient) * s.q;
+    if (ambient > 0 && lobe >= 1 - ambient) {
+        // Indirect-only Lambert lobe; direct light uses transmissionBSDF instead.
+        direction = basis * cosineHemisphere();
+        pdf = ambient * max(0, dot(s.n, direction)) / PI;
+        weight = s.ambient / ambient;
+        indirectOnly = true;
+        return above(s, view, direction);
+    }
+    if (lobe < specular) {
         if (s.deltaSurface) {
             direction = reflect(-view, s.n);
-            weight = fresnel(dot(view, s.n), s.f0) / s.q;
+            weight = fresnel(dot(view, s.n), s.f0) / specular;
             delta = true;
             return above(s, view, direction);
         }
-        direction = reflect(-view, basis * visibleNormal(transpose(basis) * view, s.alpha));
+        float a = s.lobeMix > 0 && lobe < specular * s.lobeMix ? s.alpha1 : s.alpha;
+        direction = reflect(-view, basis * visibleNormal(transpose(basis) * view, a));
     } else {
         direction = basis * cosineHemisphere();
     }
@@ -710,14 +800,105 @@ float emitterPDF(Hit h, vec3 origin, vec3 direction) {
 }
 vec3 lightContribution(Hit hit, Surface s, vec3 view, vec3 direction, vec3 radiance, float maxT, float weight,
                        float mis) {
-    vec3 bsdf = directBSDF(s, view, direction);
+    // Transmission has no BSDF-sampled counterpart, so it takes no MIS weight.
+    vec3 bsdf = directBSDF(s, view, direction) * mis + transmissionBSDF(s, view, direction);
     if (all(equal(bsdf, vec3(0)))) {
         return vec3(0);
     }
-    vec3 origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
-    return bsdf * radiance * (weight * mis * visibility(origin, direction, maxT));
+    bool behind = dot(direction, hit.g) < 0;
+    vec3 origin = hit.p + hit.g * (behind ? -.001 : .001);
+    float visible = behind && s.model == MODEL_PBR && s.bodyDistance > 0
+        ? bodyVisibility(hit, origin, direction, maxT, s.bodyDistance) : visibility(origin, direction, maxT);
+    return bsdf * radiance * (weight * visible);
 }
-vec3 directLighting(Hit hit, Surface s, vec3 view) {
+bool sphereLens(int id,out vec3 center,out float radius,out float eta) {
+    Instance inst=instances[id];
+    if(geometries[inst.data.x].w==0) return false;
+    Material m=materials[materialMaps[inst.data.y]];
+    if(int(m.base.w)!=MODEL_GLASS || m.parameters.w<1) return false;
+    mat3 linear=instanceMatrix(inst);
+    vec3 lengths=vec3(length(linear[0]),length(linear[1]),length(linear[2]));
+    if(abs(lengths.x-lengths.y)>1e-5*lengths.x || abs(lengths.x-lengths.z)>1e-5*lengths.x) return false;
+    center=vec3(inst.rows[0].w,inst.rows[1].w,inst.rows[2].w); radius=lengths.x; eta=m.parameters.w;
+    return radius>0;
+}
+float lensAngle(float theta,float k,float eta) {
+    float b=clamp(k*sin(theta),-1,1);
+    return theta-2*(asin(b)-asin(b/eta));
+}
+float lensDerivative(float theta,float k,float eta) {
+    float b=k*sin(theta);
+    return 1-2*k*cos(theta)*(inversesqrt(max(1e-12,1-b*b))-inversesqrt(max(1e-12,1-b*b/(eta*eta)))/eta);
+}
+vec2 lensMeasure(float theta,float k,float eta) {
+    float derivative=lensDerivative(theta,k,eta);
+    float jacobian=abs(theta)<1e-6?derivative*derivative:abs(sin(lensAngle(theta,k,eta))/sin(theta)*derivative);
+    float b=k*sin(theta),ci=sqrt(max(0,1-b*b)),ct=sqrt(max(0,1-b*b/(eta*eta)));
+    float rp=(ci-eta*ct)/(ci+eta*ct),rs=(eta*ci-ct)/(eta*ci+ct);
+    float transmission=1-.5*(rp*rp+rs*rs);
+    return vec2(jacobian,transmission*transmission);
+}
+bool lensIntersection(vec3 origin,vec3 direction,int instance,out Hit hit,out float transmittance) {
+    float minimum=.001; transmittance=1;
+    for(int step=0;step<1024 && traceRange(origin,direction,minimum,1e30,hit);++step) {
+        if(hit.instance==instance) return true;
+        transmittance*=1-opacity(hit);
+        if(transmittance<=0) break;
+        minimum=hit.distance+max(1e-6,abs(hit.distance)*4.7683716e-7);
+    }
+    return false;
+}
+vec3 sphereSunLighting(Hit hit,Surface s,vec3 view,vec3 target,int samples) {
+    if(cfg.options.x==0 || samples==0 || s.model==MODEL_GLASS || s.model==MODEL_EMISSION || s.model==MODEL_METAL) return vec3(0);
+    vec3 result=vec3(0),origin=hit.p+.001*hit.g;
+    for(int id=0;id<int(cfg.background.w);++id) {
+        vec3 center; float radius,eta;
+        if(!sphereLens(id,center,radius,eta)) continue;
+        vec3 offset=center-origin; float distance=length(offset),k=distance/radius;
+        if(k<=1) continue;
+        vec3 axial=offset/distance,tangent=safeNormal(target-dot(target,axial)*axial,frame(axial)[0]);
+        float goal=atan(dot(target,tangent),dot(target,axial));
+        float limit=asin(1/k)*(1-1e-5),split=0;
+        if(lensDerivative(0,k,eta)>0 && lensDerivative(limit,k,eta)<0) {
+            float lo=0,hi=limit;
+            for(int i=0;i<20;++i) {float mid=(lo+hi)*.5;if(lensDerivative(mid,k,eta)>0) lo=mid;else hi=mid;}
+            split=(lo+hi)*.5;
+        }
+        float ends[4]=float[4](-limit,-split,split,limit),last=-10;
+        for(int segment=0;segment<3;++segment) {
+            float lo=ends[segment],hi=ends[segment+1],a=lensAngle(lo,k,eta)-goal,b=lensAngle(hi,k,eta)-goal;
+            if(hi-lo<1e-8 || a*b>0) continue;
+            for(int i=0;i<22;++i) {float mid=(lo+hi)*.5,c=lensAngle(mid,k,eta)-goal;if((a<0)==(c<0)) {lo=mid;a=c;} else hi=mid;}
+            float theta=(lo+hi)*.5;
+            if(abs(theta-last)<1e-6) continue;
+            last=theta;
+            vec2 measure=lensMeasure(theta,k,eta);
+            if(measure.x<=1e-20 || measure.y<=0) continue;
+            vec3 direction=cos(theta)*axial+sin(theta)*tangent;
+            if(dot(direction,hit.g)<0) continue;
+            vec3 f=directBSDF(s,view,direction);
+            if(all(equal(f,vec3(0)))) continue;
+            Hit entry,exit;
+            float before,within;
+            if(!lensIntersection(origin,direction,id,entry,before) || !entry.front) continue;
+            vec3 inside=refract(direction,entry.g,1/eta);
+            if(!lensIntersection(entry.p+.001*inside,inside,id,exit,within) || exit.front) continue;
+            vec3 outgoing=refract(inside,exit.g,eta);
+            // Solid-angle Jacobian converts the uniform sun-disc proposal to
+            // the receiver direction. Fresnel factors belong in both its
+            // throughput and the competing BSDF-chain probability.
+            float lightPDF=measure.x/cfg.sunDirection.w;
+            float mis=powerWeight(samples*lightPDF,bsdfPDF(s,view,direction)*measure.y);
+            Material entryMaterial=materials[entry.material],exitMaterial=materials[exit.material];
+            vec3 tint=channelValue(baseRoot(entryMaterial,entry.uv),entryMaterial.programs[0].w).colour.rgb*
+                channelValue(baseRoot(exitMaterial,exit.uv),exitMaterial.programs[0].w).colour.rgb;
+            result+=f*cfg.sunRadiance.rgb*tint*(measure.y*mis*before*within*visibility(exit.p+.001*outgoing,outgoing,1e30)/(samples*measure.x));
+        }
+    }
+    return result;
+}
+vec3 directLighting(Hit hit, Surface s, vec3 view,int remainingDepth,out vec3 caustic) {
+    caustic=vec3(0);
     int count=max(0,cfg.counts.z),sunSamples=count>0?max(1,cfg.counts.w):0;
         vec3 direct = vec3(0);
         if (cfg.sunRadiance.w != 0) {
@@ -728,14 +909,18 @@ vec3 directLighting(Hit hit, Surface s, vec3 view) {
                 vec3 l = cfg.sunDirection.xyz;
                 float mis = 1;
                 if (omega > 1e-12) {
-                    float z = 1 - random() * omega / (2 * PI), phi = 2 * PI * random(),
-                          r = sqrt(max(0, 1 - z * z));
+                    // Avoid subtracting nearly equal FP32 values for a small
+                    // physical sun: otherwise samples collapse onto its axis.
+                    float q = random() * omega / (2 * PI), z = 1-q, phi = 2 * PI * random(),
+                          r = sqrt(max(0, q * (2-q)));
                     l = basis * vec3(r * cos(phi), r * sin(phi), z);
                     if (cfg.options.x != 0) {
                         mis = powerWeight(samples / omega, bsdfPDF(s, view, l));
                     }
                 }
                 direct += lightContribution(hit, s, view, l, cfg.sunRadiance.rgb, 1e30, 1.0 / samples, mis);
+                int causticSamples=min(2,samples);
+                if(remainingDepth>=3 && j<causticSamples) caustic+=sphereSunLighting(hit,s,view,l,causticSamples);
             }
         }
         // Power-weighted selection reduces noise for uneven light intensities.
@@ -807,6 +992,11 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, ou
     bool indirectPath = false;
     float prevPDF = 0;
     bool prevDelta = true;
+    vec3 lensOrigin=origin,lensDirection=direction;
+    float lensPDF=0; vec2 lensDensity=vec2(0);
+    int lensInstance=-1,lensStage=0;
+    // Light reached by an ambient-only sample was counted by light sampling.
+    bool prevIndirectOnly = false;
     albedo = vec3(0);
     normal = vec3(0);
     int nulls = 0, count = max(0, cfg.counts.z), sunSamples = count > 0 ? max(1, cfg.counts.w) : 0;
@@ -816,7 +1006,8 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, ou
             vec3 contribution = throughput * cfg.background.rgb;
             float pdf = sunPDF(direction);
             if (pdf > 0) {
-                contribution += throughput * cfg.sunRadiance.rgb * pdf * hitWeight(prevPDF, pdf, sunSamples, prevDelta);
+                float mis=prevIndirectOnly?0:lensStage==2 && lensDensity.x>0?powerWeight(lensPDF*lensDensity.y,min(2,sunSamples)*lensDensity.x*pdf):hitWeight(prevPDF,pdf,sunSamples,prevDelta);
+                contribution += throughput * cfg.sunRadiance.rgb * pdf * mis;
             }
             result += contribution;
             if(indirectPath) indirect += contribution;
@@ -841,7 +1032,7 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, ou
         }
         if (s.model == MODEL_EMISSION) {
             vec3 emitted = (material.programs[0].y > 0 ? s.base : material.emission.rgb) * material.emission.w;
-            vec3 contribution = throughput * emitted * hitWeight(prevPDF, emitterPDF(hit, previous, direction), count, prevDelta);
+            vec3 contribution = prevIndirectOnly ? vec3(0) : throughput * emitted * hitWeight(prevPDF, emitterPDF(hit, previous, direction), count, prevDelta);
             result += contribution;
             if(indirectPath) indirect += contribution;
             break;
@@ -849,23 +1040,25 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, ou
         if (depth == cfg.image.w) {
             break;
         }
-        vec3 direct=directLighting(hit,s,view);
-        result += throughput * direct;
+        vec3 caustic;
+        vec3 direct=directLighting(hit,s,view,cfg.image.w-depth,caustic);
+        result += throughput * (direct+caustic);
         if(indirectPath) indirect += throughput * direct;
         vec3 weight, next;
         float pdf;
-        bool delta,subsurface;
-        if (!scatter(s, hit, view, next, weight, pdf, delta,subsurface)) {
+        bool delta,subsurface,indirectOnly;
+        if (!scatter(s, hit, view, next, weight, pdf, delta,subsurface,indirectOnly)) {
             break;
         }
+        prevIndirectOnly = indirectOnly;
         if(subsurface) {
             Hit entry; vec3 spatialWeight;
             if(!sampleSubsurface(hit,s.base,entry,spatialWeight)) break;
             throughput *= weight*spatialWeight;
             hit=entry;
             s.model=MODEL_SUBSURFACE_ENTRY; s.n=entry.g; s.g=entry.g;
-            direct=directLighting(entry,s,entry.g);
-            result += throughput*direct;
+            direct=directLighting(entry,s,entry.g,cfg.image.w-depth,caustic);
+            result += throughput*(direct+caustic);
             indirect += throughput*direct;
             indirectPath=true;
             next=frame(entry.g)*cosineHemisphere();
@@ -875,12 +1068,29 @@ vec3 pathTrace(vec3 origin, vec3 direction, out vec3 albedo, out vec3 normal, ou
             delta=false;
         }
         previous = hit.p;
+        if(!delta) {
+            lensOrigin=hit.p+.001*hit.g; lensDirection=normalize(next);
+            lensPDF=dot(lensDirection,hit.g)>=0 && !indirectOnly?pdf:0; lensStage=0; lensInstance=-1;
+        } else if(s.model==MODEL_GLASS && dot(next,hit.g)<0 && cfg.options.x!=0 && sunSamples>0 && lensPDF>0 && cfg.background.w>0) {
+            if(lensStage==0 && hit.front) {
+                vec3 center; float radius,eta;
+                lensStage=-1;
+                if(sphereLens(hit.instance,center,radius,eta)) {
+                    vec3 offset=center-lensOrigin; float k=length(offset)/radius;
+                    float theta=acos(clamp(dot(lensDirection,normalize(offset)),-1,1));
+                    if(k>1 && theta<asin(1/k)*(1-1e-5)) {
+                        lensDensity=lensMeasure(theta,k,eta); lensStage=1; lensInstance=hit.instance;
+                    }
+                }
+            } else if(lensStage==1 && !hit.front && hit.instance==lensInstance) lensStage=2;
+            else lensStage=-1;
+        } else {lensStage=-1;lensPDF=0;}
         prevPDF = pdf;
         prevDelta = delta;
         indirectPath = indirectPath || !delta || (s.model==MODEL_METAL && material.f0.w>0);
         throughput *= weight;
         direction = normalize(next);
-        origin = hit.p + hit.g * (dot(direction, hit.g) >= 0 ? .001 : -.001);
+        origin = hit.p + .001*(s.model==MODEL_GLASS?direction:hit.g*(dot(direction, hit.g) >= 0 ? 1 : -1));
         if (depth >= 8) {
             float survival = clamp(max(throughput.x, max(throughput.y, throughput.z)), .05, .95);
             if (random() >= survival) {
@@ -933,6 +1143,11 @@ float pixelHash(uint x, uint y) {
 }
 void main() {
     uvec2 pixel = gl_GlobalInvocationID.xy + uvec2(dispatch.offsetX, dispatch.offsetY);
+    if(dispatch.sampleCount>0 && dispatch.offsetY==0xffffffffu) {
+        uint columns=(uint(cfg.image.x)+255u)/256u;
+        uint tile=dispatch.offsetX+gl_WorkGroupID.z;
+        pixel=gl_GlobalInvocationID.xy+256u*uvec2(tile%columns,tile/columns);
+    }
     if (any(greaterThanEqual(pixel, uvec2(cfg.image.xy)))) {
         return;
     }

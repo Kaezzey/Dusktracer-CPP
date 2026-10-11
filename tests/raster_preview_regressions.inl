@@ -112,6 +112,33 @@ static void check_raster_graph() {
     auto cutout = raster_image();
     check(cutout[(128 * 256 + 128) * 4] < 20, "opacity graph cuts out raster geometry");
 }
+// Inspector texture slots without a node graph: scalar maps must reach the
+// viewport and the Vulkan compiler, as they reach the CPU material.
+static void check_raster_legacy_scalar_textures() {
+    raster_reset();
+    const unsigned char grey[] = {100, 100, 100, 100};
+    check(stbi_write_png("legacy-roughness.png", 2, 2, 1, grey, 2) != 0, "write scalar map fixture");
+    g_scene.textures.push_back({"Roughness", "legacy-roughness.png"});
+    scene_material material;
+    material.model = scene_material_model::pbr;
+    material.metallic_tex = material.roughness_tex = 0;
+    g_scene.materials.push_back(material);
+    scene_object cube;
+    cube.type = scene_object_type::cube;
+    cube.material_index = 0;
+    cube.scale = vec3(2, 2, .1);
+    g_scene.objects.push_back(cube);
+    std::vector<dusk_gpu::instruction> instructions;
+    auto record = dusk_gpu::compile_material(g_scene, material,
+                                             [](const graph_node& node) { return node.texture_index; }, instructions);
+    check(record.programs[1].y > 0 && record.programs[2].y > 0,
+          "inspector metallic and roughness maps compile for the viewport and Vulkan");
+    raster_preview::debug_view = 4;
+    raster_wait_textures();
+    auto pixels = raster_image();
+    raster_preview::debug_view = 0;
+    check(std::abs(int(pixels[(128 * 256 + 128) * 4]) - 100) <= 1, "the viewport reads inspector roughness maps");
+}
 static void check_raster_mesh_slots() {
     raster_reset();
     std::ofstream("slots.mtl") << "newmtl Left\nKd 1 0 0\nnewmtl Right\nKd 0 1 0\n";
@@ -319,6 +346,7 @@ static void raster_production_scene(const char* root) {
     std::printf("RASTER warm 1024x1024: mean %.3f ms, p95 %.3f ms (30 completed GPU frames)\n",
                 total / times.size(), times[28]);
 }
+#include "raster_subsurface_parity.inl"
 static int run_raster_checks(const char* project) {
     check(glfwInit() != 0, "raster GLFW init");
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
@@ -337,8 +365,10 @@ static int run_raster_checks(const char* project) {
     glGetProgramiv(raster_preview::shadow_program.id, GL_LINK_STATUS, &linked);
     check(linked == GL_TRUE, "masked shadow shader compiles and links");
     check_raster_graph();
+    check_raster_legacy_scalar_textures();
     check_raster_mesh_slots();
     check_raster_shadows();
+    subsurface_parity::run();
     if (project) {
         raster_production_scene(project);
     }

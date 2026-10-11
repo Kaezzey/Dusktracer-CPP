@@ -50,9 +50,15 @@ static int run_project_checks() {
     m.sss_model = 4;
     m.sss_samples = 7;
     m.sss_radius = 2.1;
+    m.sss_profile=1; m.sss_radius_rgb=vec3(1,.372,.186);
     m.sss_eta = 1.33;
     m.sss_color_override_enabled = true;
     m.sss_color_override_color = vec3(.1, .2, .3);
+    m.sss_shading = sss_shading_unreal_profile;
+    m.sss_subsurface_color = vec3(.9, .3, .2); m.sss_opacity = .27; m.sss_transmission_distance = .013;
+    m.sss_surface_albedo = vec3(.8, .5, .3); m.sss_mfp_color = vec3(1, .4, .1); m.sss_mfp_mm = 2.5;
+    m.sss_units_per_metre = 100; m.sss_profile_tint = vec3(.9, .8, .7);
+    m.sss_lobe_roughness0 = .6; m.sss_lobe_roughness1 = 1.4; m.sss_lobe_mix = .2;
     m.unreal_pbr = true;
     m.normal_strength = .75;
     m.alpha_double_sided = false;
@@ -157,12 +163,46 @@ static int run_project_checks() {
           "texture library and explicit graph path share the same packed file");
     auto before = read(first / "Scene.dusk");
     check(!loaded.render_settings.gpu_firefly_filter,"persist GPU firefly setting");
+    check(loaded.world.materials[0].sss_profile==1 && (loaded.world.materials[0].sss_radius_rgb-m.sss_radius_rgb).length_squared()==0,"persist RGB skin scattering profile");
+    {
+        const auto& p = loaded.world.materials[0];
+        auto same = [](const vec3& a, const vec3& b) { return (a - b).length_squared() == 0; };
+        check(p.sss_shading == m.sss_shading && same(p.sss_subsurface_color, m.sss_subsurface_color) &&
+              p.sss_opacity == m.sss_opacity && p.sss_transmission_distance == m.sss_transmission_distance &&
+              same(p.sss_surface_albedo, m.sss_surface_albedo) && same(p.sss_mfp_color, m.sss_mfp_color) &&
+              p.sss_mfp_mm == m.sss_mfp_mm && p.sss_units_per_metre == m.sss_units_per_metre &&
+              same(p.sss_profile_tint, m.sss_profile_tint) && p.sss_lobe_roughness0 == m.sss_lobe_roughness0 &&
+              p.sss_lobe_roughness1 == m.sss_lobe_roughness1 && p.sss_lobe_mix == m.sss_lobe_mix &&
+              p.sss_color_from_base == m.sss_color_from_base,
+              "persist Unreal Subsurface and Subsurface Profile settings");
+    }
     auto legacy=before;
-    legacy.replace(legacy.find("DUSK_SCENE 2"),12,"DUSK_SCENE 1");
+    legacy.replace(legacy.find("DUSK_SCENE 5"),12,"DUSK_SCENE 4");
+    for(auto at=legacy.find("sss_base_color ");at!=std::string::npos;at=legacy.find("sss_base_color "))
+        legacy.erase(at,legacy.find('\n',at)-at+1);
+    write(first / "VersionFour.dusk",legacy);
+    check(!load(first / "VersionFour.dusk").world.materials[0].sss_color_from_base,
+          "version-four Unreal Subsurface colours are not multiplied by base colour");
+    legacy.replace(legacy.find("DUSK_SCENE 4"),12,"DUSK_SCENE 3");
+    for(auto at=legacy.find("sss_unreal ");at!=std::string::npos;at=legacy.find("sss_unreal "))
+        legacy.erase(at,legacy.find('\n',at)-at+1);
+    write(first / "VersionThree.dusk",legacy);
+    check(load(first / "VersionThree.dusk").world.materials[0].sss_shading==sss_shading_burley,
+          "version-three scenes keep legacy Burley diffusion");
+    legacy.replace(legacy.find("DUSK_SCENE 3"),12,"DUSK_SCENE 1");
+    for(auto at=legacy.find("sss_profile ");at!=std::string::npos;at=legacy.find("sss_profile "))
+        legacy.erase(at,legacy.find('\n',at)-at+1);
+    auto version_two=legacy;
+    version_two.replace(version_two.find("DUSK_SCENE 1"),12,"DUSK_SCENE 2");
+    write(first / "VersionTwo.dusk",version_two);
+    auto older=load(first / "VersionTwo.dusk");
+    check(!older.render_settings.gpu_firefly_filter && (older.world.materials[0].sss_radius_rgb-vec3(1,1,1)).length_squared()==0,
+          "version-two scenes retain GPU settings and neutral diffusion distances");
     auto filter_at=legacy.find("gpu_filter ");
     legacy.erase(filter_at,legacy.find('\n',filter_at)-filter_at+1);
     write(first / "Legacy.dusk",legacy);
     check(load(first / "Legacy.dusk").render_settings.gpu_firefly_filter,"version-one scenes load with firefly suppression enabled");
+    check((load(first / "Legacy.dusk").world.materials[0].sss_radius_rgb-vec3(1,1,1)).length_squared()==0,"legacy scenes preserve neutral scattering distances");
     save(first / "Scene.dusk", inspect(loaded));
     check(read(first / "Scene.dusk") == before, "repeated save is deterministic");
 

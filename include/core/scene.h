@@ -66,9 +66,35 @@ struct scene_material_parameters {
     int    sss_model    = 1;    // 0=None, nonzero=Burley
     int    sss_samples  = 4;
     double sss_radius   = 1.0;
+    // Relative RGB diffusion distances. Skin scatters red farther than blue.
+    vec3 sss_radius_rgb = vec3(1,1,1);
+    int sss_profile = 0; // 0 neutral, 1 skin, 2 custom (editor preset only)
     double sss_eta      = 1.3;
     bool   sss_color_override_enabled = false;
     vec3   sss_color_override_color = vec3(1.0, 1.0, 1.0);
+    // Shading model used when SSS is enabled and sss_model is nonzero.
+    int sss_shading = 0; // sss_shading_model
+    // Unreal "Subsurface": wrap/back-scatter transmission with this colour.
+    // Opacity follows Unreal: 0 wraps light fully around, 1 follows the normal.
+    // Light reaching back faces through the object is attenuated by
+    // exp(-thickness/transmission distance), with distance in scene units.
+    vec3   sss_subsurface_color = vec3(1, 1, 1);
+    // Multiplies the subsurface colour by the (textured) base colour, as when
+    // an Unreal material wires its colour map into Subsurface Color.
+    bool   sss_color_from_base = true;
+    double sss_opacity = .5;
+    double sss_transmission_distance = .5;
+    // Unreal "Subsurface Profile" (Burley parameterization). Distances are
+    // mean free paths in millimetres, converted with scene units per metre.
+    vec3   sss_surface_albedo = vec3(.91058, .338275, .2);
+    vec3   sss_mfp_color = vec3(1, .198863, .0782621);
+    double sss_mfp_mm = 1.2;
+    double sss_units_per_metre = 1;
+    vec3   sss_profile_tint = vec3(1, 1, 1);
+    // Dual specular: lobe roughness = roughness * scale; mix weights lobe 1.
+    double sss_lobe_roughness0 = .75;
+    double sss_lobe_roughness1 = 1.3;
+    double sss_lobe_mix = .85;
     // When true, interpret packed metal/roughness textures using Unreal-style channels
     // (G = roughness, B = metallic) when a combined texture is used.
     bool   unreal_pbr = false;
@@ -91,6 +117,35 @@ struct scene_material_parameters {
 struct scene_material : scene_material_parameters {
     material_graph graph;
 };
+
+enum sss_shading_model {
+    sss_shading_burley = 0,          // legacy spatial Burley diffusion
+    sss_shading_unreal_subsurface = 1,
+    sss_shading_unreal_profile = 2,
+};
+
+// Backend-neutral subsurface description. CPU, Vulkan and the raster viewport
+// all consume this, so the two Unreal models cannot drift between backends.
+struct subsurface_lowered {
+    enum kind { none, diffusion, transmission } mode = none;
+    // Diffusion: fraction of the diffuse substrate replaced by Burley
+    // diffusion with world-space shape distances, entry IOR and a tint that
+    // is either an override or the base colour times tint_scale.
+    double strength = 0;
+    vec3 distances = vec3(1, 1, 1);
+    double eta = 1.3;
+    bool tint_override = false;
+    vec3 tint = vec3(1, 1, 1);
+    vec3 tint_scale = vec3(1, 1, 1);
+    // Specular lobe roughness scales and the weight of lobe 1.
+    double lobe_scale0 = 1, lobe_scale1 = 1, lobe_mix = 0;
+    // Transmission: Unreal Subsurface colour (optionally times base colour),
+    // opacity and extinction length.
+    vec3 color = vec3(0, 0, 0);
+    bool color_from_base = false;
+    double opacity = 1, transmission_distance = 1;
+};
+subsurface_lowered lower_subsurface(const scene_material_parameters& material);
 
 // Convert an editor-facing scene_material into a runtime material*
 // using the scene's texture list (scene.textures[...] indices).

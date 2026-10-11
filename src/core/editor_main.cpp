@@ -1596,7 +1596,19 @@ static void SaveMaterialsManifest()
         out << m.emission_intensity << "|";
         out << m.dielectric_F0.x() << "," << m.dielectric_F0.y() << "," << m.dielectric_F0.z() << "|";
         out << m.normal_strength << "|";
-        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "|" << (m.unreal_pbr?1:0) << "|" << serialize_material_graph(m.graph) << "\n";
+        out << m.albedo_tex << "|" << m.metallic_tex << "|" << m.roughness_tex << "|" << m.normal_tex << "|" << m.alpha_tex << "|" << (m.alpha_double_sided?1:0) << "|" << m.alpha_cutoff << "|" << (m.unreal_pbr?1:0) << "|" << serialize_material_graph(m.graph);
+        auto colour_field = [&](const vec3& c) { out << "|" << c.x() << "," << c.y() << "," << c.z(); };
+        out << "|" << m.sss_profile;
+        colour_field(m.sss_radius_rgb);
+        out << "|" << m.sss_shading;
+        colour_field(m.sss_subsurface_color);
+        out << "|" << m.sss_opacity << "|" << m.sss_transmission_distance;
+        colour_field(m.sss_surface_albedo);
+        colour_field(m.sss_mfp_color);
+        out << "|" << m.sss_mfp_mm << "|" << m.sss_units_per_metre;
+        colour_field(m.sss_profile_tint);
+        out << "|" << m.sss_lobe_roughness0 << "|" << m.sss_lobe_roughness1 << "|" << m.sss_lobe_mix;
+        out << "|" << (m.sss_color_from_base ? 1 : 0) << "\n";
     }
 }
 
@@ -1667,7 +1679,34 @@ static void LoadMaterialsManifest()
         if (idx < toks.size()) m.alpha_cutoff = std::stod(toks[idx++]);
         if (idx < toks.size()) m.unreal_pbr = (std::stoi(toks[idx++]) != 0);
 
-        if (idx < toks.size()) deserialize_material_graph(toks[idx], m.graph);
+        if (idx < toks.size()) deserialize_material_graph(toks[idx++], m.graph);
+        if (idx < toks.size()) m.sss_profile=std::stoi(toks[idx++]);
+        if (idx < toks.size()) {
+            std::stringstream values(toks[idx++]); double red=1,green=1,blue=1; char comma;
+            values >> red >> comma >> green >> comma >> blue;
+            m.sss_radius_rgb=vec3(std::max(1e-6,red),std::max(1e-6,green),std::max(1e-6,blue));
+        }
+        auto colour_field = [&](vec3& value) {
+            if (idx >= toks.size()) return;
+            std::stringstream values(toks[idx++]); double r=value.x(),g=value.y(),b=value.z(); char comma;
+            values >> r >> comma >> g >> comma >> b;
+            value = vec3(r,g,b);
+        };
+        auto number_field = [&](double& value) { if (idx < toks.size()) value = std::stod(toks[idx++]); };
+        if (idx < toks.size()) m.sss_shading = std::clamp(std::stoi(toks[idx++]),0,2);
+        colour_field(m.sss_subsurface_color);
+        number_field(m.sss_opacity);
+        number_field(m.sss_transmission_distance);
+        colour_field(m.sss_surface_albedo);
+        colour_field(m.sss_mfp_color);
+        number_field(m.sss_mfp_mm);
+        number_field(m.sss_units_per_metre);
+        colour_field(m.sss_profile_tint);
+        number_field(m.sss_lobe_roughness0);
+        number_field(m.sss_lobe_roughness1);
+        number_field(m.sss_lobe_mix);
+        // Manifests without this field predate multiplying by base colour.
+        m.sss_color_from_base = idx < toks.size() && std::stoi(toks[idx++]) != 0;
         loaded.push_back(std::move(m));
         } catch (const std::exception&) {
             std::fprintf(stderr, "Invalid material manifest; keeping the current scene materials.\n");
@@ -1700,9 +1739,11 @@ static void EnsureRasterFBO(int width, int height)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+        // Half float keeps the linear direct-lighting debug view comparable
+        // with path-traced HDR; ordinary views are already display encoded.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F,
                      width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                     GL_RGBA, GL_FLOAT, nullptr);
 
         glBindRenderbuffer(GL_RENDERBUFFER, g_rasterDepthRBO);
         glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
@@ -2493,58 +2534,118 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 
         // Subsurface scattering (simplified controls)
         if (ImGui::Checkbox("Use Subsurface Scattering (SSS)", &mat.use_sss)) {
+            // A material switched on without prior settings starts from Unreal's skin profile.
+            if (mat.use_sss && mat.sss_strength <= 0 && mat.sss_shading == sss_shading_burley) {
+                mat.sss_shading = sss_shading_unreal_profile;
+                mat.sss_strength = 1;
+                if (mat.sss_model == SSS_NONE) mat.sss_model = SSS_DIPOLE_BURLEY;
+            }
             g_world_dirty = true;
         }
         
         if (mat.use_sss) {
             ImGui::Indent();
-            
-            // Fraction of the diffuse substrate replaced by spatial scattering.
-            float sss_ui = (float)std::clamp(mat.sss_strength, 0.0, 1.0);
-            if (ImGui::SliderFloat("SSS Strength", &sss_ui, 0.0f, 1.0f)) {
-                mat.sss_strength = (double)sss_ui;
+            auto colour_edit = [&](const char* label, vec3& value) {
+                float c[3] = {(float)value.x(), (float)value.y(), (float)value.z()};
+                if (ImGui::ColorEdit3(label, c)) { value = vec3(c[0], c[1], c[2]); g_world_dirty = true; }
+            };
+            auto slider = [&](const char* label, double& value, float lo, float hi, const char* format = "%.3f",
+                              ImGuiSliderFlags flags = 0) {
+                float v = (float)value;
+                if (ImGui::SliderFloat(label, &v, lo, hi, format, flags)) { value = v; g_world_dirty = true; }
+            };
+            const char* shading_models[] = {"None", "Subsurface (Unreal)", "Subsurface Profile (Unreal)",
+                                            "Burley Diffusion (legacy)"};
+            int shading = mat.sss_model == SSS_NONE ? 0
+                : mat.sss_shading == sss_shading_unreal_subsurface ? 1
+                : mat.sss_shading == sss_shading_unreal_profile ? 2 : 3;
+            if (ImGui::Combo("Shading Model", &shading, shading_models, IM_ARRAYSIZE(shading_models))) {
+                if (shading == 0) mat.sss_model = SSS_NONE;
+                else {
+                    if (mat.sss_model == SSS_NONE) mat.sss_model = SSS_DIPOLE_BURLEY;
+                    mat.sss_shading = shading == 1 ? sss_shading_unreal_subsurface
+                        : shading == 2 ? sss_shading_unreal_profile : sss_shading_burley;
+                    // The profile's Opacity input masks scattering; start fully on.
+                    if (shading == 2 && mat.sss_strength <= 0) mat.sss_strength = 1;
+                }
                 g_world_dirty = true;
             }
-
-            float sss_radius_f = (float)mat.sss_radius;
-            if (ImGui::SliderFloat("SSS Radius", &sss_radius_f, 0.01f, 10.0f)) {
-                mat.sss_radius = (double)sss_radius_f;
-                // Keep the legacy project scale field in sync with the diffusion distance
-                mat.sss_scale = mat.sss_radius;
-                g_world_dirty = true;
-            }
-
-            const char* sss_items[] = { "None", "Burley diffusion" };
-            int sss_model_idx = mat.sss_model == SSS_NONE ? 0 : 1;
-            if (ImGui::Combo("SSS Model", &sss_model_idx, sss_items, IM_ARRAYSIZE(sss_items))) {
-                mat.sss_model = sss_model_idx == 0 ? SSS_NONE : SSS_DIPOLE_BURLEY;
-                g_world_dirty = true;
-            }
-
-            // (Unreal PBR checkbox moved to the Textures section)
-
-            float eta = (float)mat.sss_eta;
-            if (ImGui::SliderFloat("SSS IOR", &eta, 1.0f, 2.5f)) {
-                mat.sss_eta = eta;
-                g_world_dirty = true;
-            }
-
-            // SSS Color Override (only when SSS is enabled)
-            if (ImGui::Checkbox("Override SSS Color", &mat.sss_color_override_enabled)) {
-                g_world_dirty = true;
-            }
-            if (mat.sss_color_override_enabled) {
-                float sss_col[3] = {
-                    (float)mat.sss_color_override_color.x(),
-                    (float)mat.sss_color_override_color.y(),
-                    (float)mat.sss_color_override_color.z()
-                };
-                if (ImGui::ColorEdit3("SSS Scatter Color", sss_col)) {
-                    mat.sss_color_override_color = vec3(sss_col[0], sss_col[1], sss_col[2]);
+            if (shading == 1) {
+                colour_edit("Subsurface Color", mat.sss_subsurface_color);
+                if (ImGui::Checkbox("Multiply by Base Color", &mat.sss_color_from_base)) g_world_dirty = true;
+                slider("Opacity", mat.sss_opacity, 0.0f, 1.0f);
+                ImGui::TextWrapped("Opacity 0 wraps light around thin objects; 1 follows the surface normal.");
+                slider("Transmission Distance", mat.sss_transmission_distance, 0.00001f, 10.0f, "%.5f",
+                       ImGuiSliderFlags_Logarithmic);
+                ImGui::TextWrapped("Light crossing the object falls to 37%% over this many scene units.");
+            } else if (shading == 2) {
+                if (ImGui::Button("Reset to Unreal Default Skin")) {
+                    scene_material_parameters defaults;
+                    mat.sss_surface_albedo = defaults.sss_surface_albedo;
+                    mat.sss_mfp_color = defaults.sss_mfp_color;
+                    mat.sss_mfp_mm = defaults.sss_mfp_mm;
+                    mat.sss_profile_tint = defaults.sss_profile_tint;
+                    mat.sss_lobe_roughness0 = defaults.sss_lobe_roughness0;
+                    mat.sss_lobe_roughness1 = defaults.sss_lobe_roughness1;
+                    mat.sss_lobe_mix = defaults.sss_lobe_mix;
+                    mat.sss_eta = 1.4;
+                    mat.sss_strength = 1;
                     g_world_dirty = true;
                 }
+                slider("Subsurface Mask", mat.sss_strength, 0.0f, 1.0f);
+                colour_edit("Surface Albedo", mat.sss_surface_albedo);
+                colour_edit("Mean Free Path Color", mat.sss_mfp_color);
+                slider("Mean Free Path (mm)", mat.sss_mfp_mm, 0.001f, 100.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                slider("Scene Units per Metre", mat.sss_units_per_metre, 0.001f, 1000.0f, "%.3f",
+                       ImGuiSliderFlags_Logarithmic);
+                colour_edit("Tint", mat.sss_profile_tint);
+                slider("Specular Roughness 0", mat.sss_lobe_roughness0, 0.0f, 2.0f);
+                slider("Specular Roughness 1", mat.sss_lobe_roughness1, 0.0f, 2.0f);
+                slider("Specular Lobe Mix", mat.sss_lobe_mix, 0.0f, 1.0f);
+                slider("Entry IOR", mat.sss_eta, 1.0f, 2.5f);
+                vec3 d = lower_subsurface(mat).distances;
+                ImGui::TextDisabled("Diffusion distance (scene units): %.4g, %.4g, %.4g", d.x(), d.y(), d.z());
+            } else if (shading == 3) {
+                const char* profiles[]={"Neutral", "Skin", "Custom"};
+                if(ImGui::Combo("Scattering Profile",&mat.sss_profile,profiles,3)) {
+                    if(mat.sss_profile==0) mat.sss_radius_rgb=vec3(1,1,1);
+                    if(mat.sss_profile==1) {
+                        // Relative transport lengths from Jensen et al.'s Skin1 coefficients.
+                        mat.sss_radius_rgb=vec3(1,.372,.186);
+                        mat.sss_radius=mat.sss_scale=.0037;
+                        mat.sss_eta=1.3;
+                        mat.sss_strength=1;
+                    }
+                    g_world_dirty=true;
+                }
+                ImGui::TextWrapped("Radius is measured in scene units.");
+                if(mat.sss_profile==1) ImGui::TextWrapped("Skin scatters red farther into shadow. The preset assumes one unit is one metre; adjust Radius for your model's scale.");
+
+                // Fraction of the diffuse substrate replaced by spatial scattering.
+                slider("SSS Strength", mat.sss_strength, 0.0f, 1.0f);
+                double radius = mat.sss_radius;
+                slider("SSS Radius", radius, 0.00001f, 10.0f, "%.5f", ImGuiSliderFlags_Logarithmic);
+                if (radius != mat.sss_radius) {
+                    // Keep the legacy project scale field in sync with the diffusion distance
+                    mat.sss_radius = mat.sss_scale = radius;
+                }
+
+                float distances[3]={(float)mat.sss_radius_rgb.x(),(float)mat.sss_radius_rgb.y(),(float)mat.sss_radius_rgb.z()};
+                if(ImGui::DragFloat3("RGB Radius Multipliers",distances,.01f,.001f,10.f,"%.3f")) {
+                    mat.sss_radius_rgb=vec3(std::max(.001f,distances[0]),std::max(.001f,distances[1]),std::max(.001f,distances[2]));
+                    mat.sss_profile=2;
+                    g_world_dirty=true;
+                }
+                slider("SSS IOR", mat.sss_eta, 1.0f, 2.5f);
+
+                // SSS Color Override (only when SSS is enabled)
+                if (ImGui::Checkbox("Override SSS Color", &mat.sss_color_override_enabled)) {
+                    g_world_dirty = true;
+                }
+                if (mat.sss_color_override_enabled) colour_edit("SSS Scatter Color", mat.sss_color_override_color);
             }
-            
+            ImGui::TextDisabled("Raster preview and ray tracing share this shading model.");
+
             ImGui::Unindent();
         }
 
@@ -2633,6 +2734,19 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
     if (orig.sss_samples != mat.sss_samples) material_changed = true;
     if (fabs(orig.sss_strength - mat.sss_strength) > 1e-6) material_changed = true;
     if (fabs(orig.sss_radius - mat.sss_radius) > 1e-6) material_changed = true;
+    if (orig.sss_profile!=mat.sss_profile || (orig.sss_radius_rgb-mat.sss_radius_rgb).length_squared()>1e-12 ||
+        orig.sss_eta!=mat.sss_eta || orig.sss_color_override_enabled!=mat.sss_color_override_enabled ||
+        (orig.sss_color_override_color-mat.sss_color_override_color).length_squared()>1e-12) material_changed=true;
+    if (orig.sss_shading!=mat.sss_shading || orig.use_sss!=mat.use_sss ||
+        orig.sss_color_from_base!=mat.sss_color_from_base ||
+        (orig.sss_subsurface_color-mat.sss_subsurface_color).length_squared()>1e-12 ||
+        orig.sss_opacity!=mat.sss_opacity || orig.sss_transmission_distance!=mat.sss_transmission_distance ||
+        (orig.sss_surface_albedo-mat.sss_surface_albedo).length_squared()>1e-12 ||
+        (orig.sss_mfp_color-mat.sss_mfp_color).length_squared()>1e-12 || orig.sss_mfp_mm!=mat.sss_mfp_mm ||
+        orig.sss_units_per_metre!=mat.sss_units_per_metre ||
+        (orig.sss_profile_tint-mat.sss_profile_tint).length_squared()>1e-12 ||
+        orig.sss_lobe_roughness0!=mat.sss_lobe_roughness0 || orig.sss_lobe_roughness1!=mat.sss_lobe_roughness1 ||
+        orig.sss_lobe_mix!=mat.sss_lobe_mix) material_changed=true;
     if (orig.albedo_tex != mat.albedo_tex) material_changed = true;
     if (orig.metallic_tex != mat.metallic_tex) material_changed = true;
     if (orig.roughness_tex != mat.roughness_tex) material_changed = true;

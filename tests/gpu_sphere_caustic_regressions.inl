@@ -1,0 +1,60 @@
+#ifdef DUSK_ENABLE_VULKAN_RT
+static void check_gpu_sphere_caustics(const std::string& device,const std::filesystem::path& folder) {
+    auto source=sphere_scene(scene_material_model::dielectric);
+    source.materials[0].base_color=vec3(1,1,1);
+    source.objects[0].center=point3(0,0,1); source.objects[0].radius=.5;
+    scene_material floor; floor.model=scene_material_model::lambert; floor.base_color=vec3(.8,.8,.8);
+    source.materials.push_back(floor);
+    scene_object ground; ground.type=scene_object_type::cube; ground.center=point3(0,0,-.05);
+    ground.scale=vec3(10,10,.1); ground.material_index=1; source.objects.push_back(ground);
+    auto cam=test_camera(8,8,8192); cam.lookfrom=point3(.04,0,.1); cam.lookat=point3(.04,0,0);
+    cam.vfov=1; cam.background=vec3(); cam.use_sun=true; cam.sun_dir=vec3(0,0,1);
+    cam.sun_radiance=vec3(2,2,2); cam.sun_angular_radius=20; cam.max_depth=4; cam.sun_shadow_samples=1;
+    auto settings=raw_settings(); std::vector<float> hdr;
+    auto run=[&] {return dusk_gpu::render(dusk_gpu::compile_scene(source),cam,settings,device,nullptr,nullptr,{},&hdr);};
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE","1"); run(); double backward=channel_mean(hdr,0);
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE",""); run(); double assisted=channel_mean(hdr,0);
+    std::cout<<"Sphere caustic reference "<<backward<<", manifold "<<assisted<<'\n';
+    near(assisted,backward,.04,"sphere sun sampling agrees with independent backward-path reference");
+    cam.sun_shadow_samples=4; run();
+    near(channel_mean(hdr,0),assisted,.025,"sphere caustic MIS is invariant to sun sample count");
+    compare_render(source,cam,device,"CPU/GPU sphere-manifold caustic",3);
+    source.materials[0].ior=1; source.materials[0].base_color=vec3(.8,.9,1);
+    cam.sun_angular_radius=.266; cam.samples_per_pixel=128; run();
+    near(channel_mean(hdr,0),.8*.8*.8*2/pi,.002,"unit-IOR glass preserves solar energy and applies each interface tint once");
+    cam.max_depth=2; run(); near(channel_mean(hdr,0),0,1e-6,"caustic connections obey the path depth budget");
+    cam.max_depth=4;
+    run(); double unobstructed=channel_mean(hdr,0);
+    scene_material veil; veil.model=scene_material_model::pbr; veil.base_color=vec3(); veil.alpha_cutoff=0;
+    initialize_material_graph(veil,source.textures);
+    int opacity=veil.graph.add(graph_kind::scalar,0,0); veil.graph.find(opacity)->value=vec3(.5,0,0);
+    veil.graph.connect({opacity,0,veil.graph.output_id(),4}); source.materials.push_back(veil);
+    scene_object pane=ground; pane.center=point3(0,0,.25); pane.scale=vec3(10,10,.01); pane.material_index=2; source.objects.push_back(pane);
+    run(); near(channel_mean(hdr,0),unobstructed*.25,.005,"partial occluders attenuate both faces of the refracted connection");
+    auto cpu_world=build_world_from_scene(source); camera cpu_camera=cam; build_emissive_surfaces(source,cpu_camera);
+    double cpu_mean=0;
+    for(int i=0;i<1000;++i) cpu_mean+=cpu_camera.ray_colour(ray(point3(.04,0,.1),vec3(0,0,-1),.5),4,cpu_world).x()/1000;
+    near(cpu_mean,unobstructed*.25,.01,"CPU sphere connection carries actual glass tint through partial blockers");
+    compare_render(source,cam,device,"CPU/GPU caustic through partial occluder",3);
+    source.objects.pop_back(); source.materials.pop_back();
+    scene_material black; black.model=scene_material_model::lambert; black.base_color=vec3(); source.materials.push_back(black);
+    scene_object blocker=ground; blocker.center=point3(0,0,3); blocker.material_index=2; source.objects.push_back(blocker);
+    run(); near(channel_mean(hdr,0),0,1e-6,"external blocker occludes the refracted sun connection");
+    source.objects.pop_back();
+    source.materials[0].ior=1.5; source.materials[0].base_color=vec3(1,1,1);
+    source.objects[0].radius=.65;
+    cam=test_camera(192,144,128); cam.lookfrom=point3(2.7,-4,2.4); cam.lookat=point3(0,0,.35);
+    cam.vfov=34; cam.background=vec3(); cam.use_sun=true; cam.sun_dir=vec3(0,0,1);
+    cam.sun_radiance=vec3(2,2,2); cam.sun_angular_radius=.266; cam.max_depth=8; cam.sun_shadow_samples=1;
+    auto save=[&](const char* name,const render_result& image) {
+        auto file=(folder/name).string();
+        require(stbi_write_png(file.c_str(),image.width,image.height,3,image.pixels.data(),image.width*3)!=0,"save sphere caustic comparison");
+    };
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE","1"); auto before=run();
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE",""); auto after=run(); auto raw=hdr;
+    settings.gpu_firefly_filter=true; auto filtered=run();
+    require(hdr==raw,"caustic sampling does not depend on display firefly filtering");
+    save("sun-sphere-paths-before.png",before); save("sun-sphere-sampling-after.png",after);
+    save("sun-sphere-filtered.png",filtered);
+}
+#endif

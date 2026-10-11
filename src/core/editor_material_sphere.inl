@@ -91,6 +91,10 @@ static bool initialize() {
     glUniform1i(shader.location("uInstructions"), 12);
     glUniform1i(shader.location("uSunShadow"), 13);
     glUniform1i(shader.location("uPointShadow"), 14);
+    glUniform1i(shader.location("uSunSurface"), 15);
+    glUniform1i(shader.location("uPointSurface"), 16);
+    glUniform1f(shader.location("uObjectId"), 1); // analytic preview surfaces use this id
+    glUniform3f(shader.location("uEnvironment"), .2f, .2f, .2f); // neutral studio sky
     glUniform1i(shader.location("uSunShadowEnabled"), GL_FALSE);
     glUniform1i(shader.location("uPointShadowIndex"), -1);
     glUniform1i(shader.location("uDebugView"), 0);

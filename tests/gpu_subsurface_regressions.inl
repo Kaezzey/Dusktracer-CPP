@@ -24,6 +24,16 @@ static void check_gpu_subsurface(const std::string& device,const std::filesystem
     cam.background=vec3(); cam.use_sun=true; cam.sun_dir=vec3(0,0,-1);
     cam.sun_radiance=vec3(1,1,1); cam.sun_angular_radius=10; cam.sun_shadow_samples=1;
     compare_render(source,cam,device,"GPU SSS backlit sphere",2);
+    material.sss_radius_rgb=vec3(1,.372,.186);
+    compare_render(source,cam,device,"GPU RGB skin diffusion backlighting",3);
+    render_hdr();
+    require(channel_mean(hdr,0)>channel_mean(hdr,2)*5,"skin transports red farther than blue through the sphere");
+    cam.background=vec3(1,1,1); cam.use_sun=false;
+    compare_render(source,cam,device,"GPU RGB diffusion white furnace",3);
+    render_hdr();
+    for(int channel=0;channel<3;++channel) require(channel_mean(hdr,channel)<1.01,"each RGB skin diffusion channel has a bounded energy budget");
+    cam.background=vec3(); cam.use_sun=true;
+    material.sss_radius_rgb=vec3(1,1,1);
     auto backlit=render_hdr(); double transmission=channel_mean(hdr,0);
     require(transmission>.002,"GPU SSS carries backlighting from a different surface point");
     material.sss_strength=0; render_hdr();
@@ -93,5 +103,98 @@ static void check_gpu_subsurface(const std::string& device,const std::filesystem
     cam.image_width=8; cam.image_height=8; cam.samples_per_pixel=8;
     render_selected({render_backend::vulkan,device},source,nullptr,cam,settings,nullptr,nullptr,{},diagnostic);
     require(diagnostic.find("using CPU")==std::string::npos,"SSS editor render stays on selected GPU without fallback");
+}
+static void check_gpu_skin_shadow(const std::string& device,const std::filesystem::path& folder) {
+    scene source;
+    scene_material skin; skin.model=scene_material_model::pbr; skin.base_color=vec3(.7,.7,.7);
+    skin.use_sss=true; skin.sss_strength=1; skin.sss_radius=.15; skin.roughness=.8;
+    source.materials.push_back(skin);
+    scene_material black; black.model=scene_material_model::lambert; black.base_color=vec3(); source.materials.push_back(black);
+    scene_object slab; slab.type=scene_object_type::cube; slab.material_index=0; slab.scale=vec3(5,5,.3); source.objects.push_back(slab);
+    scene_object blocker=slab; blocker.material_index=1; blocker.center=point3(-1.25,0,2); blocker.scale=vec3(2.5,5,.1); source.objects.push_back(blocker);
+    auto cam=test_camera(128,96,1024); cam.lookfrom=point3(0,0,1); cam.lookat=point3(); cam.vfov=60; cam.max_depth=2;
+    cam.background=vec3(); cam.use_sun=true; cam.sun_dir=vec3(0,0,1); cam.sun_radiance=vec3(2,2,2); cam.sun_angular_radius=.266; cam.sun_shadow_samples=1;
+    auto settings=raw_settings(); std::vector<float> hdr;
+    auto run=[&] {return dusk_gpu::render(dusk_gpu::compile_scene(source),cam,settings,device,nullptr,nullptr,{},&hdr);};
+    auto save=[&](const char* name,const render_result& image) {
+        auto file=(folder/name).string(); require(stbi_write_png(file.c_str(),image.width,image.height,3,image.pixels.data(),image.width*3)!=0,"save skin shadow-boundary comparison");
+    };
+    auto neutral=run(); save("skin-shadow-neutral.png",neutral);
+    source.materials[0].sss_profile=1; source.materials[0].sss_radius_rgb=vec3(1,.372,.186);
+    auto image=run(); save("skin-shadow-profile.png",image);
+    double red=0,green=0,blue=0;
+    // The blocker covers the left half; integrate a strip just inside shadow.
+    for(int y=32;y<64;++y) for(int x=48;x<60;++x) {size_t p=(y*128+x)*3;red+=hdr[p];green+=hdr[p+1];blue+=hdr[p+2];}
+    std::cout<<"Skin shadow strip RGB: "<<red<<", "<<green<<", "<<blue<<'\n';
+    require(red>green*1.3 && green>blue*1.3 && red>1,"skin diffusion carries a warm tail across an external shadow boundary");
+    source.materials[0].sss_strength=0; run();
+    double opaque=0;
+    for(int y=32;y<64;++y) for(int x=48;x<60;++x) opaque+=hdr[(y*128+x)*3];
+    require(opaque<red*.05,"the skin shadow transition comes from spatial scattering");
+    cam.image_width=32; cam.image_height=24; cam.samples_per_pixel=8192;
+    source.materials[0].sss_strength=1;
+    compare_render(source,cam,device,"CPU/GPU RGB skin shadow boundary",3);
+}
+// Unreal Subsurface and Subsurface Profile must match the CPU tracer.
+static void check_gpu_unreal_subsurface(const std::string& device,const std::filesystem::path& folder) {
+    auto source=sphere_scene(scene_material_model::pbr);
+    auto& material=source.materials[0]; material.base_color=vec3(.6,.45,.4); material.roughness=.45;
+    material.use_sss=true; material.sss_model=SSS_DIPOLE_BURLEY; material.sss_shading=sss_shading_unreal_subsurface;
+    material.sss_subsurface_color=vec3(.9,.35,.25); material.sss_opacity=.35; material.sss_transmission_distance=.6;
+    auto cam=test_camera(24,24,2048); cam.vfov=34; cam.max_depth=3; cam.background=vec3();
+    cam.use_sun=true; cam.sun_dir=safe_unit_vector(vec3(-.6,.3,-1)); cam.sun_radiance=vec3(2,2,2);
+    cam.sun_angular_radius=5; cam.sun_shadow_samples=1;
+    auto settings=raw_settings(); std::vector<float> hdr;
+    auto render_hdr=[&] {
+        return dusk_gpu::render(dusk_gpu::compile_scene(source),cam,settings,device,nullptr,nullptr,{},&hdr);
+    };
+    compare_render(source,cam,device,"GPU Unreal Subsurface backlit transmission",2);
+    source.materials[0].sss_opacity=0;
+    compare_render(source,cam,device,"GPU Unreal Subsurface opacity-zero wrap",2);
+    source.materials[0].sss_opacity=.35;
+    // Transmission is counted once, by light sampling, whatever the sample count.
+    cam.max_depth=1; render_hdr(); double reference=channel_mean(hdr,0);
+    require(reference>.005,"GPU backlight transmits through the body");
+    cam.direct_light_samples=4; cam.sun_shadow_samples=4; render_hdr();
+    near(channel_mean(hdr,0),reference,reference*.03,"GPU Unreal transmission is invariant to light samples");
+    cam.direct_light_samples=1; cam.sun_shadow_samples=1; cam.max_depth=3;
+    // Indirect light sees at most unit albedo in a white furnace.
+    cam.use_sun=false; cam.background=vec3(1,1,1); render_hdr();
+    require(channel_mean(hdr,0)<1.01 && channel_mean(hdr,1)<1.01,"GPU Unreal Subsurface ambient keeps unit albedo");
+    compare_render(source,cam,device,"GPU Unreal Subsurface white furnace",2);
+    cam.use_sun=true; cam.background=vec3();
+    scene_material black; black.model=scene_material_model::lambert; black.base_color=vec3();
+    source.materials.push_back(black);
+    scene_object blocker; blocker.type=scene_object_type::cube; blocker.center=point3(0,0,-2.5);
+    blocker.scale=vec3(100,100,.1); blocker.material_index=1; source.objects.push_back(blocker);
+    cam.max_depth=1; render_hdr(); double blocked=channel_mean(hdr,0);
+    source.objects.pop_back(); render_hdr();
+    require(blocked<channel_mean(hdr,0)*.5,"an external blocker removes transmitted sunlight on the GPU");
+    cam.max_depth=3; source.materials.pop_back();
+    cam.use_sun=false;
+    camera::point_light point; point.position=point3(.4,.3,-3); point.radiance=colour(20,20,20);
+    cam.point_lights.push_back(point);
+    compare_render(source,cam,device,"GPU Unreal Subsurface point-light transmission",2);
+    render_hdr(); std::cout<<"Unreal point-light transmission mean red "<<channel_mean(hdr,0)<<'\n';
+    require(channel_mean(hdr,0)>.005,"GPU point light transmits through the body");
+    cam.point_lights.clear(); cam.use_sun=true;
+    auto unreal=render_hdr(); auto save=[&](const char* name,const render_result& image) {
+        auto path=(folder/name).string();
+        require(stbi_write_png(path.c_str(),image.width,image.height,3,image.pixels.data(),image.width*3)!=0,"save GPU Unreal subsurface fixture");
+    };
+    save("unreal-subsurface-gpu.png",unreal);
+
+    auto& profile=source.materials[0];
+    profile.sss_shading=sss_shading_unreal_profile; profile.sss_strength=1; profile.sss_units_per_metre=100;
+    profile.sss_eta=1.4;
+    cam.sun_dir=safe_unit_vector(vec3(-.7,.5,.5));
+    compare_render(source,cam,device,"GPU Subsurface Profile skin diffusion",3);
+    save("subsurface-profile-gpu.png",render_hdr());
+    // Dual specular alone, without diffusion, also matches.
+    profile.sss_strength=0; profile.roughness=.3;
+    compare_render(source,cam,device,"GPU Subsurface Profile dual specular",2);
+    profile.sss_lobe_mix=0; render_hdr(); auto single=hdr;
+    profile.use_sss=false; render_hdr();
+    require(hdr==single,"zero lobe mix reproduces the ordinary specular lobe exactly");
 }
 #endif

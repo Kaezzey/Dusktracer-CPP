@@ -209,6 +209,27 @@ int main(int argc,char** argv) {
     pixels.resize(1440*960*4); glReadPixels(0,0,1440,960,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
     stbi_flip_vertically_on_write(1);
     check(stbi_write_png("material-editor.png",1440,960,4,pixels.data(),1440*4) != 0,"production editor screenshot");
+    // The subsurface inspector for each shading model, including the legacy one.
+    for (int shading = 0; shading < 3; ++shading) {
+        auto& sss = g_scene.materials[0];
+        sss.use_sss = true; sss.sss_model = SSS_DIPOLE_BURLEY; sss.sss_shading = shading;
+        for (int i = 0; i < 3; ++i) {
+            io.DisplaySize = ImVec2(1440,960); io.DeltaTime = 1.f/60;
+            ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0,0)); ImGui::SetNextWindowSize(ImVec2(480,960));
+            ImGui::Begin("Subsurface Inspector",nullptr,ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings);
+            DrawMaterialInspector(sss,g_scene,0,false);
+            check(sss.use_sss && sss.sss_shading == shading,"drawing the inspector preserves the shading model");
+            ImGui::End(); ImGui::Render();
+            glBindFramebuffer(GL_FRAMEBUFFER,0); glViewport(0,0,1440,960); glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData()); glFinish();
+        }
+        std::vector<unsigned char> panel(480*960*4);
+        glReadPixels(0,0,480,960,GL_RGBA,GL_UNSIGNED_BYTE,panel.data());
+        const std::string name = "inspector-sss-" + std::to_string(shading) + ".png";
+        check(stbi_write_png(name.c_str(),480,960,4,panel.data(),480*4) != 0,"subsurface inspector screenshot");
+    }
+    g_scene.materials[0].use_sss = false;
     StopEditorPreviews();
     StopRasterPreview();
     glDeleteProgram(g_rasterShader);

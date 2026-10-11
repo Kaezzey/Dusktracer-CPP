@@ -48,5 +48,25 @@ inline double entry_directional(double cosine, double eta) {
     }
     return entry_transmission(cosine, eta)/(normalization*profile_pi);
 }
+
+// Christensen-Burley fit relating the volume mean free path to the
+// normalized-diffusion shape distance: d = mfp / s(A), A = surface albedo.
+inline double burley_mfp_scaling(double albedo) {
+    albedo = std::clamp(albedo, 0.0, 1.0);
+    return 1.85 - albedo + 7*std::pow(std::abs(albedo - .8), 3);
+}
+
+// Unreal-style "Subsurface" shading model transmission term. The result is
+// radiance per unit incident radiance, already including any cosine, so a
+// light of radiance L contributes L * SubsurfaceColor * term. Opacity 0 is
+// thin and wraps light all the way around; opacity 1 follows the normal.
+inline double unreal_transmission(double n_dot_h, double l_dot_back, double opacity) {
+    opacity = std::clamp(opacity, 0.0, 1.0);
+    double forward = std::clamp(l_dot_back, 0.0, 1.0);
+    double in_scatter = std::pow(forward, 12)*(3 + (.1 - 3)*opacity);
+    double normal_contribution = std::clamp(n_dot_h*opacity + 1 - opacity, 0.0, 1.0);
+    double back_scatter = normal_contribution/(2*profile_pi);
+    return back_scatter + (1 - back_scatter)*in_scatter;
+}
 } // namespace sss
 #endif

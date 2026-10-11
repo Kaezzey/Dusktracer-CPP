@@ -70,7 +70,12 @@ static uint64_t MaterialPreviewStamp(const scene& assets, const scene_material& 
         << '|' << m.dielectric_F0 << '|' << m.normal_strength << '|' << m.alpha_cutoff << '|'
         << m.alpha_double_sided << '|' << m.unreal_pbr << '|' << m.use_sss << '|' << m.sss_strength << '|'
         << m.sss_scale << '|' << m.sss_model << '|' << m.sss_samples << '|' << m.sss_radius << '|'
+        << m.sss_profile << '|' << m.sss_radius_rgb << '|'
         << m.sss_eta << '|' << m.sss_color_override_enabled << '|' << m.sss_color_override_color << '|'
+        << m.sss_shading << '|' << m.sss_subsurface_color << '|' << m.sss_color_from_base << '|' << m.sss_opacity << '|'
+        << m.sss_transmission_distance << '|' << m.sss_surface_albedo << '|' << m.sss_mfp_color << '|'
+        << m.sss_mfp_mm << '|' << m.sss_units_per_metre << '|' << m.sss_profile_tint << '|'
+        << m.sss_lobe_roughness0 << '|' << m.sss_lobe_roughness1 << '|' << m.sss_lobe_mix << '|'
         << graph_surface_key(m.graph);
     auto texture_stamp = [&](int index, const std::string& path = {}) {
         if (!path.empty()) {
@@ -109,9 +114,18 @@ static preview_image RenderMaterialPreview(const scene& assets, const scene_mate
             hit_record rec{};
             vec3 view;
             if (camera.surface(sx, sy, rec, view)) {
+                // Light behind the unit preview sphere crosses its chord, as in
+                // the tracers' body transmittance.
+                auto light = [&](const vec3& direction, const colour& radiance) {
+                    double body = runtime->body_transmission_distance(), visible = 1;
+                    if (body > 0 && dot(rec.geometry_normal(), direction) < 0) {
+                        visible = std::exp(2 * dot(rec.p - point3(), direction) / body);
+                    }
+                    return runtime->shade_direct(rec, view, direction, radiance, empty_world, visible) +
+                           runtime->shade_transmission(rec, view, direction, radiance, visible);
+                };
                 c = runtime->albedo(rec) * .12 + runtime->emitted(rec.u, rec.v, rec.p) +
-                    runtime->shade_direct(rec, view, key, colour(3.8, 3.6, 3.4), empty_world) +
-                    runtime->shade_direct(rec, view, fill, colour(.8, 1, 1.3), empty_world);
+                    light(key, colour(3.8, 3.6, 3.4)) + light(fill, colour(.8, 1, 1.3));
                 double alpha = runtime->opacity_at(rec);
                 c = alpha * c + (1 - alpha) * background;
             }

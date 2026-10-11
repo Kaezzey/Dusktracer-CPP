@@ -18,6 +18,8 @@ static void check_firefly_reconstruction() {
 }
 #ifdef DUSK_ENABLE_VULKAN_RT
 static void check_gpu_fireflies(const std::string& device,const std::filesystem::path& folder) {
+    // Retain an unassisted high-variance fixture to test reconstruction itself.
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE","1");
     auto source=sphere_scene(scene_material_model::dielectric);
     source.materials[0].base_color=vec3(1,1,1); source.objects[0].radius=.65;
     source.objects[0].center=point3(0,0,0);
@@ -78,6 +80,7 @@ static void check_gpu_fireflies(const std::string& device,const std::filesystem:
     std::cout<<"Dense caustic reconstruction: "<<changed<<" changed channels, "<<clean_energy/energy*100<<"% display energy retained\n";
     require(clean_energy>=energy*.98 && changed<dense.pixels.size()*.03,"converged caustic footprint is preserved");
     save("dense-caustic-before.png",dense); save("dense-caustic-after.png",dense_clean);
+    gpu_option("DUSK_GPU_NO_SPHERE_NEE","");
     // The same isolated bright sun viewed through a specular-only glass chain
     // is a legitimate highlight and must not be reconstructed away.
     source.objects.pop_back(); source.materials[0].ior=1;

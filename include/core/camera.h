@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include "caustics.h"
+#include "sun_sphere.h"
 #include <vector>
 #include <atomic>
 #include <limits>
@@ -52,6 +53,7 @@ class camera {
 
     // Camera-side directional sun fields (can be mirrored from scene directional light)
     bool   use_sun = false;
+    std::vector<sun_sphere::lens> sun_spheres;
     vec3   sun_dir = vec3(0,0,0);
     colour sun_radiance = colour(0,0,0);
     double sun_angular_radius = 0.266; // degrees; legacy zero uses the physical sun disc
@@ -471,7 +473,14 @@ class camera {
         double previous_pdf = 0;
         int previous_samples = 0, previous_sun_samples = 0, null_events = 0;
         bool previous_delta = true, first_intersection = true;
+        point3 lens_origin; vec3 lens_direction;
+        double lens_pdf=0,lens_jacobian=0,lens_transmission=0;
+        const hittable* lens_object=nullptr;
+        int lens_stage=0;
+        // Light reached by an ambient-only sample was counted by light sampling.
+        bool previous_indirect_only = false;
         auto hit_weight = [&](double light_pdf, int samples) {
+            if (previous_indirect_only) return 0.0;
             if (previous_delta || samples == 0 || light_pdf <= 0) return 1.0;
             return enable_mis ? power_weight(previous_pdf,samples*light_pdf) : 0.0;
         };
@@ -484,7 +493,11 @@ class camera {
             if (!did_hit) {
                 result += throughput*background;
                 double pdf = sun_pdf(current_ray.direction());
-                if (pdf > 0) result += throughput*sun_radiance*(pdf*hit_weight(pdf,previous_sun_samples));
+                if (pdf > 0) {
+                    double mis=lens_stage==2 && lens_jacobian>0 ? power_weight(lens_pdf*lens_transmission,
+                        std::min(2,previous_sun_samples)*lens_jacobian*pdf) : hit_weight(pdf,previous_sun_samples);
+                    result += throughput*sun_radiance*(pdf*mis);
+                }
                 break;
             }
             if (!rec.mat) break;
@@ -516,13 +529,19 @@ class camera {
                 auto add_light = [&](const vec3& direction, const colour& radiance, double max_distance,
                                      double weight, double surface_mis) {
                     vec3 origin = rec.p+rec.geometry_normal()*(dot(direction,rec.geometry_normal()) >= 0 ? .001 : -.001);
-                    double visibility = compute_transmittance(ray(origin,direction,current_ray.time()),max_distance,world);
+                    ray shadow(origin,direction,current_ray.time());
+                    double body = subsurface ? 0 : rec.mat->body_transmission_distance();
+                    double visibility = body > 0 && dot(direction,rec.geometry_normal()) < 0
+                        ? body_transmittance(shadow,max_distance,world,rec,body)
+                        : compute_transmittance(shadow,max_distance,world);
                     if (visibility <= 0) return;
                     double cosine = std::max(0.0,dot(rec.geometry_normal(),direction));
                     colour direct = subsurface
                         ? radiance*(cosine*rec.mat->subsurface_directional(cosine)*visibility)
                         : rec.mat->shade_direct(rec,view,direction,radiance,world,visibility);
                     lighting += direct*(surface_mis*weight);
+                    // Unreal transmission has no BSDF-sampled counterpart.
+                    if (!subsurface) lighting += rec.mat->shade_transmission(rec,view,direction,radiance,visibility)*weight;
                 };
                 if (use_sun) {
                     double omega = sun_solid_angle();
@@ -533,14 +552,54 @@ class camera {
                         double weight = 1.0/samples, mis = 1;
                         colour radiance = sun_radiance;
                         if (omega > 1e-12) {
-                            double z = 1-random_double()*omega/(2*pi), phi = 2*pi*random_double();
-                            double radius = std::sqrt(std::max(0.0,1-z*z));
+                            double q = random_double()*omega/(2*pi), z=1-q, phi = 2*pi*random_double();
+                            double radius = std::sqrt(std::max(0.0,q*(2-q)));
                             direction = sun_frame.world(vec3(radius*std::cos(phi),radius*std::sin(phi),z));
                             double pdf = 1/omega;
                             mis = enable_mis ? power_weight(samples*pdf,direction_pdf(direction)) : 1;
                             radiance *= pdf; weight /= pdf;
                         }
                         add_light(direction,radiance,infinity,weight,mis);
+                        int caustic_samples=std::min(2,samples);
+                        if(enable_mis && i<caustic_samples && depth+3<=max_depth && !rec.mat->is_dielectric()) {
+                            point3 origin=rec.p+.001*rec.geometry_normal();
+                            for(const auto& sphere:sun_spheres) {
+                                vec3 offset=sphere.center-origin; double distance=offset.length();
+                                if(distance<=sphere.radius || sphere.eta<1) continue;
+                                vec3 axial=offset/distance,tangent=safe_unit_vector(direction-dot(direction,axial)*axial);
+                                double target=std::atan2(dot(direction,tangent),dot(direction,axial));
+                                sun_sphere::map mapping(distance/sphere.radius,sphere.eta);
+                                std::array<double,3> roots;
+                                int branches=mapping.roots(target,roots);
+                                for(int branch=0;branch<branches;++branch) {
+                                    auto path=sun_sphere::connect(sphere,origin,axial,tangent,roots[branch]);
+                                    if(path.jacobian<=1e-20 || path.transmission<=0 || dot(path.direction,rec.geometry_normal())<0) continue;
+                                    hit_record entry,exit;
+                                    double visible=1;
+                                    auto connection_hit=[&](const point3& start,const vec3& direction,const point3& expected,const hittable* object,hit_record& hit) {
+                                        ray probe(start,direction,current_ray.time()); double minimum=.001;
+                                        for(int step=0;step<1024 && world.hit(probe,interval(minimum,(expected-start).length()+.002),hit);++step) {
+                                            if(hit.mat && hit.mat->is_dielectric() && std::abs(hit.mat->dielectric_ior()-sphere.eta)<1e-6 &&
+                                                (!object || object==hit.object) && (hit.p-expected).length()<1e-4*std::max(1.0,sphere.radius)) return true;
+                                            visible*=hit.mat?1-hit.mat->opacity_at(hit):0;
+                                            if(visible<=0) break;
+                                            minimum=hit.t+1e-6;
+                                        }
+                                        return false;
+                                    };
+                                    if(!connection_hit(origin,path.direction,path.entry,nullptr,entry) || !entry.front_face) continue;
+                                    if(!connection_hit(entry.p+.001*path.inside,path.inside,path.exit,entry.object,exit) || exit.front_face) continue;
+                                    visible*=compute_transmittance(ray(exit.p+.001*path.outgoing,path.outgoing,current_ray.time()),infinity,world);
+                                    if(visible<=0) continue;
+                                    double light_pdf=path.jacobian/omega,bsdf_pdf=direction_pdf(path.direction)*path.transmission;
+                                    colour energy=sun_radiance*entry.mat->transmission_tint(entry)*exit.mat->transmission_tint(exit)*
+                                        (path.transmission*visible*power_weight(caustic_samples*light_pdf,bsdf_pdf)/(caustic_samples*path.jacobian));
+                                    double cosine=std::max(0.0,dot(rec.geometry_normal(),path.direction));
+                                    lighting += subsurface ? energy*(cosine*rec.mat->subsurface_directional(cosine)) :
+                                        rec.mat->shade_direct(rec,view,path.direction,energy,world,1);
+                                }
+                            }
+                        }
                     }
                 }
                 // Delta lights cannot be reached by BSDF sampling: no MIS weight.
@@ -591,14 +650,40 @@ class camera {
                 sample.scattered = ray(rec.p,direction,current_ray.time());
             }
             previous_point = rec.p; previous_pdf = sample.pdf;
+            // Complement the sphere light proposal only for two transmitted
+            // interfaces following a non-delta receiver. Reflections and other
+            // geometry keep the ordinary path estimator.
+            if(!sample.delta) {
+                lens_origin=rec.p+.001*rec.geometry_normal();
+                lens_direction=safe_unit_vector(sample.scattered.direction());
+                lens_pdf=dot(lens_direction,rec.geometry_normal())>=0 && !sample.indirect_only?sample.pdf:0; lens_stage=0; lens_object=nullptr;
+            } else if(rec.mat->is_dielectric() && dot(sample.scattered.direction(),rec.geometry_normal())<0 &&
+                      enable_mis && count>0 && lens_pdf>0) {
+                if(lens_stage==0 && rec.front_face) {
+                    lens_stage=-1;
+                    for(const auto& sphere:sun_spheres) {
+                        if(sphere.eta<1 || std::abs(sphere.eta-rec.mat->dielectric_ior())>1e-6 ||
+                            std::abs((rec.p-sphere.center).length()-sphere.radius)>1e-4*std::max(1.0,sphere.radius)) continue;
+                        vec3 offset=sphere.center-lens_origin;
+                        if(offset.length()<=sphere.radius) continue;
+                        sun_sphere::map mapping(offset.length()/sphere.radius,sphere.eta);
+                        double theta=std::acos(std::clamp(dot(lens_direction,safe_unit_vector(offset)),-1.0,1.0));
+                        if(theta>=mapping.limit) continue;
+                        lens_jacobian=mapping.jacobian(theta); lens_transmission=mapping.transmission(theta);
+                        lens_object=rec.object; lens_stage=1; break;
+                    }
+                } else if(lens_stage==1 && !rec.front_face && rec.object==lens_object) lens_stage=2;
+                else lens_stage=-1;
+            } else {lens_stage=-1; lens_pdf=0;}
             previous_delta = sample.delta; previous_samples = count;
+            previous_indirect_only = sample.indirect_only;
             previous_sun_samples = count > 0 ? std::max(1,sun_shadow_samples) : 0;
             throughput = throughput*sample.weight;
             current_ray = sample.scattered;
             if (!sample.passthrough) {
                 vec3 direction = safe_unit_vector(current_ray.direction());
                 double side = dot(direction,rec.geometry_normal()) >= 0 ? 1 : -1;
-                current_ray = ray(rec.p+side*.001*rec.geometry_normal(),direction,current_ray.time());
+                current_ray = ray(rec.p+.001*(rec.mat->is_dielectric()?direction:side*rec.geometry_normal()),direction,current_ray.time());
             }
             if (depth >= 8) {
                 double survival = std::clamp(std::max({throughput.x(),throughput.y(),throughput.z()}),.05,.95);
@@ -613,6 +698,25 @@ class camera {
         // Legacy project/API fields; additive caustics estimates are retired.
         photon_map caustics;
         double     caustics_radius = 0.08; // gather radius
+
+    // Visibility for light reaching a back-facing direction through the
+    // receiver's own body: its surfaces bound a thickness with extinction
+    // exp(-thickness/distance), measured to the surface nearest the light.
+    // The raster viewport reads the same thickness from its shadow maps.
+    double body_transmittance(const ray& r, double max_t, const hittable& world,
+                              const hit_record& receiver, double distance) const {
+        double other = 1, thickness = 0, tmin = 0.001;
+        hit_record rec;
+        for (int step = 0; step < 1024 && tmin < max_t && world.hit(r, interval(tmin, max_t), rec); ++step) {
+            if (rec.object == receiver.object && rec.mat == receiver.mat) thickness = rec.t;
+            else {
+                other *= rec.mat ? 1.0 - clamp01(rec.mat->opacity_at(rec)) : 0.0;
+                if (other <= 1e-6) return 0.0;
+            }
+            tmin = rec.t + 0.001;
+        }
+        return other*std::exp(-thickness/distance);
+    }
 
     // Compute deterministic transmittance along a ray up to max_t by
     // accumulating per-hit material opacity (alpha). Returns value in

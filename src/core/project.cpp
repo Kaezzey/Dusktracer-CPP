@@ -152,7 +152,7 @@ struct hasher {
     }
 };
 
-template <class A, class D> void archive(A& a, D& d, int version = 2) {
+template <class A, class D> void archive(A& a, D& d, int version = 5) {
     auto& c = d.camera_settings;
     // Camera pose and lens belong to the viewport; directional/point lights
     // belong to the scene. Derived camera copies must not mark a project dirty.
@@ -175,6 +175,12 @@ template <class A, class D> void archive(A& a, D& d, int version = 2) {
                  m.sss_eta, m.sss_color_override_enabled, m.sss_color_override_color, m.unreal_pbr,
                  m.emission_intensity, m.dielectric_F0, m.normal_strength, m.albedo_tex, m.metallic_tex,
                  m.roughness_tex, m.normal_tex, m.alpha_tex, m.alpha_double_sided, m.alpha_cutoff);
+        if(version>=3) a.record("sss_profile",m.sss_profile,m.sss_radius_rgb);
+        if(version>=4) a.record("sss_unreal",m.sss_shading,m.sss_subsurface_color,m.sss_opacity,
+                                m.sss_transmission_distance,m.sss_surface_albedo,m.sss_mfp_color,m.sss_mfp_mm,
+                                m.sss_units_per_metre,m.sss_profile_tint,m.sss_lobe_roughness0,
+                                m.sss_lobe_roughness1,m.sss_lobe_mix);
+        if(version>=5) a.record("sss_base_color",m.sss_color_from_base);
         auto& g = m.graph;
         a.record("graph", g.next_id, g.pan_x, g.pan_y, g.zoom);
         a.list("nodes", g.nodes, [&](auto& n) {
@@ -208,6 +214,12 @@ void validate(const document& d) {
         }
     };
     for (const auto& m : s.materials) {
+        require(m.sss_profile>=0 && m.sss_profile<=2 && m.sss_radius_rgb.x()>0 &&
+                m.sss_radius_rgb.y()>0 && m.sss_radius_rgb.z()>0,"Invalid SSS distance profile.");
+        require(m.sss_shading>=sss_shading_burley && m.sss_shading<=sss_shading_unreal_profile &&
+                m.sss_transmission_distance>0 && m.sss_mfp_mm>=0 && m.sss_units_per_metre>0 &&
+                m.sss_opacity>=0 && m.sss_opacity<=1 && m.sss_lobe_mix>=0 && m.sss_lobe_mix<=1 &&
+                m.sss_lobe_roughness0>=0 && m.sss_lobe_roughness1>=0,"Invalid Unreal subsurface settings.");
         require(int(m.model) >= 0 && int(m.model) <= int(scene_material_model::pbr),
                 "Unknown material model.");
         for (int i : {m.albedo_tex, m.metallic_tex, m.roughness_tex, m.normal_tex, m.alpha_tex}) {
@@ -525,9 +537,13 @@ document load(const fs::path& file) {
     reader a{in};
     int version = 0;
     a.record("DUSK_SCENE", version);
-    require(version == 1 || version == 2, "Unsupported Dusk scene version.");
+    require(version >= 1 && version <= 5, "Unsupported Dusk scene version.");
     document d;
     archive(a, d, version);
+    if (version < 5) {
+        // Earlier Unreal Subsurface colours were not multiplied by base colour.
+        for (auto& m : d.world.materials) m.sss_color_from_base = false;
+    }
     in >> std::ws;
     require(in.eof(), "Unexpected data after the scene document.");
     validate(d);
@@ -580,7 +596,7 @@ document save(const fs::path& file, const view& state) {
     out.imbue(std::locale::classic());
     out << std::setprecision(17);
     writer a{out};
-    a.record("DUSK_SCENE", 2);
+    a.record("DUSK_SCENE", 5);
     archive(a, d);
     const auto contents = out.str();
     require(contents.size() <= max_document_bytes, "Scene document exceeds 64 MiB.");

@@ -54,6 +54,9 @@ static uint64_t texture_generation = 1;
 static size_t texture_bytes = 0;
 static unsigned queued_textures = 0;
 static GLuint sun_depth = 0, point_depth = 0, shadow_fbo = 0, placeholder = 0;
+// Subsurface light-space surface maps, allocated only for scenes that use them.
+static GLuint sun_surface = 0, point_surface = 0;
+static bool surface_maps = false;
 static float sun_view[16], sun_projection[16], shadow_far = 100, world_texel = .01f;
 static bool shadows_enabled = true;
 static int debug_view = 0;
@@ -268,10 +271,53 @@ static material& get_material(int index) {
     glActiveTexture(GL_TEXTURE0);
     return cached;
 }
+static bool uses_subsurface(const dusk_gpu::material_record& m) {
+    return m.subsurface.x > 0 || m.specular_lobes.w > 0;
+}
+// Shadow-map identity matching the tracers' subsurface domains: one object
+// instance and one material. Sixteen bits leave eight fraction bits for the
+// packed cosine; ids repeat only every 255 objects or 256 materials.
+static float object_id(const draw& item) {
+    return float((item.object_index % 255 + 1) * 256 + ((item.material_index + 2) & 255));
+}
+// Diffusion taps for uDiffusionTaps: stratified quantiles of each channel's
+// Burley radius distribution, golden-angle directions, and the tracers'
+// channel-mixture density. They depend only on the material, not the pixel.
+static void upload_diffusion_taps(program& shader, const dusk_gpu::material_record& m) {
+    if (m.subsurface.x <= 0) {
+        return;
+    }
+    constexpr int per_channel = raster_shaders::diffusion_taps / 3;
+    float taps[raster_shaders::diffusion_taps * 4];
+    for (int c = 0; c < 3; ++c) {
+        for (int k = 0; k < per_channel; ++k) {
+            const int i = c * per_channel + k;
+            double radius = sss::sample_burley_radius(std::max(1e-6, double(m.subsurface_distances[c])),
+                                                      (k + .5) / per_channel);
+            double density = 0;
+            for (int other = 0; other < 3; ++other) {
+                density += sss::burley_pdf_area(radius, std::max(1e-6, double(m.subsurface_distances[other]))) / 3;
+            }
+            double angle = 2.39996323 * i;
+            taps[i * 4] = float(radius * std::cos(angle));
+            taps[i * 4 + 1] = float(radius * std::sin(angle));
+            taps[i * 4 + 2] = float(radius);
+            taps[i * 4 + 3] = float(1 / (density * raster_shaders::diffusion_taps));
+        }
+    }
+    glUniform4fv(shader.location("uDiffusionTaps[0]"), raster_shaders::diffusion_taps, taps);
+}
 static void bind_material(program& shader, int index) {
     auto& cached = get_material(index);
     const auto& m = cached.record;
+    upload_diffusion_taps(shader, m);
     glUniform4fv(shader.location("uBase"), 1, &m.base.x);
+    glUniform4fv(shader.location("uSubsurface"), 1, &m.subsurface.x);
+    glUniform4fv(shader.location("uScatterTint"), 1, &m.scatter_tint.x);
+    glUniform4fv(shader.location("uSubsurfaceDistances"), 1, &m.subsurface_distances.x);
+    glUniform4fv(shader.location("uSubsurfaceColour"), 1, &m.subsurface_colour.x);
+    glUniform4fv(shader.location("uSpecularLobes"), 1, &m.specular_lobes.x);
+    glUniform4fv(shader.location("uProfileTint"), 1, &m.profile_tint.x);
     glUniform4fv(shader.location("uParameters"), 1, &m.parameters.x);
     glUniform4fv(shader.location("uF0"), 1, &m.f0.x);
     glUniform4fv(shader.location("uEmission"), 1, &m.emission.x);
@@ -367,6 +413,7 @@ static void draw_scene(program& shader, const std::vector<draw>& draws, int skip
             bind_material(shader, item.material_index);
             last_material = item.material_index;
         }
+        glUniform1f(shader.location("uObjectId"), object_id(item));
         glUniformMatrix4fv(shader.location("uModel"), 1, GL_FALSE, item.model);
         glUniformMatrix3fv(shader.location("uNormalMatrix"), 1, GL_FALSE, item.normal);
         glBindVertexArray(item.vao);
@@ -439,6 +486,7 @@ static uint64_t scene_key(const std::vector<draw>& draws, const lighting& lights
     };
     append(&revision, sizeof(revision));
     append(&lights.shadow_source, sizeof(lights.shadow_source));
+    append(&surface_maps, sizeof(surface_maps));
     for (const auto& item : draws) {
         append(item.model, sizeof(item.model));
         append(&item.vao, sizeof(item.vao));
@@ -446,6 +494,10 @@ static uint64_t scene_key(const std::vector<draw>& draws, const lighting& lights
         append(&item.count, sizeof(item.count));
         const uint64_t opacity = materials.at(item.material_index).opacity_key;
         append(&opacity, sizeof(opacity));
+        if (surface_maps) {
+            const float id = object_id(item);
+            append(&id, sizeof(id));
+        }
     }
     for (int c = 0; c < 3; ++c) {
         double value = lights.sun_direction[c];
@@ -482,6 +534,28 @@ static void ensure_shadow_targets() {
     for (GLenum axis : {GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R}) {
         glTexParameteri(GL_TEXTURE_CUBE_MAP, axis, GL_CLAMP_TO_EDGE);
     }
+}
+static void ensure_surface_targets() {
+    if (sun_surface) {
+        return;
+    }
+    glGenTextures(1, &sun_surface);
+    glActiveTexture(GL_TEXTURE0 + 15);
+    configure_texture(sun_surface, false);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, sun_resolution, sun_resolution, 0, GL_RG, GL_FLOAT, nullptr);
+    glGenTextures(1, &point_surface);
+    glActiveTexture(GL_TEXTURE0 + 16);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, point_surface);
+    for (int face = 0; face < 6; ++face) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RG32F, point_resolution, point_resolution, 0,
+                     GL_RG, GL_FLOAT, nullptr);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    for (GLenum axis : {GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R}) {
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, axis, GL_CLAMP_TO_EDGE);
+    }
+    glActiveTexture(GL_TEXTURE0);
 }
 static void fit_sun(const std::vector<draw>& draws, const lighting& light) {
     point3 minimum(infinity, infinity, infinity), maximum(-infinity, -infinity, -infinity);
@@ -537,21 +611,31 @@ static void update_shadows(const std::vector<draw>& draws, const lighting& light
         return;
     }
     ensure_shadow_targets();
+    if (surface_maps) {
+        ensure_surface_targets();
+    }
     fit_sun(draws, light);
+    GLfloat clear[4];
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+    glClearColor(0, 0, 0, 0); // object id zero: no surface
     glBindFramebuffer(GL_FRAMEBUFFER, shadow_fbo);
-    glDrawBuffer(GL_NONE);
+    glDrawBuffer(surface_maps ? GL_COLOR_ATTACHMENT0 : GL_NONE);
     glReadBuffer(GL_NONE);
     glDisable(GL_CULL_FACE);
     glUseProgram(shadow_program.id);
     glUniformMatrix4fv(shadow_program.location("uView"), 1, GL_FALSE, sun_view);
     glUniformMatrix4fv(shadow_program.location("uProj"), 1, GL_FALSE, sun_projection);
     glUniform1i(shadow_program.location("uPointShadowPass"), 0);
+    glUniform3f(shadow_program.location("uLightAxis"), float(light.sun_direction.x()),
+                float(light.sun_direction.y()), float(light.sun_direction.z()));
     glViewport(0, 0, sun_resolution, sun_resolution);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, sun_depth, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, surface_maps ? sun_surface : 0, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glClearColor(clear[0], clear[1], clear[2], clear[3]);
         return;
     }
-    glClear(GL_DEPTH_BUFFER_BIT);
+    glClear(GL_DEPTH_BUFFER_BIT | (surface_maps ? GL_COLOR_BUFFER_BIT : 0));
     draw_scene(shadow_program, draws);
     if (!light.positions.empty()) {
         const auto& p = light.positions[0];
@@ -571,10 +655,14 @@ static void update_shadows(const std::vector<draw>& draws, const lighting& light
             glUniformMatrix4fv(shadow_program.location("uView"), 1, GL_FALSE, view);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
                                    point_depth, 0);
-            glClear(GL_DEPTH_BUFFER_BIT);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                                   surface_maps ? point_surface : 0, 0);
+            glClear(GL_DEPTH_BUFFER_BIT | (surface_maps ? GL_COLOR_BUFFER_BIT : 0));
             draw_scene(shadow_program, draws, light.shadow_source);
         }
     }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glClearColor(clear[0], clear[1], clear[2], clear[3]);
     shadow_key = key;
     ++shadow_updates;
 }
@@ -625,6 +713,8 @@ static void BuildRasterShader() {
         glUniform1i(shader->location("uInstructions"), 12);
         glUniform1i(shader->location("uSunShadow"), 13);
         glUniform1i(shader->location("uPointShadow"), 14);
+        glUniform1i(shader->location("uSunSurface"), 15);
+        glUniform1i(shader->location("uPointSurface"), 16);
     }
     glGenTextures(1, &placeholder);
     glActiveTexture(GL_TEXTURE0);
@@ -640,11 +730,13 @@ static void RenderRasterScene(const float view[16], const float projection[16], 
     pump_textures();
     auto draws = collect_draws();
     material_error.clear();
+    surface_maps = false;
     for (const auto& item : draws) {
         const auto& material = get_material(item.material_index);
         if (material_error.empty() && !material.error.empty()) {
             material_error = material.error;
         }
+        surface_maps |= uses_subsurface(material.record);
     }
     auto light = scene_lighting();
     update_shadows(draws, light);
@@ -663,6 +755,10 @@ static void RenderRasterScene(const float view[16], const float projection[16], 
     glUniform3f(shader.location("uSunRadiance"), float(light.sun_radiance.x()), float(light.sun_radiance.y()),
                 float(light.sun_radiance.z()));
     glUniform1i(shader.location("uSunShadowEnabled"), shadows_enabled && sun_depth != 0);
+    glUniform1i(shader.location("uSurfaceMaps"), shadows_enabled && surface_maps && sun_surface != 0);
+    // The tracers' environment, so ambient reflections match the render.
+    glUniform3f(shader.location("uEnvironment"), float(g_camera.background.x()), float(g_camera.background.y()),
+                float(g_camera.background.z()));
     glUniform1i(shader.location("uPointShadowIndex"),
                 shadows_enabled && point_depth && !light.positions.empty() ? 0 : -1);
     glUniform1i(shader.location("uPointCount"), int(light.positions.size()));
@@ -679,6 +775,10 @@ static void RenderRasterScene(const float view[16], const float projection[16], 
     glBindTexture(GL_TEXTURE_2D, sun_depth);
     glActiveTexture(GL_TEXTURE0 + 14);
     glBindTexture(GL_TEXTURE_CUBE_MAP, point_depth);
+    glActiveTexture(GL_TEXTURE0 + 15);
+    glBindTexture(GL_TEXTURE_2D, sun_surface);
+    glActiveTexture(GL_TEXTURE0 + 16);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, point_surface);
     draw_scene(shader, draws);
     if (g_pickShader) {
         glUseProgram(g_pickShader);
@@ -720,6 +820,9 @@ static void StopRasterPreview() {
     glDeleteTextures(1, &placeholder);
     glDeleteTextures(1, &sun_depth);
     glDeleteTextures(1, &point_depth);
+    glDeleteTextures(1, &sun_surface);
+    glDeleteTextures(1, &point_surface);
+    sun_surface = point_surface = 0;
     glDeleteFramebuffers(1, &shadow_fbo);
     glDeleteProgram(shadow_program.id);
 }

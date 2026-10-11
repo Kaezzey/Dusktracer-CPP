@@ -37,7 +37,10 @@ dynamically. Missing drivers therefore do not prevent the editor from starting.
    BLAS geometry is shared between instances of each mesh asset; the TLAS keeps
    each instance’s transform and material-slot mapping.
 4. The compute shader accumulates scene-linear HDR, albedo, normals, and variance
-   in a storage buffer. Work is submitted in bounded 256-by-256 tiles, up to four samples per dispatch.
+   in a storage buffer. Each dispatch groups four independent 256-by-256 tiles
+   along its Z workgroup dimension, so the GPU schedules their blocks together.
+   Three submissions can remain in flight. GPU timings adapt the sample batch
+   from 1 to 16; per-pixel RNG and accumulation order remain unchanged.
    Cancellation is checked between submissions and preparation steps. A four-byte
    convergence readback ends adaptive renders when every pixel has converged.
 5. Readback occurs at most every 750 ms during tracing. The existing
@@ -71,6 +74,9 @@ checksum validation. A stale or corrupt cache rebuilds automatically.
   radius, strength, entry IOR, optional scatter tint, masks and material slots.
   Probes remain on the originating instance and material; lighting and shadows
   are evaluated at the sampled entry point with complementary MIS.
+- Unreal Subsurface transmission for direct lights (with thickness through the
+  object's own body) and its ambient lobe for indirect light, plus Subsurface
+  Profile dual specular lobes, matching the CPU; see `src/core/MATERIAL_TRANSPORT.md`.
 - Every current graph operation, scalar broadcast, output channels, UV tiling,
   automatic/explicit texture color spaces, normal mapping, and opacity.
 - HDR emission and textures; ordinary textures occupy one RGBA8 word per texel.
@@ -95,9 +101,18 @@ and disabled SSS preserve ordinary PBR. It replaces the diffuse substrate and
 does not add a second full diffuse lobe. Probes enumerate at most 256 scene
 intersections per axis, with a float-scale-aware advancement step. GPU SSS does
 not use a CPU shading pass or trigger CPU fallback.
+The Skin profile uses RGB diffusion distances with red scattering farther than
+blue. Its sampler includes all channel proposal densities, maintaining energy
+when colour channels use different radii. Scene units control the visible width.
 
-Sunlight and emissive caustics use ordinary dielectric path transport
-on both backends. Legacy zero-radius suns use a physical 0.266-degree disc;
+Sunlight and emissive caustics use dielectric path transport on both backends.
+For uniform glass spheres, CPU and GPU additionally sample the transmitted
+sun connection using all branches of the spherical Snell map, its solid-angle
+Jacobian, exact Fresnel factors and complementary MIS on ordinary paths.
+The estimator checks external and internal blockers, including partial alpha,
+and respects the path depth budget. This is a light proposal, not additive gain.
+Other glass geometry and internally reflected paths retain ordinary sampling.
+Legacy zero-radius suns use a physical 0.266-degree disc;
 legacy MNEE/photon settings no longer add light. The PBR model retains the CPU model’s
 single-scattering and normal-mapping approximations; this backend adds no new
 Principled layers or multiple-scattering compensation.
@@ -111,7 +126,7 @@ Progressive GPU previews apply **GPU Firefly Suppression**, enabled by default
 in Render Settings. This reconstructs isolated indirect outliers against a
 5x5 neighbourhood before tone mapping, using the same filter for previews and
 final images. It keeps direct lighting, visible emitters and specular-only
-camera paths outside the filter. Dense caustic footprints pass through.
+camera paths and targeted sphere-caustic estimates outside the filter. Dense caustic footprints pass through.
 The raw HDR estimator remains unchanged; disable the control for unfiltered
 reference output. Reconstruction can soften tiny indirect highlights, and
 does not make a low-sample caustic fully converged. No global radiance/sample
@@ -175,6 +190,11 @@ For a short scheduling and denoising regression/benchmark, run `DuskGpuTests
 build/gpu-validation.png --scheduling`. `DUSK_GPU_BATCH_SAMPLES=1` is a diagnostic
 override for comparing single-sample submissions with the default batch of four;
 values are clamped to 1–4. Batching preserves RNG sequences and exact HDR pixels.
+`DUSK_GPU_TILE_GROUP=1` selects one tile per dispatch for comparison with the
+default four (range 1–16). `--performance` benchmarks both and verifies exact
+HDR equality, including trailing tiles and partial sample batches. The diagnostic
+`DUSK_GPU_NO_SPHERE_NEE=1` disables the sphere proposal for independent path-tracing
+reference renders; it does not disable glass or sunlight.
 
 Final filtering follows the [OIDN API](https://www.openimagedenoise.org/documentation.html):
 HDR color with albedo/normal guides, checked device errors, and cancellable execution.

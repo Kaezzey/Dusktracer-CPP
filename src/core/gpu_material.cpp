@@ -105,12 +105,17 @@ struct material_compiler {
         record.emission =
             pack(m.emission.length_squared() == 0 ? m.base_color : m.emission, float(m.emission_intensity));
         record.alpha = {float(m.alpha_cutoff), m.alpha_double_sided ? 1.f : 0.f, 0, 0};
-        double fraction = m.model==scene_material_model::pbr && m.use_sss && m.sss_model!=0
-            ? std::clamp(m.sss_strength,0.,1.) : 0;
-        double eta=std::clamp(m.sss_eta,1.,4.);
-        record.subsurface = {float(fraction),float(std::max(1e-6,m.sss_radius)),float(eta),
+        const auto sss = lower_subsurface(m);
+        double fraction = sss.mode==subsurface_lowered::diffusion ? sss.strength : 0;
+        double eta=std::clamp(sss.eta,1.,4.);
+        record.subsurface = {float(fraction),float(std::max({sss.distances.x(),sss.distances.y(),sss.distances.z()})),float(eta),
             float(sss::entry_directional(1,eta)/sss::entry_transmission(1,eta))};
-        record.scatter_tint = pack(m.sss_color_override_color,m.sss_color_override_enabled?1.f:0.f);
+        record.scatter_tint = pack(sss.tint,sss.tint_override?1.f:0.f);
+        record.subsurface_distances=pack(sss.distances);
+        record.subsurface_colour=pack(sss.color,float(sss.opacity));
+        record.specular_lobes={float(sss.lobe_scale0),float(sss.lobe_scale1),float(sss.lobe_mix),
+            sss.mode==subsurface_lowered::transmission && sss.color.length_squared()>0 ? float(sss.transmission_distance) : 0.f};
+        record.profile_tint=pack(sss.tint_scale,sss.color_from_base?1.f:0.f);
         material_graph graph = m.graph;
         if (graph.nodes.empty()) {
             int output = graph.add(graph_kind::output, 0, 0);
@@ -120,7 +125,10 @@ struct material_compiler {
                 }
                 int id = graph.add(graph_kind::texture_sample, 0, 0);
                 graph.find(id)->texture_index = texture;
-                graph.connect({id, channel, output, slot});
+                std::string reason;
+                if (!graph.connect({id, channel, output, slot}, &reason)) {
+                    throw std::runtime_error("Texture binding rejected by the material graph: " + reason);
+                }
             };
             bind(0, m.albedo_tex);
             bind(3, m.normal_tex);
@@ -134,8 +142,9 @@ struct material_compiler {
                 bind(1, packed, 3);
                 bind(2, separate_roughness ? m.roughness_tex : packed, separate_roughness ? 1 : 2);
             } else {
-                bind(1, m.metallic_tex);
-                bind(2, m.roughness_tex);
+                // Scalar inputs take the red channel, as the CPU material does.
+                bind(1, m.metallic_tex, 1);
+                bind(2, m.roughness_tex, 1);
             }
         } else {
             record.alpha.y = 1;

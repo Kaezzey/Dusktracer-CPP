@@ -31,6 +31,43 @@ static bool has_extension_ci(const std::string& path, const char* ext)
     return true;
 }
 
+subsurface_lowered lower_subsurface(const scene_material_parameters& m) {
+    subsurface_lowered s;
+    if (m.model != scene_material_model::pbr || !m.use_sss || m.sss_model == 0) return s;
+    auto unit = [](const vec3& c) {
+        vec3 r;
+        for (int i = 0; i < 3; ++i) r[i] = std::isfinite(c[i]) ? std::clamp(c[i], 0.0, 1.0) : 0;
+        return r;
+    };
+    s.eta = m.sss_eta;
+    if (m.sss_shading == sss_shading_unreal_subsurface) {
+        s.mode = subsurface_lowered::transmission;
+        s.color = unit(m.sss_subsurface_color);
+        s.color_from_base = m.sss_color_from_base;
+        s.opacity = std::clamp(m.sss_opacity, 0.0, 1.0);
+        s.transmission_distance = std::max(1e-6, m.sss_transmission_distance);
+        return s;
+    }
+    s.mode = subsurface_lowered::diffusion;
+    s.strength = std::clamp(m.sss_strength, 0.0, 1.0);
+    if (m.sss_shading == sss_shading_unreal_profile) {
+        vec3 albedo = unit(m.sss_surface_albedo);
+        double metres = std::max(0.0, m.sss_mfp_mm)*1e-3*std::max(0.0, m.sss_units_per_metre);
+        for (int c = 0; c < 3; ++c)
+            s.distances[c] = std::max(1e-6, metres*std::max(0.0, m.sss_mfp_color[c])/sss::burley_mfp_scaling(albedo[c]));
+        s.tint_scale = unit(m.sss_profile_tint);
+        s.lobe_scale0 = std::clamp(m.sss_lobe_roughness0, 0.0, 2.0);
+        s.lobe_scale1 = std::clamp(m.sss_lobe_roughness1, 0.0, 2.0);
+        s.lobe_mix = std::clamp(m.sss_lobe_mix, 0.0, 1.0);
+        return s;
+    }
+    s.distances = std::max(1e-6, m.sss_radius)*m.sss_radius_rgb;
+    for (int c = 0; c < 3; ++c) s.distances[c] = std::max(1e-6, s.distances[c]);
+    s.tint_override = m.sss_color_override_enabled;
+    s.tint = m.sss_color_override_color;
+    return s;
+}
+
 // ------------------------------------------------------------
 // Texture cache: map file path + sample-space -> shared_ptr<texture>
 // ------------------------------------------------------------
@@ -208,19 +245,30 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
 
         // Propagate subsurface scattering (SSS) settings from editor material
         // Only apply SSS if use_sss is enabled
-        mat->sss_strength = m.use_sss ? m.sss_strength : 0.0;
+        const auto sss = lower_subsurface(m);
+        const bool diffusion = sss.mode == subsurface_lowered::diffusion;
+        mat->sss_strength = diffusion ? sss.strength : 0.0;
         mat->sss_scale = m.sss_scale;
-        // Extended dipole/diffusion params
-        mat->sss_model = static_cast<SSSModel>(m.sss_model);
+        mat->sss_model = diffusion ? static_cast<SSSModel>(m.sss_model) : SSS_NONE;
         mat->sss_samples = m.sss_samples;
-        mat->sss_radius = m.sss_radius;
-        mat->sss_eta = m.sss_eta;
-        mat->sss_color_override = m.sss_color_override_enabled;
+        mat->sss_radius = 1;
+        mat->sss_radius_rgb = sss.distances;
+        mat->sss_eta = sss.eta;
+        mat->sss_color_override = sss.tint_override;
         mat->sss_color_override_col = colour(
-            (float)m.sss_color_override_color.x(),
-            (float)m.sss_color_override_color.y(),
-            (float)m.sss_color_override_color.z()
+            (float)sss.tint.x(),
+            (float)sss.tint.y(),
+            (float)sss.tint.z()
         );
+        mat->sss_tint_scale = sss.tint_scale;
+        mat->lobe_scale0 = sss.lobe_scale0;
+        mat->lobe_scale1 = sss.lobe_scale1;
+        mat->lobe_mix = sss.lobe_mix;
+        mat->sss_transmission = sss.mode == subsurface_lowered::transmission;
+        mat->sss_transmission_color = sss.color;
+        mat->sss_transmission_base = sss.color_from_base;
+        mat->sss_opacity = sss.opacity;
+        mat->sss_transmission_distance = sss.transmission_distance;
         // Unreal PBR packing flag
         mat->use_unreal_pbr = m.graph.nodes.empty() && m.unreal_pbr;
 
@@ -428,6 +476,20 @@ hittable_list build_world_from_scene(const scene& scn)
 // ------------------------------------------------------------
 void build_emissive_surfaces(const scene& scn, camera& cam)
 {
+    cam.sun_spheres.clear();
+    for(const auto& obj:scn.objects) {
+        if(obj.type!=scene_object_type::sphere || obj.material_index<0 || obj.material_index>=int(scn.materials.size())) continue;
+        const auto& mat=scn.materials[obj.material_index];
+        vec3 scale=obj.scale;
+        for(int c=0;c<3;++c) scale[c]=scale[c]==0?1:std::abs(scale[c]);
+        if(mat.model!=scene_material_model::dielectric || mat.ior<1 || obj.radius<=0 ||
+            std::abs(scale.x()-scale.y())>1e-6*scale.x() || std::abs(scale.x()-scale.z())>1e-6*scale.x()) continue;
+        sun_sphere::lens lens{obj.center+obj.translation,obj.radius*scale.x(),mat.ior};
+        bool duplicate=std::any_of(cam.sun_spheres.begin(),cam.sun_spheres.end(),[&](const auto& previous) {
+            return (previous.center-lens.center).length_squared()<1e-20 && previous.radius==lens.radius && previous.eta==lens.eta;
+        });
+        if(!duplicate) cam.sun_spheres.push_back(lens);
+    }
     std::vector<camera::emissive_surface> surfaces;
     auto add = [&](std::shared_ptr<hittable> geometry) {
         hit_record sample; double pdf;

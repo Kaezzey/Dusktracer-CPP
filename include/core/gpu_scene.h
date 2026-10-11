@@ -46,6 +46,10 @@ struct material_record {
     f4 alpha;       // cutoff, double-sided masking, provably opaque, reserved
     f4 subsurface;  // Burley fraction, world-space radius, entry IOR, directional normalization
     f4 scatter_tint;// RGB override tint; W enables override
+    f4 subsurface_distances; // RGB world-space diffusion distances
+    f4 subsurface_colour;   // RGB Unreal Subsurface colour; W Unreal opacity
+    f4 specular_lobes;      // lobe 0/1 roughness scales, lobe 1 weight; W body extinction distance (0 = none)
+    f4 profile_tint;        // RGB diffusion tint multiplier; W multiplies Subsurface colour by base
     i4 programs[5]; // start, count, result register, result channel
 };
 struct texture_record {
@@ -73,5 +77,5 @@ material_record compile_material(const scene& source, const scene_material& mate
                                  const std::function<int(int)>& texture_channels = {});
 snapshot compile_scene(const scene& source, const std::atomic<bool>* cancel = nullptr);
 static_assert(sizeof(vertex) == 80 && sizeof(instance) == 64 && sizeof(instruction) == 80 &&
-              sizeof(material_record) == 192);
+              sizeof(material_record) == 256);
 } // namespace dusk_gpu

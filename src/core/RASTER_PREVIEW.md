@@ -25,7 +25,12 @@ original images. This is independent of the Content Drawer and sphere-preview
 workers.
 
 Lighting uses the existing GGX distribution, Smith masking and Schlick Fresnel
-for direct illumination, plus a neutral studio fill. One directional light has
+for direct illumination. Ambient light comes from the renderer's Sky /
+Background colour, as in the tracers: the diffuse substrate behind `(1-F)` and a
+Fresnel reflection of that colour. A small diffuse fill stands in for bounce
+light, which the viewport does not trace; it has no specular part, so a black
+sky gives dark grazing rims in both the viewport and the render. The material
+sphere preview uses a neutral grey studio sky instead. One directional light has
 a fitted 2048-square filtered depth map. The first point light (or first
 emissive primitive when there are no point lights) has a filtered 512-square
 cubemap. Receiver-plane comparisons use the actual cubemap texel centers to
@@ -34,10 +39,21 @@ shadow maps; camera navigation and scalar color/metalness/roughness changes
 reuse them. Other point lights illuminate without shadow maps, up to eight
 point/emissive lights in total.
 
-This remains an interactive preview: studio fill and emissive center-light
+This remains an interactive preview: the bounce-light fill and emissive center-light
 approximations are not global illumination. Glass is a tinted reflective
-preview; refraction, traced reflections, subsurface scattering and caustics
-require Render. Alpha uses a stable cutout at max(authored cutoff, 0.5), rather
+preview; refraction, traced reflections and caustics require Render.
+Subsurface materials use the tracers' functions and integrals with light-space
+surface maps; see "Raster preview parity" in `MATERIAL_TRANSPORT.md`. PBR
+direct lighting uses the tracers' diffuse Fresnel factors `(1-F(N.V))(1-F(N.L))`
+and dual specular lobes. The sun's 3x3 PCF compares each tap with the
+receiver's tangent plane, so sloped lit surfaces do not shadow themselves; the
+plane keeps its true slope down to grazing angles.
+
+Materials without a node graph take metallic and roughness maps from the
+inspector's texture slots. The shared material compiler binds those through
+their red channel, like the CPU material; previously it bound the colour output,
+which the graph rejects for scalar inputs, so the viewport and Vulkan silently
+used the scalar sliders. Rejected bindings now raise an error instead. Alpha uses a stable cutout at max(authored cutoff, 0.5), rather
 than path-traced stochastic transparency. Filtered, reduced viewport textures
 need not match nearest-sampled full-resolution final pixels. Materials are
 limited to 12 distinct textures and 32 live graph values; an unsupported graph
