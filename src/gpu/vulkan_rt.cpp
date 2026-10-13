@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 #include <windows.h>
 #include "core/render_backend.h"
+#include "core/render_tiles.h"
 #include "core/gpu_scene.h"
 #include "pathtrace_spv.h"
 #include <array>
@@ -16,7 +17,9 @@
 #include <iostream>
 #include "pipeline_cache.h"
 #include "content_key.h"
+#include <algorithm>
 #include <mutex>
+#include <thread>
 
 namespace dusk_gpu {
 namespace {
@@ -129,7 +132,7 @@ struct context {
     std::array<pending_submission, 3> pending{};
     size_t next_submission = 0;
     uint32_t timestamp_bits = 0;
-    double submission_ms = 0;
+    double submission_ms = 0, busy_ms = 0; // last queued submission; sum of all (DUSK_GPU_TIMINGS)
     int64_t completed_work = 0;
     bool synchronous = false;
     VkDescriptorPool descriptors{};
@@ -440,13 +443,19 @@ struct context {
         VkMemoryPropertyFlags flags =
             host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        uint32_t type = 0;
-        for (; type < memory.memoryTypeCount; ++type) {
-            if ((req.memoryTypeBits & (1u << type)) &&
-                (memory.memoryTypes[type].propertyFlags & flags) == flags) {
-                break;
-            }
-        }
+        auto find = [&](VkMemoryPropertyFlags wanted) {
+            uint32_t type = 0;
+            while (type < memory.memoryTypeCount &&
+                   (!(req.memoryTypeBits & (1u << type)) || (memory.memoryTypes[type].propertyFlags & wanted) != wanted))
+                ++type;
+            return type;
+        };
+        // The CPU reads readback buffers. On uncached (write-combined) host
+        // memory those reads crawl: hundreds of milliseconds for one 1080p
+        // preview. Prefer a host-cached type for them; uploads keep the first.
+        uint32_t type = memory.memoryTypeCount;
+        if (host && (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT)) type = find(flags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (type == memory.memoryTypeCount) type = find(flags);
         if (type == memory.memoryTypeCount) {
             throw std::runtime_error("No suitable GPU memory type.");
         }
@@ -485,6 +494,7 @@ struct context {
                   "Read GPU timer");
             const uint64_t mask = timestamp_bits == 64 ? ~uint64_t(0) : (uint64_t(1) << timestamp_bits) - 1;
             submission_ms = double((ticks[1] - ticks[0]) & mask) * properties.limits.timestampPeriod / 1e6;
+            busy_ms += submission_ms;
         }
         completed_work += slot.work;
         slot.pending = false;
@@ -865,7 +875,9 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
         }
         const auto& geom = scene.geometries[i].data;
         VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-        geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        // Shadow rays visit every crossing once as a candidate
+        // (pathtrace.comp: visibility); none may be reported twice.
+        geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR | VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
         if (geom.w) {
             geometry.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
             auto& a = geometry.geometry.aabbs;
@@ -896,6 +908,9 @@ VkAccelerationStructureKHR build_world(context& c, const snapshot& scene, const 
         target.instanceCustomIndex = uint32_t(i);
         target.mask = masks[i];
         target.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        // Alpha-tested instances offer their crossings as candidates
+        // (pathtrace.comp: traceSurface); ray flags force the rest opaque.
+        if (masks[i] == 2) target.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
         target.accelerationStructureReference = c.asAddress(blas[source.data.x]);
     }
     auto instanceBuffer = c.allocate(instances.size() * sizeof(VkAccelerationStructureInstanceKHR),
@@ -1177,6 +1192,7 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
     int batch_samples = 4;
     c.completed_work = 0;
     c.submission_ms = 0;
+    c.busy_ms = 0;
     c.synchronous = std::getenv("DUSK_GPU_SYNCHRONOUS") != nullptr;
     const bool fixed_batch = std::getenv("DUSK_GPU_BATCH_SAMPLES") != nullptr;
     if (const char* override_samples = std::getenv("DUSK_GPU_BATCH_SAMPLES")) {
@@ -1192,8 +1208,13 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
         progress->completed_tiles = 0;
         progress->total_scanlines = cam.image_height;
         progress->completed_scanlines = 0;
+        progress->image_width = cam.image_width;
+        progress->image_height = cam.image_height;
+        progress->clear_tiles();
     }
-    double preview_interval = .75;
+    // Bucket previews refresh only the traced buckets, so they can follow
+    // each bucket's samples closely, as Cycles' tiles do.
+    double preview_interval = settings.gpu_buckets ? .15 : .75;
     if (const char* interval = std::getenv("DUSK_GPU_PREVIEW_MS")) preview_interval = std::clamp(std::atof(interval), 1., 5000.) / 1000.;
     auto lastReadback = clock::now();
     int completed = 0;
@@ -1243,7 +1264,18 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
         return resolve(static_cast<const pixel*>(readback.mapped), cam.image_width, cam.image_height,
                        settings, final, final ? linear : nullptr, cancel, status);
     };
-    auto all_converged = [&] {
+    // Host time per scheduling step, reported with DUSK_GPU_TIMINGS.
+    double enqueue_ms = 0, preview_ms = 0, converge_ms = 0, readback_ms = 0;
+    auto clocked = [&](double& total) {
+        struct scope {
+            double& total;
+            clock::time_point begin = clock::now();
+            ~scope() { total += std::chrono::duration<double, std::milli>(clock::now() - begin).count(); }
+        };
+        return scope{total};
+    };
+    auto converged_pixels = [&] {
+        auto timer = clocked(converge_ms);
         c.submit([&](VkCommandBuffer cmd) {
             c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1252,76 +1284,296 @@ render_result render(snapshot scene, camera cam, const renderer& settings, const
             c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
         });
-        return *static_cast<const uint32_t*>(convergence.mapped) ==
-               uint32_t(cam.image_width * cam.image_height);
+        return *static_cast<const uint32_t*>(convergence.mapped);
     };
-    int next_convergence_check = std::max(16, settings.adaptive_min_samples);
-    for (int sample = 0; sample < cam.samples_per_pixel && !stop;) {
-        const int samples = std::min(batch_samples, cam.samples_per_pixel - sample);
-        for (int first_tile = 0; first_tile < columns*rows && !stop; first_tile += tile_group) {
+    // One barrier orders a submission after the previous one. The tiles
+    // inside it are independent: no barrier or host wait separates them, so
+    // their dispatches overlap and hide each other's long-path tails.
+    auto begin_tiles = [&](VkCommandBuffer cmd) {
+        c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        c.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
+        c.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipelineLayout, 0, 1,
+                                  &descriptor, 0, nullptr);
+    };
+    // Z workgroups cover consecutive tile indices.
+    auto dispatch_tiles = [&](VkCommandBuffer cmd, int sample, int samples, uint32_t first_tile, uint32_t tiles) {
+        uint32_t constants[] = {uint32_t(sample), first_tile, UINT32_MAX, uint32_t(samples)};
+        c.vkCmdPushConstants(cmd, c.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                             sizeof(constants), constants);
+        c.vkCmdDispatch(cmd, tile/8, tile/8, tiles);
+    };
+    auto tune_batch = [&] {
+        if (!fixed_batch && c.submission_ms > 0) {
+            if (c.submission_ms < 2) batch_samples = std::min(16, batch_samples * 2);
+            else if (c.submission_ms > 8) batch_samples = std::max(1, batch_samples / 2);
+        }
+    };
+    // Work credited to buckets that converged before their last sample.
+    int64_t skipped = 0;
+    auto report = [&] {
+        double elapsed = std::chrono::duration<double>(clock::now() - start).count();
+        if (progress) {
+            progress->completed_tiles = int(c.completed_work + skipped);
+            progress->elapsed_seconds = elapsed;
+            progress->eta_seconds = elapsed / completed * (total - completed);
+        }
+    };
+    // In bucket mode finished buckets are denoised for the viewport while the
+    // next ones trace. The final image is still denoised as one frame.
+    const bool buckets = settings.gpu_buckets;
+    std::vector<float> bucket_color, bucket_albedo, bucket_normal, bucket_indirect;
+    std::unique_ptr<dusk_tiles::denoiser> bucket_denoiser;
+    if (buckets && callback && settings.use_denoiser && settings.progressive_denoise && settings.denoiser_strength > 0) {
+        const size_t values = size_t(cam.image_width) * cam.image_height * 3;
+        bucket_color.assign(values, 0.f);
+        bucket_albedo.assign(values, 0.f);
+        bucket_normal.assign(values, 0.f);
+        if (settings.gpu_firefly_filter) bucket_indirect.assign(values, 0.f);
+        // Half the cores: OIDN must not starve the thread feeding the GPU.
+        const int threads = std::max(1, int(std::thread::hardware_concurrency()) / 2);
+        bucket_denoiser = std::make_unique<dusk_tiles::denoiser>(
+            cam.image_width, cam.image_height, tile, bucket_color.data(), bucket_albedo.data(), bucket_normal.data(),
+            bucket_indirect.empty() ? nullptr : bucket_indirect.data(), settings.denoiser_strength, settings.exposure,
+            threads, progress, cancel);
+    }
+    auto preview = [&] {
+        auto timer = clocked(preview_ms);
+        auto image = read(false);
+        if (bucket_denoiser) bucket_denoiser->overlay(image.pixels);
+        callback(image);
+        lastReadback = clock::now();
+    };
+    // Bucket mode keeps a frame on the host and refreshes only the buckets
+    // being traced: the display pass and readback cover just their pixels.
+    render_result frame;
+    if (buckets && callback) {
+        frame.width = cam.image_width;
+        frame.height = cam.image_height;
+        frame.pixels.assign(size_t(cam.image_width) * cam.image_height * 3, 0);
+    }
+    auto preview_buckets = [&](const std::vector<dusk_tiles::rect>& rects) {
+        auto timer = clocked(preview_ms);
+        std::vector<VkBufferCopy> copies;
+        VkDeviceSize bytes = 0;
+        for (const auto& r : rects) {
+            for (int y = r.y0; y < r.y1; ++y) {
+                const VkDeviceSize offset = (VkDeviceSize(y) * cam.image_width + r.x0) * sizeof(uint32_t);
+                copies.push_back({offset, offset, VkDeviceSize(r.width()) * sizeof(uint32_t)});
+                bytes += VkDeviceSize(r.width()) * sizeof(uint32_t);
+            }
+        }
+        c.submit([&](VkCommandBuffer cmd) {
+            c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            c.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
+            c.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipelineLayout, 0, 1, &descriptor, 0, nullptr);
+            const float exposure = float(settings.exposure);
+            for (const auto& r : rects) {
+                // A zero sample count selects the display pass at this pixel offset.
+                uint32_t constants[4]{0, uint32_t(r.x0), uint32_t(r.y0), 0};
+                std::memcpy(&constants[0], &exposure, sizeof(exposure));
+                c.vkCmdPushConstants(cmd, c.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+                c.vkCmdDispatch(cmd, (r.width() + 7) / 8, (r.height() + 7) / 8, 1);
+            }
+            c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            c.vkCmdCopyBuffer(cmd, session.display.handle, session.display_readback.handle, uint32_t(copies.size()),
+                              copies.data());
+            c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+        });
+        if (statistics) statistics->preview_readback_bytes += bytes;
+        const auto* packed = static_cast<const uint32_t*>(session.display_readback.mapped);
+        for (const auto& r : rects) {
+            for (int y = r.y0; y < r.y1; ++y) {
+                for (int x = r.x0; x < r.x1; ++x) {
+                    const size_t p = size_t(y) * cam.image_width + x;
+                    frame.pixels[p * 3] = uint8_t(packed[p]);
+                    frame.pixels[p * 3 + 1] = uint8_t(packed[p] >> 8);
+                    frame.pixels[p * 3 + 2] = uint8_t(packed[p] >> 16);
+                }
+            }
+        }
+        auto image = frame;
+        if (bucket_denoiser) bucket_denoiser->overlay(image.pixels);
+        callback(image);
+        lastReadback = clock::now();
+    };
+    auto preview_due = [&] {
+        return callback && std::chrono::duration<double>(clock::now() - lastReadback).count() >= preview_interval;
+    };
+    // Copies finished buckets' accumulators to the host and resolves them as
+    // resolve() does, for the bucket denoiser.
+    auto read_buckets = [&](const std::vector<dusk_tiles::rect>& finished) {
+        auto timer = clocked(readback_ms);
+        std::vector<VkBufferCopy> copies;
+        VkDeviceSize bytes = 0;
+        for (const auto& r : finished) {
+            for (int y = r.y0; y < r.y1; ++y) {
+                const VkDeviceSize offset = (VkDeviceSize(y) * cam.image_width + r.x0) * sizeof(pixel);
+                copies.push_back({output_header_bytes + offset, offset, VkDeviceSize(r.width()) * sizeof(pixel)});
+                bytes += VkDeviceSize(r.width()) * sizeof(pixel);
+            }
+        }
+        c.submit([&](VkCommandBuffer cmd) {
+            c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            c.vkCmdCopyBuffer(cmd, output.handle, readback.handle, uint32_t(copies.size()), copies.data());
+            c.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+        });
+        if (statistics) statistics->preview_readback_bytes += bytes;
+        const auto* pixels = static_cast<const pixel*>(readback.mapped);
+        for (const auto& r : finished) {
+            for (int y = r.y0; y < r.y1; ++y) {
+                for (int x = r.x0; x < r.x1; ++x) {
+                    const size_t p = size_t(y) * cam.image_width + x;
+                    const float count = std::max(1.f, pixels[p].sum.w);
+                    for (int k = 0; k < 3; ++k) {
+                        const float value = pixels[p].sum[k] / count;
+                        bucket_color[p * 3 + k] = std::isfinite(value) ? std::max(0.f, value) : 0;
+                        bucket_albedo[p * 3 + k] = pixels[p].albedo[k] / count;
+                        bucket_normal[p * 3 + k] = pixels[p].normal[k] / count;
+                        if (!bucket_indirect.empty()) {
+                            const float energy = pixels[p].indirect[k] / count;
+                            bucket_indirect[p * 3 + k] = std::isfinite(energy) ? std::max(0.f, energy) : 0;
+                        }
+                    }
+                }
+            }
+            bucket_denoiser->finished(r);
+        }
+    };
+    if (buckets) {
+        // Each group of buckets takes every sample before the next group
+        // starts, like Cycles' GPU tiles. Per-pixel RNG streams depend only on
+        // the pixel and sample index, so the image matches progressive mode.
+        const auto order = dusk_tiles::make_tiles(cam.image_width, cam.image_height, tile, settings.bucket_order);
+        bool every_group_converged = settings.adaptive_sampling;
+        for (size_t first = 0; first < order.size() && !stop; first += size_t(tile_group)) {
+            const std::vector<dusk_tiles::rect> group(order.begin() + first,
+                                                      order.begin() + std::min(order.size(), first + size_t(tile_group)));
+            const int count = int(group.size());
+            uint32_t group_pixels = 0;
+            std::vector<uint32_t> indices;
+            for (const auto& r : group) {
+                group_pixels += uint32_t(r.width() * r.height());
+                indices.push_back(uint32_t((r.y0 / tile) * columns + r.x0 / tile));
+                if (progress) progress->begin_tile({r.x0, r.y0, r.width(), r.height(), render_tile_activity::rendering});
+            }
+            // Consecutive tile indices share one dispatch.
+            std::sort(indices.begin(), indices.end());
+            std::vector<std::pair<uint32_t, uint32_t>> runs;
+            for (uint32_t index : indices) {
+                if (!runs.empty() && runs.back().first + runs.back().second == index) ++runs.back().second;
+                else runs.push_back({index, 1});
+            }
+            const uint32_t converged_before = settings.adaptive_sampling ? converged_pixels() : 0;
+            int next_check = std::max(16, settings.adaptive_min_samples);
+            bool converged = false;
+            int sample = 0;
+            while (sample < cam.samples_per_pixel) {
+                if (cancelled()) {
+                    stop = true;
+                    break;
+                }
+                const int samples = std::min(batch_samples, cam.samples_per_pixel - sample);
+                {
+                    auto timer = clocked(enqueue_ms);
+                    c.enqueue(samples * count, [&](VkCommandBuffer cmd) {
+                        begin_tiles(cmd);
+                        for (const auto& run : runs) dispatch_tiles(cmd, sample, samples, run.first, run.second);
+                    });
+                }
+                completed += samples * count;
+                sample += samples;
+                report();
+                if (preview_due()) preview_buckets(group);
+                tune_batch();
+                if (settings.adaptive_sampling && sample < cam.samples_per_pixel && sample >= next_check) {
+                    next_check = sample + std::max(16, settings.adaptive_check_interval);
+                    if (converged_pixels() - converged_before == group_pixels) {
+                        converged = true;
+                        const int64_t rest = int64_t(cam.samples_per_pixel - sample) * count;
+                        skipped += rest;
+                        completed += int(rest);
+                    }
+                }
+                if (converged) break;
+            }
+            if (!converged) every_group_converged = false;
+            if (progress) {
+                for (const auto& r : group)
+                    progress->end_tile({r.x0, r.y0, r.width(), r.height(), render_tile_activity::rendering});
+            }
+            if (stop) break;
+            if (bucket_denoiser) read_buckets(group);
+            if (callback) preview_buckets(group);
+        }
+        if (!stop && every_group_converged && status) status("Adaptive sampling converged.");
+    } else {
+        int next_convergence_check = std::max(16, settings.adaptive_min_samples);
+        for (int sample = 0; sample < cam.samples_per_pixel && !stop;) {
+            const int samples = std::min(batch_samples, cam.samples_per_pixel - sample);
+            for (int first_tile = 0; first_tile < columns*rows && !stop; first_tile += tile_group) {
                 const int tiles=std::min(tile_group,columns*rows-first_tile);
                 if (cancelled()) {
                     stop = true;
                     break;
                 }
-                c.enqueue(samples*tiles, [&](VkCommandBuffer cmd) {
-                    c.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                              VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-                    c.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipeline);
-                    c.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipelineLayout, 0, 1,
-                                              &descriptor, 0, nullptr);
-                    // Z workgroups cover independent tiles in one dispatch;
-                    // there is no barrier or host wait between these blocks.
-                    uint32_t constants[] = {uint32_t(sample), uint32_t(first_tile), UINT32_MAX, uint32_t(samples)};
-                    c.vkCmdPushConstants(cmd, c.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                         sizeof(constants), constants);
-                    c.vkCmdDispatch(cmd, tile/8, tile/8, tiles);
-                });
+                {
+                    auto timer = clocked(enqueue_ms);
+                    c.enqueue(samples*tiles, [&](VkCommandBuffer cmd) {
+                        begin_tiles(cmd);
+                        dispatch_tiles(cmd, sample, samples, uint32_t(first_tile), uint32_t(tiles));
+                    });
+                }
                 completed += samples*tiles;
-                auto now = clock::now();
-                double elapsed = std::chrono::duration<double>(now - start).count();
-                if (progress) {
-                    progress->completed_tiles = int(c.completed_work);
-                    progress->elapsed_seconds = elapsed;
-                    progress->eta_seconds = elapsed / completed * (total - completed);
-                }
-                if (callback && std::chrono::duration<double>(now - lastReadback).count() >= preview_interval) {
-                    callback(read(false));
-                    lastReadback = clock::now();
-                }
-        }
-        if (!fixed_batch && c.submission_ms > 0) {
-            if (c.submission_ms < 2) batch_samples = std::min(16, batch_samples * 2);
-            else if (c.submission_ms > 8) batch_samples = std::max(1, batch_samples / 2);
-        }
-        if (!stop && settings.adaptive_sampling && sample + samples >= next_convergence_check) {
-            next_convergence_check = sample + samples + std::max(16, settings.adaptive_check_interval);
-            if (all_converged()) {
-                if (status) {
-                    status("Adaptive sampling converged.");
-                }
-                break;
+                report();
+                if (preview_due()) preview();
             }
+            tune_batch();
+            if (!stop && settings.adaptive_sampling && sample + samples >= next_convergence_check) {
+                next_convergence_check = sample + samples + std::max(16, settings.adaptive_check_interval);
+                if (converged_pixels() == uint32_t(cam.image_width * cam.image_height)) {
+                    if (status) {
+                        status("Adaptive sampling converged.");
+                    }
+                    break;
+                }
+            }
+            sample += samples;
         }
-        sample += samples;
     }
     c.drain();
-    if (progress) progress->completed_tiles = int(c.completed_work);
+    if (bucket_denoiser) bucket_denoiser->stop();
+    if (progress) {
+        progress->clear_tiles();
+        progress->completed_tiles = int(c.completed_work + skipped);
+    }
     if (progress && !stop) {
         progress->completed_tiles = int(total);
         progress->completed_scanlines = cam.image_height;
         progress->eta_seconds = 0;
     }
+    if (timings) {
+        std::cerr << "GPU busy in tracing submissions: " << c.busy_ms << " ms; host enqueue " << enqueue_ms
+                  << " ms, previews " << preview_ms << " ms, convergence " << converge_ms << " ms, bucket readback "
+                  << readback_ms << " ms\n";
+    }
     timed("tracing");
     // Publish the completed raw preview before final OIDN. Timer throttling can
     // otherwise skip the last batch, leaving the viewport at an older sample count.
     if(callback && !stop) {
-        callback(read(false));
+        preview();
         stop=cancelled();
     }
     auto result = read(!stop);
+    if (stop && bucket_denoiser) bucket_denoiser->overlay(result.pixels);
     timed("resolve");
     retain.committed = true;
     return result;

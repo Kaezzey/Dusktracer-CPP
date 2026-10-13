@@ -155,6 +155,8 @@ bool embree_triangle_accel::hit(const ray& r, interval ray_t, hit_record& rec) c
         interpN = unit_vector(interpN);
         rec.set_face_normal(r, safe_unit_vector(vec3(rh.hit.Ng_x,rh.hit.Ng_y,rh.hit.Ng_z)));
         rec.set_shading_normal(interpN);
+        rec.smooth_offset = smooth_surface_offset(rec.p, td.v0, td.v1, td.v2, td.n0, td.n1, td.n2, w, u, v);
+        rec.primitive = &td;
 
         // Interpolate tangent & bitangent and Gram-Schmidt them to normal
         vec3 interpT = (td.t0 * (float)w) + (td.t1 * (float)u) + (td.t2 * (float)v);
@@ -238,6 +240,7 @@ bool embree_triangle_accel::hit_packet(const std::array<ray,4>& rays, const inte
             interpN = unit_vector(interpN);
             rec.set_face_normal(rays[i], safe_unit_vector(vec3(rh4.hit.Ng_x[i],rh4.hit.Ng_y[i],rh4.hit.Ng_z[i])));
             rec.set_shading_normal(interpN);
+            rec.primitive = &td;
 
             vec3 interpT = (td.t0 * (float)w) + (td.t1 * (float)u) + (td.t2 * (float)v);
             vec3 interpB = (td.b0 * (float)w) + (td.b1 * (float)u) + (td.b2 * (float)v);

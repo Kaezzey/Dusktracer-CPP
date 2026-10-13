@@ -7,8 +7,11 @@ renderer's UV conventions. The normal matrix is the inverse transpose, so
 nonuniform and mirrored transforms preserve the shading frame.
 
 `gpu_material.cpp` lowers the reachable material graph for both raster and Vulkan.
-Raster uses one linked GLSL 1.30 program and a small float instruction texture
-per material. Editing values uploads bytecode; it never recompiles the viewport
+Raster uses linked GLSL 1.30 programs and a small float instruction texture
+per material. Each pass is compiled twice, with an 8-value and a 32-value
+register file; a material uses the fast 8-value program when its graph fits
+(see [EDITOR_VIEWPORT.md](EDITOR_VIEWPORT.md) for this and the depth
+pre-pass). Editing values uploads bytecode; it never recompiles the viewport
 shader. Moving nodes or adding disconnected nodes schedules no material work.
 Supported inputs include base color, metalness, roughness, tangent normals,
 opacity, emission, UV tiling and all current arithmetic nodes. Color samples
@@ -30,7 +33,10 @@ Background colour, as in the tracers: the diffuse substrate behind `(1-F)` and a
 Fresnel reflection of that colour. A small diffuse fill stands in for bounce
 light, which the viewport does not trace; it has no specular part, so a black
 sky gives dark grazing rims in both the viewport and the render. The material
-sphere preview uses a neutral grey studio sky instead. One directional light has
+sphere preview uses a neutral grey studio sky instead. The viewport applies the
+renderer's exposure and the tracers' luminance Reinhard tone mapping, which keeps
+hue and saturation, and shows a coloured sky behind objects; a black sky keeps
+the editor's dark grey. One directional light has
 a fitted 2048-square filtered depth map. The first point light (or first
 emissive primitive when there are no point lights) has a filtered 512-square
 cubemap. Receiver-plane comparisons use the actual cubemap texel centers to
@@ -53,8 +59,12 @@ Materials without a node graph take metallic and roughness maps from the
 inspector's texture slots. The shared material compiler binds those through
 their red channel, like the CPU material; previously it bound the colour output,
 which the graph rejects for scalar inputs, so the viewport and Vulkan silently
-used the scalar sliders. Rejected bindings now raise an error instead. Alpha uses a stable cutout at max(authored cutoff, 0.5), rather
-than path-traced stochastic transparency. Filtered, reduced viewport textures
+used the scalar sliders. Rejected bindings now raise an error instead. Alpha
+follows the material's Alpha Mode. Clip cuts at the authored threshold. Blend
+draws alpha of 0.99 and above with the solid surfaces, then blends the rest over
+the scene without writing depth, farthest object first (order within one mesh
+is not sorted). Shadow maps keep a hashed fraction of a Blend surface, which
+their filtering turns into partial shadow, as the tracers transmit it. Filtered, reduced viewport textures
 need not match nearest-sampled full-resolution final pixels. Materials are
 limited to 12 distinct textures and 32 live graph values; an unsupported graph
 shows magenta and reports the reason in the viewport instead of displaying a

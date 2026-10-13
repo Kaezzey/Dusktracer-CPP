@@ -35,12 +35,19 @@ static std::optional<constant_value> fold_instruction(
         case graph_kind::one_minus: value = 1-a; break;
         case graph_kind::saturate: value = std::clamp(a,0.f,1.f); break;
         case graph_kind::power: value = b == 0 ? 1 : std::pow(std::max(0.f,a),b); break;
+        case graph_kind::combine: value = args[c].colour.x; break;
+        case graph_kind::derive_normal_z: {
+            const float x = 2*args[0].colour.x-1, y = 2*args[1].colour.x-1;
+            value = c < 2 ? args[c].colour.x : .5f*(std::sqrt(std::max(0.f,1-x*x-y*y))+1);
+            break;
+        }
         default: break;
         }
         rgb[c] = std::isfinite(value) ? value : 0;
     }
     float alpha = args[0].colour.w;
-    if (kind == graph_kind::scalar || kind == graph_kind::vector) alpha = 1;
+    if (kind == graph_kind::scalar || kind == graph_kind::vector || kind == graph_kind::combine ||
+        kind == graph_kind::derive_normal_z) alpha = 1;
     if (kind == graph_kind::multiply) alpha *= args[1].colour.w;
     if (kind == graph_kind::lerp) alpha = alpha*(1-args[2].colour.x) + args[1].colour.w*args[2].colour.x;
     result.colour = {rgb[0],rgb[1],rgb[2],alpha};
@@ -101,7 +108,8 @@ static bool opaque_program(const std::vector<instruction>& instructions, i4 prog
             return op.inputs[p] < 0 || op.channels[p] != 0 ? std::optional<float>(1.f) : alpha[op.inputs[p]];
         };
         auto result = input(0), second = input(1);
-        if (op.code.x == int(graph_kind::texcoord)) result = 1.f;
+        if (op.code.x == int(graph_kind::texcoord) || op.code.x == int(graph_kind::combine) ||
+            op.code.x == int(graph_kind::derive_normal_z)) result = 1.f;
         if (op.code.x == int(graph_kind::multiply)) result = result && second ? std::optional<float>(*result * *second) : std::nullopt;
         if (op.code.x == int(graph_kind::lerp)) result = std::nullopt;
         alpha[op.code.y] = result;

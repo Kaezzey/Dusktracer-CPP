@@ -14,9 +14,19 @@ struct scene_material;
 struct scene_texture;
 
 // Stable IDs belong to the material, independently of texture asset indices.
+// Combine RGB builds a vector from three scalars (Unreal's MakeFloat3), so
+// packed or swizzled maps can feed vector pins. Derive Normal Z rebuilds a
+// tangent-space normal from X and Y channels in [0, 1] (Unreal's
+// DeriveNormalZ), for two-channel maps such as DXT5nm (X in A, Y in G).
 enum class graph_kind { output, texture_sample, scalar, vector, texcoord,
-    add, subtract, multiply, divide, lerp, one_minus, saturate, power, reroute, count };
+    add, subtract, multiply, divide, lerp, one_minus, saturate, power, reroute,
+    combine, derive_normal_z, count };
 enum class graph_space { automatic, srgb, linear };
+// Material Output pins. A pin keeps its index across shading models so a
+// graph survives a model change: Base Color, Metallic (Hair: Specular),
+// Roughness, Normal (Hair: Tangent), Opacity, Radial Roughness, Backlit.
+// PBR uses the first five and Hair all seven.
+constexpr int graph_output_slots = 7;
 struct graph_node {
     int id = 0;
     graph_kind kind = graph_kind::scalar;
@@ -55,15 +65,15 @@ struct graph_analysis {
     bool valid = true;
     const char* error = "";
     std::unordered_map<int,int> indices;
-    std::vector<std::array<int,5>> sources, channels;
+    std::vector<std::array<int,graph_output_slots>> sources, channels;
     std::vector<int> widths, order;
     std::vector<unsigned char> output_mask;
     explicit graph_analysis(const material_graph& graph, const graph_link* replacement = nullptr);
     int width(int id, int pin = 0) const;
-    std::vector<bool> reachable(const material_graph& graph, int output_slots = 5) const;
+    std::vector<bool> reachable(const material_graph& graph, int output_slots = graph_output_slots) const;
 };
 uint64_t graph_topology_key(const material_graph& graph);
-uint64_t graph_surface_key(const material_graph& graph, int output_slots = 5);
+uint64_t graph_surface_key(const material_graph& graph, int output_slots = graph_output_slots);
 bool graph_equal(const material_graph& a, const material_graph& b);
 
 const char* graph_name(graph_kind kind);

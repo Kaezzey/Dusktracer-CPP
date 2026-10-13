@@ -117,8 +117,9 @@ incident light; the viewport's ambient fill uses the same limit.
 This model uses the existing spatial Burley diffusion with Unreal's Burley
 profile parameters. Each channel's shape distance is `d = MFP / s(A)`, where:
 
-- `MFP` is **Mean Free Path (mm)** times **Mean Free Path Color**, converted
-  with **Scene Units per Metre**.
+- `MFP` is **Mean Free Path Color** times **Mean Free Path Distance**, in
+  profile units of **World Unit Scale** centimetres (Unreal's convention),
+  converted with **Scene Units per Metre**.
 - `A` is **Surface Albedo**.
 - `s(A) = 1.85 - A + 7 * |A - 0.8|^3` (Christensen and Burley, 2015).
 
@@ -126,9 +127,18 @@ The base colour times **Tint** colours the scattered light. **Subsurface Mask**
 (Unreal's Opacity input) is the fraction of diffuse light that scatters.
 **Entry IOR** sets the entry Fresnel term. Specular uses two GGX lobes, with
 roughness multiplied by **Specular Roughness 0** and **Specular Roughness 1**,
-weighted `1 - mix` and `mix`. Masking uses the mixed roughness. The defaults
-approximate Unreal's default skin profile and assume one scene unit is one
-metre.
+weighted `1 - mix` and `mix`. Masking uses the mixed roughness.
+
+The defaults are Unreal's default skin profile as listed in the UE 4.27
+`SubsurfaceProfileStruct` API reference: Surface Albedo (0.91058, 0.338275,
+0.2718), Mean Free Path Color (1.0, 0.088964, 0.072095), Mean Free Path
+Distance 2.6748 with World Unit Scale 0.1 cm (2.67 mm), Roughness 0.75 and 1.3,
+Lobe Mix 0.85 and IOR 1.55. Scene Units per Metre defaults to 1.
+
+With these colours, green and blue scatter about 26 and 38 times less far
+than red, so beyond the terminator only red light survives. Raising the mean
+free path widens that red band but leaves the white-to-red transition abrupt;
+raising the green and blue Mean Free Path Color softens it.
 
 Dusk does not implement Unreal's Scattering Distribution, Extinction Scale,
 Normal Scale, Boundary Color Bleed or Transmission Tint, which tune Unreal's
@@ -170,7 +180,10 @@ Limits: only the sun and the first point light have surface maps. Other point
 lights use local entry lighting and no thickness. Taps rotate per pixel, which
 leaves fine noise. Ambient fill and indirect light are not diffusion-integrated.
 Raster spheres are tessellated, so silhouettes and terminators differ slightly
-from the tracers' analytic spheres. Identities repeat every 255 objects, so two
+from the tracers' analytic spheres. When a diffusion distance approaches the
+object's own size, most of its 12 taps per channel fall outside the object and
+the integral becomes coarse; on a sphere whose red distance exceeded its radius
+the viewport measured 6% less red than the tracer. Identities repeat every 255 objects, so two
 such objects touching each other could exchange diffused light in the viewport.
 
 Diffusion costs time in proportion to screen coverage. On the development
@@ -190,12 +203,12 @@ interior. The development RTX 4070 measured:
 | Subsurface, sun behind | 98.8% | 1.012 |
 | Subsurface, opacity 0, sun to the side | 99.8% | 1.000 |
 | Subsurface, point light behind | 99.4% | 1.006 |
-| Subsurface Profile, sun | 97.2% | 1.001 |
-| Subsurface Profile, real skin scale, sun | 97.8% | 0.997 |
-| Subsurface Profile, point light | 97.1% | 0.995 |
-| Subsurface Profile, thin sphere, sun behind | 91.0% | 1.017 |
-| Burley Diffusion (legacy), sun | 97.9% | 1.001 |
-| Subsurface Profile, cast-shadow edge | 96.4% | 0.998 |
+| Subsurface Profile, sun | 97.3% | 0.999 |
+| Subsurface Profile, real skin scale, sun | 97.9% | 0.997 |
+| Subsurface Profile, point light | 96.9% | 0.994 |
+| Subsurface Profile, thin sphere, sun behind | 90.8% | 1.022 |
+| Burley Diffusion (legacy), sun | 97.9% | 1.000 |
+| Subsurface Profile, cast-shadow edge | 96.3% | 1.000 |
 
 These are fixture results, not a guarantee for every scene. The thin fixture is
 dim, so Monte Carlo and tap noise dominate its residual. Side-by-side images
@@ -212,6 +225,67 @@ as the viewport's mipmapped textures do. In the dim side-lit views, noise in
 near-black pixels at the terminator limits per-pixel accuracy to about 80-90%,
 while total energy agrees within 3%.
 
+## Normal maps at silhouettes
+
+Near a silhouette, a normal map can tilt a shading normal away from the viewer.
+Such a normal receives no light and used to render black in the tracers, which
+showed as dark cracks along the rim of normal-mapped spheres. The CPU tracer,
+the Vulkan tracer and the viewport now bend those normals back toward the viewer
+until they are no more grazing than the geometry (at least `min(0.9 N_g.V, 0.1)`),
+as production renderers do. Normals that already face the viewer are unchanged.
+
+Normal and bump maps also keep lighting perturbed normals right up to the
+terminator of the surface beneath them, where light then stops at once, leaving
+a hard edge. All three backends multiply the surface lobes by the
+shadow-terminator term of Chiang, Li and Burley (2019),
+`G = min(1, (Ng.L) / ((Ns.L)(Ns.Ng)))` smoothed as `-G^3 + G^2 + G`, which fades
+that light as the surface turns away. `Ng` here is the interpolated vertex
+normal before normal mapping, not the flat triangle, so the fade follows the
+smooth surface. With an unperturbed normal the term is exactly one.
+
+## Coarse smooth-shaded meshes
+
+A low-poly mesh with smooth vertex normals, such as a game character's face,
+used to show its triangles in the tracers while the viewport looked smooth.
+Three things followed the flat triangles instead of the smooth surface:
+
+- Light was only accepted where the flat triangle faced it, so near the
+  terminator whole triangles switched off together: a sawtooth shadow edge.
+- Shadow rays started on the flat facet, which lies inside the smooth surface,
+  so neighbouring facets shadowed it.
+- Subsurface entry points were lit through the flat triangle normal. With a
+  small diffusion radius every triangle averaged to one flat shade, a blocky
+  staircase across cheeks, chin and neck.
+
+Now light is gated by the interpolated normal (sampled directions still have to
+leave the flat triangle). Shadow rays start on the smooth surface the vertex
+normals describe, from Hanika's "Hacking the Shadow Terminator" (2021): `p` is
+lifted onto each vertex's tangent plane where it lies below it, and the lifted
+points are blended with the barycentric weights (`smooth_surface_offset` in
+`triangle.h`, `Hit.so` on the GPU). Where the smooth normal faces a light that
+the flat triangle faces away from, the shadow ray starts above the smooth
+surface and ignores its own triangle, as Cycles does. Subsurface entries are
+lit through the smooth normal, matching the viewport's diffusion. Flat-shaded
+meshes are unchanged: their offset is zero and both normals agree.
+
+Hard edges must be authored in the mesh as split normals. A mesh that looks
+faceted in the viewport too has flat or split normals in the file itself.
+
+## Surfaces just behind transparent ones
+
+Where a ray passes through transparent alpha (a Blend or Clip surface), both
+tracers continue the same ray from just past the hit, a few single-precision
+steps further (`camera::past`, `past()` in the shader). Shadow rays step past
+transparent occluders the same way. They used to restart 0.001 units further
+on, which skipped any surface within a millimetre: a character's eyeball sits
+about that far behind its occlusion shell, so the eyes rendered whatever lay
+behind the eyeball.
+
+To render a saved project through the viewport and the GPU tracer for
+comparison, set `DUSK_SSS_PROJECT` to its `Scene.dusk` and run
+`DuskGraphIntegrationTests <folder> --raster`; it writes `project-raster.png`
+and `project-traced.png`.
+
 ## Verification
 
 Build and run the regression suite:
@@ -226,7 +300,9 @@ emissive sphere through glass, verify legacy zero-radius sunlight on CPU and
 GPU, and ensure saved caustic gain settings cannot add light. SSS checks cover
 independent profile integrals and radial moments, directional normalization,
 white-furnace energy, tint, shared-material object isolation, moving instances,
-backlighting, external shadows, indirect lighting and emissive-light MIS.
+backlighting, external shadows, indirect lighting and emissive-light MIS. A
+coarse smooth sphere must be lit wherever its smooth surface faces the sun, on
+the CPU and on the GPU (with and without subsurface scattering).
 
 Comparison images can be regenerated with:
 
@@ -252,4 +328,7 @@ remain accessible independently of optional firefly reconstruction and OIDN.
 - [Jensen et al.: A Practical Model for Subsurface Light Transport](https://graphics.stanford.edu/papers/bssrdf/)
 - [Zeltner et al.: Specular Manifold Sampling](https://rgl.epfl.ch/publications/Zeltner2020Specular)
 - [Christensen and Burley: Approximate Reflectance Profiles for Efficient Subsurface Scattering](https://graphics.pixar.com/library/ApproxBSSRDF/paper.pdf)
+- [Chiang, Li and Burley: Taming the Shadow Terminator](https://www.yiningkarlli.com/projects/shadowterminator.html)
+- [Hanika: Hacking the Shadow Terminator (Ray Tracing Gems II)](https://jo.dreggn.org/home/2021_terminator.pdf)
+- [Unreal Engine: SubsurfaceProfileStruct (4.27 Python API)](https://dev.epicgames.com/documentation/en-us/unreal-engine/python-api/class/SubsurfaceProfileStruct?application_version=4.27)
 - [Unreal Engine: Subsurface Profile Shading Model](https://dev.epicgames.com/documentation/en-us/unreal-engine/subsurface-profile-shading-model-in-unreal-engine)

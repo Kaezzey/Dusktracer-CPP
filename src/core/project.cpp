@@ -152,7 +152,7 @@ struct hasher {
     }
 };
 
-template <class A, class D> void archive(A& a, D& d, int version = 5) {
+template <class A, class D> void archive(A& a, D& d, int version = 8) {
     auto& c = d.camera_settings;
     // Camera pose and lens belong to the viewport; directional/point lights
     // belong to the scene. Derived camera copies must not mark a project dirty.
@@ -165,6 +165,7 @@ template <class A, class D> void archive(A& a, D& d, int version = 5) {
              r.adaptive_sampling, r.adaptive_min_samples, r.adaptive_check_interval, r.adaptive_rel_threshold,
              r.adaptive_abs_threshold, d.device.backend, d.device.device_id);
     if(version>=2) a.record("gpu_filter",r.gpu_firefly_filter);
+    if(version>=7) a.record("buckets",r.bucket_size,r.bucket_order,r.gpu_buckets);
     auto& v = d.viewport;
     a.record("viewport", v.position, v.yaw, v.pitch, v.vfov, v.world_up, v.min_pitch, v.max_pitch,
              d.viewport_mode, d.match_render_resolution, d.movement_speed, d.look_sensitivity);
@@ -177,10 +178,17 @@ template <class A, class D> void archive(A& a, D& d, int version = 5) {
                  m.roughness_tex, m.normal_tex, m.alpha_tex, m.alpha_double_sided, m.alpha_cutoff);
         if(version>=3) a.record("sss_profile",m.sss_profile,m.sss_radius_rgb);
         if(version>=4) a.record("sss_unreal",m.sss_shading,m.sss_subsurface_color,m.sss_opacity,
-                                m.sss_transmission_distance,m.sss_surface_albedo,m.sss_mfp_color,m.sss_mfp_mm,
+                                m.sss_transmission_distance,m.sss_surface_albedo,m.sss_mfp_color,m.sss_mfp_distance,
                                 m.sss_units_per_metre,m.sss_profile_tint,m.sss_lobe_roughness0,
                                 m.sss_lobe_roughness1,m.sss_lobe_mix);
         if(version>=5) a.record("sss_base_color",m.sss_color_from_base);
+        if(version>=6) a.record("sss_world_unit_scale",m.sss_world_unit_scale);
+        if(version>=7) a.record("hair",m.hair_specular,m.hair_radial_roughness,m.hair_backlit,
+                                m.hair_cuticle_tilt,m.hair_tangent,m.hair_coloring);
+        // Version 8: alpha modes (earlier projects load as Blend) and the eye.
+        if(version>=8) a.record("alpha_mode",m.alpha_mode);
+        if(version>=8) a.record("eye",m.eye_specular,m.eye_iris_u,m.eye_iris_v,m.eye_iris_radius,
+                                m.eye_limbus_width,m.eye_iris_depth);
         auto& g = m.graph;
         a.record("graph", g.next_id, g.pan_x, g.pan_y, g.zoom);
         a.list("nodes", g.nodes, [&](auto& n) {
@@ -217,11 +225,18 @@ void validate(const document& d) {
         require(m.sss_profile>=0 && m.sss_profile<=2 && m.sss_radius_rgb.x()>0 &&
                 m.sss_radius_rgb.y()>0 && m.sss_radius_rgb.z()>0,"Invalid SSS distance profile.");
         require(m.sss_shading>=sss_shading_burley && m.sss_shading<=sss_shading_unreal_profile &&
-                m.sss_transmission_distance>0 && m.sss_mfp_mm>=0 && m.sss_units_per_metre>0 &&
+                m.sss_transmission_distance>0 && m.sss_mfp_distance>=0 && m.sss_world_unit_scale>0 && m.sss_units_per_metre>0 &&
                 m.sss_opacity>=0 && m.sss_opacity<=1 && m.sss_lobe_mix>=0 && m.sss_lobe_mix<=1 &&
                 m.sss_lobe_roughness0>=0 && m.sss_lobe_roughness1>=0,"Invalid Unreal subsurface settings.");
-        require(int(m.model) >= 0 && int(m.model) <= int(scene_material_model::pbr),
+        require(int(m.model) >= 0 && int(m.model) <= int(scene_material_model::eye),
                 "Unknown material model.");
+        require(m.alpha_mode >= alpha_opaque && m.alpha_mode <= alpha_blend, "Unknown alpha mode.");
+        require(m.eye_specular >= 0 && m.eye_iris_radius > 0 && m.eye_limbus_width >= 0 && m.eye_iris_depth >= 0,
+                "Invalid eye settings.");
+        require(m.hair_specular >= 0 && m.hair_radial_roughness >= 0 && m.hair_radial_roughness <= 1 &&
+                    m.hair_backlit >= 0 && m.hair_cuticle_tilt >= -90 && m.hair_cuticle_tilt <= 90 &&
+                    m.hair_coloring >= 0 && m.hair_coloring <= 1,
+                "Invalid hair settings.");
         for (int i : {m.albedo_tex, m.metallic_tex, m.roughness_tex, m.normal_tex, m.alpha_tex}) {
             index(i, s.textures.size());
         }
@@ -262,7 +277,8 @@ void validate(const document& d) {
     const auto& r = d.render_settings;
     require(r.exposure >= 0 && r.denoiser_strength >= 0 && r.denoiser_strength <= 1 &&
                 r.adaptive_min_samples > 0 && r.adaptive_check_interval > 0 &&
-                r.adaptive_rel_threshold >= 0 && r.adaptive_abs_threshold >= 0,
+                r.adaptive_rel_threshold >= 0 && r.adaptive_abs_threshold >= 0 && r.bucket_size >= 8 &&
+                r.bucket_size <= 512 && r.bucket_order >= 0 && r.bucket_order <= 2,
             "Invalid renderer settings.");
     require(c.focus_dist > 0 && c.defocus_angle >= 0 && c.defocus_angle < 180 &&
                 c.direct_light_samples >= 0 && c.sun_shadow_samples >= 0 && c.mnee_newton_max_iters > 0 &&
@@ -537,7 +553,7 @@ document load(const fs::path& file) {
     reader a{in};
     int version = 0;
     a.record("DUSK_SCENE", version);
-    require(version >= 1 && version <= 5, "Unsupported Dusk scene version.");
+    require(version >= 1 && version <= 8, "Unsupported Dusk scene version.");
     document d;
     archive(a, d, version);
     if (version < 5) {
@@ -596,7 +612,7 @@ document save(const fs::path& file, const view& state) {
     out.imbue(std::locale::classic());
     out << std::setprecision(17);
     writer a{out};
-    a.record("DUSK_SCENE", 5);
+    a.record("DUSK_SCENE", 8);
     archive(a, d);
     const auto contents = out.str();
     require(contents.size() <= max_document_bytes, "Scene document exceeds 64 MiB.");

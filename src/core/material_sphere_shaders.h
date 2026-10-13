@@ -29,7 +29,10 @@ void main() {
     vUV = vec2((atan(-vWorld.z,vWorld.x)+PI)/(2*PI), acos(clamp(-vNormal.y,-1,1))/PI);
     vTangent = safeNormal(vec3(vWorld.z,0,-vWorld.x),vec3(1,0,0));
     vBitangent = cross(vNormal,vTangent);
+    vec4 backdrop = FragColor;
     shadeSurface();
+    // Blend-mode alpha shows the backdrop through the sphere.
+    FragColor = vec4(mix(backdrop.rgb,FragColor.rgb,clamp(FragColor.a,0,1)),1);
 }
 )GLSL";
 } // namespace material_sphere_shaders

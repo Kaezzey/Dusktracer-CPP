@@ -104,7 +104,7 @@ struct material_compiler {
         record.f0 = pack(m.dielectric_F0, float(m.fuzz));
         record.emission =
             pack(m.emission.length_squared() == 0 ? m.base_color : m.emission, float(m.emission_intensity));
-        record.alpha = {float(m.alpha_cutoff), m.alpha_double_sided ? 1.f : 0.f, 0, 0};
+        record.alpha = {float(m.alpha_cutoff), m.alpha_double_sided ? 1.f : 0.f, 0, float(m.alpha_mode)};
         const auto sss = lower_subsurface(m);
         double fraction = sss.mode==subsurface_lowered::diffusion ? sss.strength : 0;
         double eta=std::clamp(sss.eta,1.,4.);
@@ -116,6 +116,12 @@ struct material_compiler {
         record.specular_lobes={float(sss.lobe_scale0),float(sss.lobe_scale1),float(sss.lobe_mix),
             sss.mode==subsurface_lowered::transmission && sss.color.length_squared()>0 ? float(sss.transmission_distance) : 0.f};
         record.profile_tint=pack(sss.tint_scale,sss.color_from_base?1.f:0.f);
+        record.hair = {float(m.hair_specular), float(m.hair_radial_roughness), float(m.hair_backlit),
+                       float(m.hair_cuticle_tilt)};
+        record.hair_tangent = pack(m.hair_tangent, float(m.hair_coloring));
+        record.iris = {float(m.eye_iris_u), float(m.eye_iris_v), float(m.eye_iris_radius), float(m.eye_limbus_width)};
+        record.eye = {float(m.eye_specular), float(m.eye_iris_depth), 0, 0};
+        const bool hair = m.model == scene_material_model::hair, eye = m.model == scene_material_model::eye;
         material_graph graph = m.graph;
         if (graph.nodes.empty()) {
             int output = graph.add(graph_kind::output, 0, 0);
@@ -131,9 +137,13 @@ struct material_compiler {
                 }
             };
             bind(0, m.albedo_tex);
-            bind(3, m.normal_tex);
+            // Hair's fourth pin is its strand tangent, not a normal map.
+            if (!hair) bind(3, m.normal_tex);
             bind(4, m.alpha_tex, 5);
-            if (m.unreal_pbr && m.model == scene_material_model::pbr) {
+            if (eye) {
+                // The eye's second pin is its cornea Specular, not Metallic.
+                bind(2, m.roughness_tex, 1);
+            } else if (m.unreal_pbr && m.model == scene_material_model::pbr) {
                 auto valid = [&](int index) { return index >= 0 && index < int(source.textures.size()); };
                 int packed = valid(m.metallic_tex) ? m.metallic_tex : m.roughness_tex;
                 bool separate_roughness =
@@ -149,7 +159,7 @@ struct material_compiler {
         } else {
             record.alpha.y = 1;
         }
-        int slots = m.model == scene_material_model::pbr ? 5 : 1;
+        int slots = hair || eye ? graph_output_slots : m.model == scene_material_model::pbr ? 5 : 1;
         for (int s = 0; s < slots; ++s) {
             auto span = program(graph, s);
             for (int previous = 0; previous < s && span.y; ++previous) {
@@ -178,7 +188,7 @@ struct material_compiler {
         }
         const bool explicit_mask = record.programs[4].y != 0;
         const auto opacity = explicit_mask ? record.programs[4] : record.programs[0];
-        record.alpha.z = m.model != scene_material_model::pbr ||
+        record.alpha.z = (m.model != scene_material_model::pbr && !hair && !eye) || m.alpha_mode == alpha_opaque ||
             (m.alpha_cutoff <= 1 && opaque_program(instructions, opacity, explicit_mask, texture_channels)) ? 1.f : 0.f;
         return record;
     }

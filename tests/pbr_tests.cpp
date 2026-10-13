@@ -242,12 +242,14 @@ static void check_transport() {
     // Transparent null events do not consume the path's scattering-depth budget.
     auto cutout = std::make_shared<pbr_material>(colour(1,1,1),0,.5);
     cutout->alpha_tex = std::make_shared<solid_colour>(colour(.4,.4,.4));
+    cutout->alpha_mode = 1; // Clip: alpha .4 is below the .5 threshold
     world.clear();
     for (int i = 0; i < 20; ++i) world.add(std::make_shared<quad>(point3(-2,-2,-i*.02),vec3(4,0,0),vec3(0,4,0),cutout));
     cam.use_sun = false; cam.background = colour(1,1,1);
     near(cam.ray_colour(ray(point3(0,0,1),vec3(0,0,-1),0),1,world).x(),1,1e-12,"cutout continuation does not burn bounce depth");
     near(cam.compute_transmittance(ray(point3(0,0,1),vec3(0,0,-1),0),5,world),1,1e-12,"shadow cutoffs agree with camera cutoffs");
     cutout->alpha_tex = std::make_shared<solid_colour>(colour(.75,.75,.75));
+    cutout->alpha_mode = 2; // Blend: alpha .75 covers three quarters
     world.clear(); world.add(std::make_shared<quad>(point3(-2,-2,0),vec3(4,0,0),vec3(0,4,0),cutout));
     near(cam.compute_transmittance(ray(point3(0,0,1),vec3(0,0,-1),0),5,world),.25,1e-12,"partial-alpha shadows use deterministic transmittance");
     cam.background = colour(); cam.point_lights = {{point3(0,0,2),colour(4,4,4),0}};
@@ -287,10 +289,31 @@ static void render_chart(const std::string& path) {
     auto image = engine.render(world,cam);
     require(stbi_write_png(path.c_str(),image.width,image.height,3,image.pixels.data(),image.width*3) != 0,"production renderer saves the roughness/metalness chart");
 }
+// Bilinear filtering: exact at texel centres, blended between them in linear
+// light, clamped at the edges. Magnified hair-card alpha stays smooth.
+static void check_texture_filtering() {
+    const unsigned char texels[] = {64, 64, 64, 0, 192, 192, 192, 255};
+    const auto path = (std::filesystem::temp_directory_path() / "dusk-bilinear.png").string();
+    require(stbi_write_png(path.c_str(), 2, 1, 4, texels, 8) != 0, "write filtering fixture");
+    image_texture colour_map(path.c_str(), texture_sample_space::srgb_color);
+    image_texture data_map(path.c_str(), texture_sample_space::linear_data);
+    auto srgb = [](double c) { return c <= .04045 ? c / 12.92 : std::pow((c + .055) / 1.055, 2.4); };
+    near(data_map.value(.25, .5, {}).x(), 64 / 255.0, 1e-9, "texel centres sample exactly");
+    near(data_map.value(.5, .5, {}).x(), 128 / 255.0, 1e-9, "between texel centres blends bilinearly");
+    near(data_map.value(0, .5, {}).x(), 64 / 255.0, 1e-9, "edges clamp to the edge texel");
+    near(colour_map.value(.5, .5, {}).x(), .5 * (srgb(64 / 255.0) + srgb(192 / 255.0)), 1e-9,
+         "sRGB texels are decoded before blending");
+    near(data_map.alpha_at(.375, .5, {}), .25, 1e-9, "alpha blends like colour");
+    std::filesystem::remove(path);
+}
 #include "material_transport_regressions.inl"
+#include "hair_regressions.inl"
+#include "terminator_regressions.inl"
+#include "eye_regressions.inl"
 
 int main(int argc, char** argv) {
-    check_bsdf(); check_geometry(); check_transport(); check_dielectric_sun(); check_subsurface_transport(); check_unreal_subsurface_transport();
+    check_bsdf(); check_geometry(); check_transport(); check_dielectric_sun(); check_subsurface_transport(); check_unreal_subsurface_transport(); check_normal_map_silhouette();
+    check_hair_bsdf(); check_texture_filtering(); check_shadow_terminator(); check_alpha_modes(); check_eye();
     if (argc > 1) render_chart(argv[1]);
     if (argc > 2 && std::string(argv[2]) == "--materials")
         render_material_transport_samples(std::filesystem::path(argv[1]).parent_path());

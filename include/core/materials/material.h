@@ -5,6 +5,7 @@
 #include "texture.h"
 #include "sss.h"
 #include "pbr_bsdf.h"
+#include "eye.h"
 #include <cstdio>
 #include <limits>
 #include <vector>
@@ -27,6 +28,14 @@ inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat) {
 
 inline double clamp01(double x) {
     return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+}
+
+// Coverage of a surface with alpha a under scene_alpha_mode: 0 opaque,
+// 1 clip (all or nothing at the cutoff), 2 blend (fractional, as Cycles).
+inline double alpha_coverage(double a, int mode, double cutoff) {
+    if (mode == 0) return 1;
+    a = clamp01(a);
+    return mode == 1 ? (a < cutoff ? 0.0 : 1.0) : a;
 }
 
 inline double pow5(double x) {
@@ -72,6 +81,11 @@ struct bsdf_sample {
     // The continuation gathers indirect light only (Unreal Subsurface ambient
     // lobe): emitters and the sun it reaches are counted by light sampling.
     bool indirect_only = false;
+    // Scales emitters and the sun if the continuation reaches them directly,
+    // for materials whose direct response differs from the light they carry
+    // between bounces (hair Backlit). Light sampling uses the same response,
+    // so MIS stays consistent.
+    colour direct_scale = colour(1, 1, 1);
 };
 
 class material {
@@ -393,6 +407,15 @@ public:
     shared_ptr<texture> alpha_tex;
     bool alpha_double_sided = true;
     double alpha_cutoff = 0.5;
+    int alpha_mode = 2; // alpha_coverage
+
+    // Eye shading model (eye.h): the base colour is seen through the cornea
+    // inside the iris, which is lit by Unreal's iris term. The cornea's F0 is
+    // 0.08 x Specular; metallic and subsurface scattering are unused.
+    bool eye = false;
+    eye_shading::iris_params iris;
+    double eye_specular = .5;
+    shared_ptr<texture> specular_tex, iris_mask_tex, iris_depth_tex;
 
     // Dielectric F0 when metallic = 0 (0.04 is common)
     colour  dielectric_F0;
@@ -558,12 +581,15 @@ public:
   private:
     struct surface {
         colour base, f0, transmission, ambient;
-        vec3 n, geometry;
+        // n: shading normal (normal-mapped); interpolated: the vertex normal
+        // before normal mapping; geometry: the flat triangle, for ray sides.
+        vec3 n, geometry, interpolated;
         double metallic, alpha, alpha1, alpha_mean, lobe_mix, specular_probability,
                subsurface_fraction, ambient_probability, opacity;
         bool smooth;
+        eye_shading::iris_geometry iris; // mask 0 except on eyes
     };
-    surface prepare_surface(const hit_record& rec) const {
+    surface prepare_surface(const hit_record& rec, const vec3& view) const {
         surface s; double rough;
         sample_surface_params(rec,s.base,s.metallic,rough);
         s.base = pbr::reflectance(s.base);
@@ -586,7 +612,7 @@ public:
         s.ambient_probability = ambient_weight/(1+ambient_weight);
         s.opacity = clamp01(sss_opacity);
         s.geometry = safe_unit_vector(rec.geometry_normal());
-        s.n = safe_unit_vector(rec.normal,s.geometry);
+        s.n = s.interpolated = safe_unit_vector(rec.normal,s.geometry);
         if (normal_tex) {
             hit_record frame = rec; frame.normal = s.n; frame.set_tangent_frame(rec.tangent,rec.bitangent);
             colour texel = normal_tex->value(rec.u,rec.v,rec.p);
@@ -594,10 +620,40 @@ public:
             vec3 mapped = safe_unit_vector(tangent.x()*frame.tangent+tangent.y()*frame.bitangent+tangent.z()*s.n,s.n);
             if (dot(mapped,s.geometry) > 0) s.n = mapped;
         }
+        if (eye) prepare_eye(rec,view,s);
+        s.n = face_view(s.n,s.geometry,view);
         return s;
     }
+    void prepare_eye(const hit_record& rec, const vec3& view, surface& s) const {
+        hit_record frame = rec; frame.normal = s.interpolated; frame.set_tangent_frame(rec.tangent,rec.bitangent);
+        auto pin = [&](const shared_ptr<texture>& t) { return t ? t->value(rec.u,rec.v,rec.p).x() : -1.0; };
+        s.iris = eye_shading::iris(iris,rec.u,rec.v,frame.tangent,frame.bitangent,s.interpolated,view,
+                                   pin(iris_mask_tex),pin(iris_depth_tex));
+        if (s.iris.mask > 0 && base_tex) s.base = pbr::reflectance(base_tex->value(s.iris.u,s.iris.v,rec.p));
+        const double specular = specular_tex ? std::max(0.0,specular_tex->value(rec.u,rec.v,rec.p).x()) : eye_specular;
+        s.metallic = 0;
+        s.f0 = colour(1,1,1)*clamp01(.08*specular);
+        s.specular_probability = specular_sampling_probability(s.f0,0);
+    }
+    // Normal maps tilt some shading normals away from the viewer near
+    // silhouettes, where they would see no light at all and render black.
+    // Bend those toward the viewer so shading is never more grazing than the
+    // geometry; normals already facing the viewer are unchanged.
+    static vec3 face_view(const vec3& n, const vec3& g, const vec3& v) {
+        double limit = std::min(.9*dot(g,v),.1), facing = dot(n,v);
+        if (limit <= 0 || facing >= limit) return n;
+        vec3 side = safe_unit_vector(n-facing*v,safe_unit_vector(g-dot(g,v)*v,g));
+        return safe_unit_vector(limit*v+std::sqrt(1-limit*limit)*side,g);
+    }
+    // Light reaches the smooth surface the vertex normals describe: gating it
+    // on the flat triangle would cut the terminator along triangle edges.
+    static bool lit(const surface& s, const vec3& v, const vec3& l) {
+        return dot(s.geometry,v) > 0 && dot(s.interpolated,l) > 0 && dot(s.n,v) > 0 && dot(s.n,l) > 0;
+    }
+    // Sampled directions must also leave the flat triangle, or the ray would
+    // start inside the mesh; light sampling alone covers the rest.
     static bool above_surface(const surface& s, const vec3& v, const vec3& l) {
-        return dot(s.geometry,v) > 0 && dot(s.geometry,l) > 0 && dot(s.n,v) > 0 && dot(s.n,l) > 0;
+        return lit(s,v,l) && dot(s.geometry,l) > 0;
     }
     static bool viewable(const surface& s, const vec3& v) { return dot(s.geometry,v) > 0 && dot(s.n,v) > 0; }
     static double specular_distribution(const surface& s, double nh) {
@@ -611,19 +667,31 @@ public:
     }
     // Surface lobes (diffuse substrate and GGX) times cosine.
     static colour evaluate_cosine(const surface& s, const vec3& v, const vec3& l) {
-        if (!above_surface(s,v,l)) return colour(0,0,0);
+        if (!lit(s,v,l)) return colour(0,0,0);
         double nv = std::clamp(dot(s.n,v),0.0,1.0), nl = std::clamp(dot(s.n,l),0.0,1.0);
         // A diffuse substrate loses light on both entry and exit through its
         // dielectric interface. Do not add a full Lambert lobe on top of GGX.
         colour transmission_v = colour(1,1,1)-schlick_fresnel(nv,s.f0);
         colour transmission_l = colour(1,1,1)-schlick_fresnel(nl,s.f0);
-        colour f = s.base*((1-s.metallic)*(1-s.subsurface_fraction)/pi)*transmission_v*transmission_l;
+        colour diffuse = s.base*((1-s.metallic)*(1-s.subsurface_fraction)/pi)*transmission_v*transmission_l;
+        colour specular(0,0,0);
         if (!s.smooth) {
             vec3 h = safe_unit_vector(v+l,s.n);
             double d = specular_distribution(s,std::clamp(dot(s.n,h),0.0,1.0));
-            f += schlick_fresnel(dot(v,h),s.f0)*(d*pbr::visibility(nv,nl,s.alpha_mean));
+            specular = schlick_fresnel(dot(v,h),s.f0)*(d*pbr::visibility(nv,nl,s.alpha_mean));
         }
-        return f*nl;
+        // An eye's iris replaces N.L with Unreal's iris term (eye.h).
+        return (diffuse*eye_shading::diffuse_cosine(s.iris,nl,l)+specular*nl)*terminator_softening(s,l);
+    }
+    // Chiang, Li and Burley (2019), "Taming the Shadow Terminator": a normal
+    // or bump map keeps lighting surfaces up to the terminator and then cuts
+    // it off. This fades it as the smooth surface turns away from the light,
+    // as Cycles does; without a normal map it is exactly one.
+    static double terminator_softening(const surface& s, const vec3& l) {
+        double nl = dot(s.n,l), ng = dot(s.n,s.interpolated);
+        if (nl <= 0 || ng <= 0) return 0;
+        double g = std::min(1.0,dot(s.interpolated,l)/(nl*ng));
+        return g*(1+g*(1-g));
     }
     // Density of the surface lobes. The ambient lobe only gathers indirect
     // light, so light sampling never competes with it.
@@ -649,8 +717,8 @@ public:
     // Exposed deterministic variates support reproducible sampler validation.
     bool sample_surface(const ray& incoming, const hit_record& rec, double lobe, double u, double v, bsdf_sample& sample) const {
         sample = {};
-        surface s = prepare_surface(rec);
         vec3 view = safe_unit_vector(-incoming.direction());
+        surface s = prepare_surface(rec,view);
         if (!viewable(s,view)) return false;
         double subsurface_probability = (1-s.specular_probability)*s.subsurface_fraction;
         if (subsurface_probability > 0 && lobe >= 1-subsurface_probability) {
@@ -713,7 +781,7 @@ public:
     colour shade_direct(const hit_record& rec, const vec3& view, const vec3& light, const colour& radiance,
                         const hittable&, double visibility = 1) const override {
         if (opacity_at(rec) <= 0) return colour(0,0,0);
-        auto s = prepare_surface(rec); vec3 v = safe_unit_vector(view), l = safe_unit_vector(light);
+        vec3 v = safe_unit_vector(view), l = safe_unit_vector(light); auto s = prepare_surface(rec,v);
         return evaluate_cosine(s,v,l)*radiance*visibility;
     }
     // Unreal Subsurface transmission for a direct light on either side. It
@@ -723,14 +791,15 @@ public:
     colour shade_transmission(const hit_record& rec, const vec3& view, const vec3& light, const colour& radiance,
                               double visibility = 1) const override {
         if (!sss_transmission || opacity_at(rec) <= 0) return colour(0,0,0);
-        auto s = prepare_surface(rec); vec3 v = safe_unit_vector(view), l = safe_unit_vector(light);
+        vec3 v = safe_unit_vector(view), l = safe_unit_vector(light); auto s = prepare_surface(rec,v);
         if (!viewable(s,v)) return colour(0,0,0);
         vec3 h = safe_unit_vector(v+l,s.n);
         return s.transmission*radiance*(sss::unreal_transmission(dot(s.n,h),-dot(l,v),s.opacity)*visibility);
     }
     double bsdf_pdf(const hit_record& rec, const vec3& view, const vec3& light) const override {
         if (opacity_at(rec) <= 0) return 0;
-        return surface_pdf(prepare_surface(rec),safe_unit_vector(view),safe_unit_vector(light));
+        vec3 v = safe_unit_vector(view);
+        return surface_pdf(prepare_surface(rec,v),v,safe_unit_vector(light));
     }
     double body_transmission_distance() const override {
         return sss_transmission ? std::max(1e-6,sss_transmission_distance) : 0;
@@ -814,10 +883,10 @@ public:
         return opacity <= 0 || (opacity < 1 && random_double() >= opacity);
     }
     double opacity_at(const hit_record& rec) const override {
-        if (!alpha_double_sided && !rec.front_face) return 1;
+        if (alpha_mode == 0 || (!alpha_double_sided && !rec.front_face)) return 1;
         double a = alpha_tex ? alpha_tex->mask_alpha_at(rec.u,rec.v,rec.p)
             : base_tex ? base_tex->alpha_at(rec.u,rec.v,rec.p) : 1;
-        return a < alpha_cutoff ? 0 : clamp01(a);
+        return alpha_coverage(a,alpha_mode,alpha_cutoff);
     }
 };
 

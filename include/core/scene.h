@@ -29,8 +29,17 @@ enum class scene_material_model {
     dielectric,
     diffuse_light,
     isotropic,
-    pbr          // uses your pbr_material class
+    pbr,         // uses your pbr_material class
+    hair,        // Unreal-style Hair shading model (Chiang et al. fibres)
+    eye          // Unreal-style Eye shading model: wet cornea over a refracting iris
 };
+
+// How Opacity (or the base colour's alpha) hides a surface, as Blender's
+// Blend Mode and Unreal's Opaque / Masked / Translucent:
+// opaque ignores alpha, clip keeps alpha at or above the cutoff fully and
+// drops the rest, blend lets alpha through fractionally (0.3 alpha shows 70%
+// of what is behind), as Cycles always does.
+enum scene_alpha_mode { alpha_opaque = 0, alpha_clip = 1, alpha_blend = 2 };
 
 // ----------------------------------------
 // Texture asset owned by the scene
@@ -84,11 +93,15 @@ struct scene_material_parameters {
     bool   sss_color_from_base = true;
     double sss_opacity = .5;
     double sss_transmission_distance = .5;
-    // Unreal "Subsurface Profile" (Burley parameterization). Distances are
-    // mean free paths in millimetres, converted with scene units per metre.
-    vec3   sss_surface_albedo = vec3(.91058, .338275, .2);
-    vec3   sss_mfp_color = vec3(1, .198863, .0782621);
-    double sss_mfp_mm = 1.2;
+    // Unreal "Subsurface Profile" (Burley parameterization), with Unreal's
+    // default skin (SubsurfaceProfileStruct, UE 4.27 Python API reference).
+    // The mean free path is Mean Free Path Color times Distance in profile
+    // units of World Unit Scale centimetres (0.1 cm, so the default is
+    // 2.67 mm), converted to scene units with Scene Units per Metre.
+    vec3   sss_surface_albedo = vec3(.91058, .338275, .2718);
+    vec3   sss_mfp_color = vec3(1, .088964, .072095);
+    double sss_mfp_distance = 2.6748;
+    double sss_world_unit_scale = .1;
     double sss_units_per_metre = 1;
     vec3   sss_profile_tint = vec3(1, 1, 1);
     // Dual specular: lobe roughness = roughness * scale; mix weights lobe 1.
@@ -99,8 +112,31 @@ struct scene_material_parameters {
     // (G = roughness, B = metallic) when a combined texture is used.
     bool   unreal_pbr = false;
     double emission_intensity = 1.0;                  // intensity multiplier for diffuse_light
+    // Hair: base_color is the fibre colour, roughness the longitudinal
+    // roughness and ior the cuticle IOR. These follow Unreal's Hair pins.
+    double hair_specular = 0.5;           // primary highlight; 0.5 is physical
+    double hair_radial_roughness = 0.3;   // azimuthal roughness: soft (high) or glinty (low)
+    double hair_backlit = 1.0;            // light passing through strands
+    double hair_cuticle_tilt = 2.0;       // degrees; shifts the highlights along the strand
+    // How Base Color sets fibre absorption. 0: colour of one strand, as in
+    // Unreal (a strand transmits about sqrt(colour)); suits hair cards.
+    // 1: colour of a dense volume of strands (Chiang et al., as in Cycles);
+    // suits real strand geometry with many overlapping fibres.
+    int    hair_coloring = 0;
+    // Strand direction in tangent space when the Tangent pin is unconnected.
+    // (0,1,0) runs along the texture V axis, as on Unreal hair cards.
+    vec3   hair_tangent = vec3(0, 1, 0);
     vec3   dielectric_F0    = vec3(0.04, 0.04, 0.04); // PBR dielectric F0
     double normal_strength  = 1.0;                    // PBR normal strength
+    // Eye (Unreal's Eye shading model). The iris is a disc in UV space; inside
+    // it the base colour is looked up where the view ray, refracted by the
+    // cornea (ior), meets an iris Iris Depth radii below the surface.
+    // Specular sets the cornea's reflectance as in Unreal (F0 = 0.08 x Specular).
+    double eye_specular = 0.5;
+    double eye_iris_u = 0.5, eye_iris_v = 0.5; // iris centre in UV space
+    double eye_iris_radius = 0.15;             // iris radius in UV units (Unreal's IrisUVRadius)
+    double eye_limbus_width = 0.03;            // UV width of the soft iris edge
+    double eye_iris_depth = 0.5;               // iris depth below the cornea, in iris radii
 
     // --- Texture bindings (indices into scene.textures) ---
     // -1 = no texture; renderer should fall back to scalar params above.
@@ -111,7 +147,8 @@ struct scene_material_parameters {
     // Optional alpha/opacity mask (single-channel or image alpha)
     int alpha_tex     = -1;   // alpha mask index into scene.textures
     bool alpha_double_sided = true;
-    double alpha_cutoff = 0.5;
+    double alpha_cutoff = 0.5;   // Clip mode only
+    int alpha_mode = alpha_blend; // scene_alpha_mode
 };
 
 struct scene_material : scene_material_parameters {

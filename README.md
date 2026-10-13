@@ -29,13 +29,17 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Unified transform wrapper for spheres, cubes, and meshes  
 - BVH acceleration & AABB optimisations  
 - Support for alpha in albedo textures (RGBA PNGs used as transparency source when no explicit alpha map is set)
-- Stochastic alpha testing for soft, Monte‑Carlo-correct transparent edges (alpha_cutoff retained as a fast-path)
+- Alpha modes per material, as in Blender and Unreal: **Blend** (soft, fractional alpha, the default), **Clip** (all or nothing at a threshold) and **Opaque**, on CPU, GPU and the viewport
 - Double-sided masked transparency for materials that use alpha
 - Point-light direct illumination with inverse-square attenuation and shadow checks
+- [Hair shading model](src/core/HAIR.md) for hair cards: Unreal-style pins on the Chiang et al. fibre BSDF (R, TT, TRT), on CPU, GPU and the raster viewport
+- [Eye shading model](src/core/EYE.md): Unreal-style wet cornea, refracted iris and iris caustic, with Iris Mask and Iris Distance pins
+- [Bucket rendering](src/core/BUCKET_RENDERING.md) on CPU and GPU, with Blender-style bucket marks and per-bucket denoising in the viewport
 - Embree path UV interpolation fix to ensure correct texture sampling on hardware-accelerated geometry
 
 ### Editor Features
 - [Project folders and complete `.dusk` scenes](src/core/PROJECTS.md): New/Open/Save/Save As, portable assets, and renderer state.
+- [Unreal-style viewport navigation](src/core/EDITOR_VIEWPORT.md): captured right-drag fly with eased WASD, pan, orbit, zoom and F to frame; a saved dock layout, a status bar, and floating panels that stay above the editor
 - Persistent material graph with texture drops, searchable nodes, editable wires, CPU shader evaluation, and asynchronous previews ([guide and performance checks](docs/material-graph.md))
 - Content Drawer (ctrl + spacebar)
 - GPU-based picking via RGB8 ID buffer  
@@ -72,7 +76,7 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 - Stable transform dragging with frozen ray/plane anchors and continuous rotation
 - Raster preview shares exact TRS math with ray tracer
 - Reverse-mapping transforms for correct ray intersection
-- Per-material alpha masking with stochastic sampling and automatic double-sided handling for masked materials
+- Per-material alpha modes (Opaque, Clip, Blend) with automatic double-sided handling for masked materials
 
 ---
 
@@ -80,12 +84,12 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 1. Drag an RGBA PNG with transparent regions into the Textures window.
 2. Assign it to a material's Albedo slot (or supply an explicit alpha map).
 3. Apply that material to geometry (leaves/sprites/meshes).
-4. Render with higher SPP to see soft edges from stochastic alpha testing.
+4. Pick the material's **Alpha Mode**: Blend keeps soft edges soft, Clip cuts at the threshold.
 5. Add point lights and position them in the viewport — they will appear as icons in the raster preview and light the ray-traced render.
 
 Notes:
 - Loader treats 0 = fully transparent, 255 = opaque.
-- alpha_cutoff remains available to cull near‑fully transparent pixels as a performance fast-path.
+- Blend is exact in the tracers (a surface with alpha 0.3 lets 70% through). The viewport draws the solid part first and blends the rest over it, farthest object first.
 - If backface masking artifacts appear, double-sided masking is automatically enabled when alpha is present.
 
 ---

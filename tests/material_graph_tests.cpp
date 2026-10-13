@@ -1,6 +1,7 @@
 #include "core/dusktracer.h"
 #include "core/scene.h"
 #include "core/materials/material.h"
+#include "core/materials/hair.h"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -137,5 +138,58 @@ int main() {
     large.find(unused)->value = vec3(.9,0,0);
     require(graph_surface_key(large,1) == lambert_surface && graph_surface_key(large,5) != pbr_surface,
         "only inputs used by the active material model invalidate shading");
+    // Packed normal maps: Combine RGB assembles a vector from channels and
+    // Derive Normal Z rebuilds Z from two (DXT5nm keeps X in A and Y in G).
+    {
+        material_graph packed; int out = packed.add(graph_kind::output,0,0);
+        int tex = packed.add(graph_kind::texture_sample,0,0), combine = packed.add(graph_kind::combine,0,0);
+        int derive = packed.add(graph_kind::derive_normal_z,0,0), flip = packed.add(graph_kind::one_minus,0,0);
+        std::string reason;
+        require(!packed.connect({tex,0,combine,0},&reason) && !reason.empty(),"Combine RGB takes scalar channels, not vectors");
+        require(!packed.connect({tex,1,out,3}),"a single channel cannot be a normal");
+        require(packed.connect({tex,1,combine,0}) && packed.connect({tex,2,flip,0}) && packed.connect({flip,0,combine,1}) &&
+                packed.connect({tex,3,combine,2}) && packed.connect({combine,0,out,3}),
+                "Combine RGB builds a DirectX-to-OpenGL normal for the Normal pin");
+        auto normal = compile_material_graph(packed,3,loader);
+        vec3 texel = sample_texture(false).value(.8,.6,{});
+        near(normal->value(.8,.6,{}).x(),texel.x(),"Combine RGB keeps R");
+        near(normal->value(.8,.6,{}).y(),1-texel.y(),"Combine RGB takes One Minus G");
+        near(normal->value(.8,.6,{}).z(),texel.z(),"Combine RGB keeps B");
+        require(packed.connect({tex,4,derive,0}) && packed.connect({tex,2,derive,1}) && packed.connect({derive,0,out,3}),
+                "Derive Normal Z feeds the Normal pin");
+        normal = compile_material_graph(packed,3,loader);
+        vec3 n = 2*normal->value(.8,.6,{})-vec3(1,1,1);
+        near(n.x(),2*sample_texture(false).alpha_at(.8,.6,{})-1,"Derive Normal Z keeps X");
+        near(n.y(),2*texel.y()-1,"Derive Normal Z keeps Y");
+        near(n.length(),1,"Derive Normal Z returns a unit normal");
+        material_graph copy;
+        require(deserialize_material_graph(serialize_material_graph(packed),copy) && graph_equal(packed,copy),
+                "vector nodes survive serialization");
+    }
+
+    // Hair: all seven Material Output pins reach the renderer and survive saving.
+    require(graph_inputs(graph_kind::output) == graph_output_slots && graph_output_slots == 7,
+            "Material Output carries the hair pins");
+    scene_material strands; strands.model = scene_material_model::hair;
+    initialize_material_graph(strands,{}); auto& hg = strands.graph;
+    int fibre = hg.add(graph_kind::vector,0,0); hg.find(fibre)->value = vec3(.7,.5,.3);
+    int backlit = hg.add(graph_kind::scalar,0,0); hg.find(backlit)->value = vec3(.25,0,0);
+    int radial = hg.add(graph_kind::scalar,0,0); hg.find(radial)->value = vec3(.6,0,0);
+    int strand = hg.add(graph_kind::vector,0,0); hg.find(strand)->value = vec3(1,0,0);
+    require(hg.connect({fibre,0,hg.output_id(),0}) && hg.connect({radial,0,hg.output_id(),5}) &&
+            hg.connect({backlit,0,hg.output_id(),6}) && hg.connect({strand,0,hg.output_id(),3}),"connect hair pins");
+    material_graph reloaded;
+    require(deserialize_material_graph(serialize_material_graph(hg),reloaded) && graph_equal(hg,reloaded),
+            "hair pins survive serialization");
+    auto hair = std::dynamic_pointer_cast<hair_material>(build_rt_material(scn,strands));
+    require(hair && hair->backlit_tex && hair->radial_tex && hair->tangent_tex && !hair->specular_tex,
+            "hair consumes its connected pins only");
+    near(hair->backlit_tex->value(0,0,{}).x(),.25,"Backlit pin reaches the hair material");
+    near(hair->radial_tex->value(0,0,{}).x(),.6,"Radial Roughness pin reaches the hair material");
+    near(hair->albedo(hit).y(),.5,"Base Color pin reaches the hair material");
+    uint64_t pbr_key = graph_surface_key(hg,5), hair_key = graph_surface_key(hg,7);
+    hg.find(backlit)->value = vec3(.5,0,0);
+    require(graph_surface_key(hg,5) == pbr_key && graph_surface_key(hg,7) != hair_key,
+            "hair-only pins invalidate hair shading only");
     std::cout << checks << " graph checks passed\n";
 }

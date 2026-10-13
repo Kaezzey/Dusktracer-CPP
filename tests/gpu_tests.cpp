@@ -135,6 +135,32 @@ void check_graphs(const std::string& device, const std::filesystem::path& folder
             }
         }
     }
+    // Vectors from channels: Combine RGB (R, G, A) and Derive Normal Z (A, G),
+    // as a DXT5nm normal map is read. Constants exercise bytecode folding and
+    // texture channels the shader interpreter.
+    for (bool textured : {false, true}) {
+        for (auto kind : {graph_kind::combine, graph_kind::derive_normal_z}) {
+            material.graph = {};
+            int root = material.graph.add(graph_kind::output, 0, 0);
+            int op = material.graph.add(kind, 0, 0);
+            if (textured) {
+                int texture = material.graph.add(graph_kind::texture_sample, 0, 0);
+                material.graph.find(texture)->texture_index = 0;
+                material.graph.find(texture)->space = graph_space::linear;
+                const int channels[] = {kind == graph_kind::combine ? 1 : 4, 2, 4};
+                for (int p = 0; p < graph_inputs(kind); ++p)
+                    require(material.graph.connect({texture, channels[p], op, p}), "connect channel to vector node");
+            } else {
+                material.graph.find(op)->defaults = {.7, .35, .2};
+            }
+            require(material.graph.connect({op, 0, root, 0}), "vector node feeds a colour pin");
+            auto expected = build_rt_material(source, material)->emitted(.5, .5, point3());
+            dusk_gpu::render(dusk_gpu::compile_scene(source), cam, raw_settings(), device, nullptr, nullptr, {},
+                             &linear);
+            for (int c = 0; c < 3; ++c)
+                near(channel_mean(linear, c), expected[c], 2e-6, "GPU Combine RGB and Derive Normal Z match CPU");
+        }
+    }
     const unsigned char checker[] = {255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 255, 255, 255, 255, 0};
     const auto checker_path = folder / "gpu-checker.png";
     require(stbi_write_png(checker_path.string().c_str(), 2, 2, 4, checker, 8) != 0, "write UV fixture");
@@ -155,9 +181,16 @@ void check_graphs(const std::string& device, const std::filesystem::path& folder
 
     material.model = scene_material_model::pbr;
     material.graph.connect({tex, 4, root, 4});
-    auto alpha_camera = test_camera(32, 32, 128);
+    // Bilinear filtering blends the 2x2 checker's alpha. Clip cuts it at the
+    // threshold; Blend covers the edges partially and samples them
+    // stochastically, so compare converged images.
+    auto alpha_camera = test_camera(32, 32, 2048);
     alpha_camera.max_depth = 0;
-    compare_render(source, alpha_camera, device, "Alpha cutout traversal", .5);
+    material.alpha_mode = alpha_clip;
+    compare_render(source, alpha_camera, device, "Alpha cutout traversal", .75);
+    material.alpha_mode = alpha_blend;
+    alpha_camera.samples_per_pixel = 8192;
+    compare_render(source, alpha_camera, device, "Blended alpha traversal", .75);
 
     // Register reuse must handle long chains without a per-hit 256-value stack.
     material.model = scene_material_model::diffuse_light;
@@ -237,6 +270,60 @@ void check_meshes(const std::string& device, const std::filesystem::path& folder
     }
     cam.samples_per_pixel=1024;
     compare_render(source,cam,device,"Mesh SSS slots, normals and transformed instances",3);
+
+    // A coarse smooth-shaded sphere lit across its terminator: both tracers
+    // light the smooth surface (shadow rays from Hanika's offset, skipping
+    // their own triangle) instead of a sawtooth of facets.
+    const auto sphere_path = folder / "gpu-smooth-sphere.obj";
+    {
+        std::ofstream sphere(sphere_path);
+        const int rings = 6, segments = 12;
+        for (int i = 0; i <= rings; ++i)
+            for (int j = 0; j <= segments; ++j) {
+                const double theta = pi * i / rings, phi = 2 * pi * j / segments;
+                const vec3 p(std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi));
+                sphere << "v " << p.x() << ' ' << p.y() << ' ' << p.z() << "\nvn " << p.x() << ' ' << p.y() << ' '
+                       << p.z() << '\n';
+            }
+        auto index = [&](int i, int j) { return i * (segments + 1) + j + 1; };
+        for (int i = 0; i < rings; ++i)
+            for (int j = 0; j < segments; ++j) {
+                if (i > 0) sphere << "f " << index(i, j) << "//" << index(i, j) << ' ' << index(i, j + 1) << "//"
+                                  << index(i, j + 1) << ' ' << index(i + 1, j + 1) << "//" << index(i + 1, j + 1) << '\n';
+                if (i < rings - 1) sphere << "f " << index(i, j) << "//" << index(i, j) << ' ' << index(i + 1, j + 1)
+                                          << "//" << index(i + 1, j + 1) << ' ' << index(i + 1, j) << "//"
+                                          << index(i + 1, j) << '\n';
+            }
+    }
+    scene smooth;
+    scene_material skin;
+    skin.model = scene_material_model::pbr;
+    skin.base_color = vec3(.8, .6, .5);
+    skin.roughness = .6;
+    smooth.materials = {skin};
+    scene_mesh_asset ball;
+    ball.file_path = sphere_path.string();
+    smooth.meshes.push_back(ball);
+    scene_object instance;
+    instance.type = scene_object_type::mesh_instance;
+    instance.mesh_index = 0;
+    instance.material_index = 0;
+    instance.rotation_deg = vec3(0, 20, 0);
+    smooth.objects.push_back(instance);
+    auto terminator = test_camera(64, 64, 512);
+    terminator.background = vec3(0, 0, 0);
+    terminator.use_sun = true;
+    terminator.sun_dir = vec3(1, 0, 0);
+    terminator.sun_radiance = vec3(3, 3, 3);
+    terminator.lookat = point3(0, .5, 0);
+    terminator.vfov = 30;
+    compare_render(smooth, terminator, device, "Smooth low-poly terminator", 1.0);
+    smooth.materials[0].use_sss = true;
+    smooth.materials[0].sss_strength = 1;
+    smooth.materials[0].sss_model = SSS_DIPOLE_BURLEY;
+    smooth.materials[0].sss_radius = .02;
+    terminator.samples_per_pixel = 2048;
+    compare_render(smooth, terminator, device, "Smooth low-poly subsurface terminator", 2.0);
 }
 
 void check_transport(const std::string& device) {
@@ -482,12 +569,19 @@ static void check_denoiser() {
 #include "gpu_firefly_regressions.inl"
 #include "gpu_subsurface_regressions.inl"
 #include "gpu_sphere_caustic_regressions.inl"
+#include "render_bucket_regressions.inl"
+#include "gpu_hair_regressions.inl"
+#include "gpu_eye_regressions.inl"
+#include "project_render_tool.inl"
 
 int main(int argc, char** argv) {
     check_denoiser();
     std::cout << std::unitbuf;
     try {
         check_firefly_reconstruction();
+        check_bucket_layout();
+        check_bucket_denoiser();
+        check_cpu_buckets();
         const std::filesystem::path output = argc > 1 ? argv[1] : "gpu-validation.png";
 #ifndef DUSK_ENABLE_VULKAN_RT
         auto source = sphere_scene(scene_material_model::lambert);
@@ -516,10 +610,16 @@ int main(int argc, char** argv) {
         std::string id = compatible->id;
         check_pipeline_cache();
         check_gpu_scheduling(id);
+        check_gpu_buckets(id);
         check_material_optimisation();
         check_gpu_cache(id);
         check_shadow_specialisation(id);
         check_compact_preview(id);
+        if (argc > 2 && std::string(argv[2]) == "--render-project") return render_project(id, argc, argv);
+        if (argc > 2 && std::string(argv[2]) == "--bucket-benchmark") {
+            benchmark_gpu_buckets(id);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "--performance") {
             benchmark_gpu_optimisations(id);
             return 0;
@@ -532,6 +632,8 @@ int main(int argc, char** argv) {
         if(argc>2 && std::string(argv[2])=="--caustics") {check_gpu_sphere_caustics(id,fixture_folder);return 0;}
         if(argc>2 && std::string(argv[2])=="--skin") {check_gpu_skin_shadow(id,fixture_folder);return 0;}
         if(argc>2 && std::string(argv[2])=="--unreal") {check_gpu_unreal_subsurface(id,fixture_folder);return 0;}
+        if(argc>2 && std::string(argv[2])=="--hair") {check_gpu_hair(id,fixture_folder);return 0;}
+        if(argc>2 && std::string(argv[2])=="--eye") {check_gpu_eye(id);check_gpu_alpha_modes(id);check_gpu_stacked_alpha(id);return 0;}
         check_gpu_fireflies(id,fixture_folder);
         check_gpu_sphere_caustics(id,fixture_folder);
         check_gpu_subsurface(id,fixture_folder);
@@ -540,6 +642,10 @@ int main(int argc, char** argv) {
         check_graphs(id, fixture_folder);
         check_meshes(id, fixture_folder);
         check_transport(id);
+        check_gpu_hair(id, fixture_folder);
+        check_gpu_eye(id);
+        check_gpu_alpha_modes(id);
+        check_gpu_stacked_alpha(id);
 #ifdef HAVE_OIDN
         {
             auto source = sphere_scene(scene_material_model::pbr);

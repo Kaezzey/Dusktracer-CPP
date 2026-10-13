@@ -69,7 +69,9 @@ checksum validation. A stale or corrupt cache rebuilds automatically.
 - Analytic spheres/ellipsoids, cube faces, and imported triangle meshes, including mesh
   instancing, material-slot overrides, UVs, smooth normals, and tangent frames.
 - Lambert, legacy fuzzy metal, ideal dielectric, emissive, isotropic surface,
-  and the existing single-scattering GGX PBR material.
+  the existing single-scattering GGX PBR material, the Hair fibre model
+  (`src/core/HAIR.md`) and the Eye model (`src/core/EYE.md`), with Opaque,
+  Clip and Blend alpha modes.
 - Spatial Burley subsurface diffusion on PBR materials, including world-space
   radius, strength, entry IOR, optional scatter tint, masks and material slots.
   Probes remain on the originating instance and material; lighting and shadows
@@ -85,12 +87,42 @@ checksum validation. A stale or corrupt cache rebuilds automatically.
 - Environment background, finite/delta sun, point lights, emissive surface
   sampling, MIS, glass Fresnel/refraction weighting, and partial-opacity shadows.
 - Camera transforms, field of view, depth of field, sample/depth settings,
-  progressive results, exposure, and adaptive variance checks.
+  progressive or bucket results with bucket denoising (`src/core/BUCKET_RENDERING.md`),
+  exposure, and adaptive variance checks.
 
 GPU graphs use liveness-based register reuse with 32 simultaneous values. Long
 chains can use all 256 source nodes; wider graphs that exceed the live-value
 limit fall back explicitly to CPU. GPU arithmetic is float32; the CPU generally
 uses double precision. Pixel-identical Monte Carlo noise is not expected.
+
+### Transparent surfaces in one traversal
+
+Rays cross transparent surfaces (Blend or Clip alpha, hair cards above all)
+in a single walk of the acceleration structure:
+
+- **Path rays** (`traceSurface`). Instances with alpha-tested materials are
+  built with `FORCE_NO_OPAQUE`, so their crossings are ray-query candidates.
+  Each is kept with probability equal to its opacity, and the query keeps
+  the nearest kept one: the nearest surface that passes its alpha test, as
+  the CPU's pass-through events give.
+- **Shadow rays** (`visibility`). Every crossing before the light is a
+  candidate (`gl_RayFlagsNoOpaqueEXT`), and none is committed: transmittance
+  is the product of 1 − opacity in any order. The walk stops once the light
+  is blocked.
+- Bottom-level structures set `NO_DUPLICATE_ANY_HIT_INVOCATION`, so no
+  crossing is counted twice. A sphere's candidate is its box, so both of its
+  crossings are weighed.
+- A crossing's opacity comes straight from the candidate (`crossingOpacity`):
+  its material, UV, and the side it was hit from, in object space. No full
+  surface hit (normals, tangent frame, inverse matrix) is built.
+
+Previously each transparent crossing restarted a query from the top of the
+BVH. Cloud's hair-card scene (960×540, 64 spp, 20 bounces, 8 sun shadow
+samples, RTX 4070) traced in 27.8 s; it now takes 10.1 s, with the same mean
+image. A smaller graph register file (8 instead of 32 values), which made the
+raster viewport 2.5× faster, changed nothing here, so it was not kept.
+`check_gpu_stacked_alpha` compares camera and shadow rays through a stack of
+cards and spheres with the CPU.
 
 ## Deliberate limits and differences
 

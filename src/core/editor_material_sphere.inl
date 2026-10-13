@@ -98,6 +98,7 @@ static bool initialize() {
     glUniform1i(shader.location("uSunShadowEnabled"), GL_FALSE);
     glUniform1i(shader.location("uPointShadowIndex"), -1);
     glUniform1i(shader.location("uDebugView"), 0);
+    glUniform1i(shader.location("uAlphaPass"), 2); // one pass, blended over the backdrop
     const vec3 key = unit_vector(vec3(-.5, .7, 1.2));
     glUniform3f(shader.location("uSunDirection"), float(key.x()), float(key.y()), float(key.z()));
     glUniform3f(shader.location("uSunRadiance"), 3.8f, 3.6f, 3.4f);

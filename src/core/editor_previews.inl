@@ -74,8 +74,12 @@ static uint64_t MaterialPreviewStamp(const scene& assets, const scene_material& 
         << m.sss_eta << '|' << m.sss_color_override_enabled << '|' << m.sss_color_override_color << '|'
         << m.sss_shading << '|' << m.sss_subsurface_color << '|' << m.sss_color_from_base << '|' << m.sss_opacity << '|'
         << m.sss_transmission_distance << '|' << m.sss_surface_albedo << '|' << m.sss_mfp_color << '|'
-        << m.sss_mfp_mm << '|' << m.sss_units_per_metre << '|' << m.sss_profile_tint << '|'
+        << m.sss_mfp_distance << '|' << m.sss_world_unit_scale << '|' << m.sss_units_per_metre << '|' << m.sss_profile_tint << '|'
         << m.sss_lobe_roughness0 << '|' << m.sss_lobe_roughness1 << '|' << m.sss_lobe_mix << '|'
+        << m.hair_specular << '|' << m.hair_radial_roughness << '|' << m.hair_backlit << '|'
+        << m.hair_cuticle_tilt << '|' << m.hair_tangent << '|' << m.hair_coloring << '|'
+        << m.alpha_mode << '|' << m.eye_specular << '|' << m.eye_iris_u << '|' << m.eye_iris_v << '|'
+        << m.eye_iris_radius << '|' << m.eye_limbus_width << '|' << m.eye_iris_depth << '|'
         << graph_surface_key(m.graph);
     auto texture_stamp = [&](int index, const std::string& path = {}) {
         if (!path.empty()) {

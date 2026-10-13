@@ -10,7 +10,7 @@
 const char* graph_name(graph_kind k) {
     static const char* names[] = {"Material Output", "Texture Sample", "Scalar", "Color",
         "Texture Coordinate", "Add", "Subtract", "Multiply", "Divide", "Lerp",
-        "One Minus", "Saturate", "Power", "Reroute"};
+        "One Minus", "Saturate", "Power", "Reroute", "Combine RGB", "Derive Normal Z"};
     return names[static_cast<int>(k)];
 }
 const char* graph_category(graph_kind k) {
@@ -18,16 +18,17 @@ const char* graph_category(graph_kind k) {
         case graph_kind::texture_sample: case graph_kind::texcoord: return "Textures";
         case graph_kind::scalar: case graph_kind::vector: return "Parameters";
         case graph_kind::output: case graph_kind::reroute: return "Utility";
+        case graph_kind::combine: case graph_kind::derive_normal_z: return "Vector";
         default: return "Math";
     }
 }
 int graph_inputs(graph_kind k) {
     switch (k) {
-        case graph_kind::output: return 5;
+        case graph_kind::output: return graph_output_slots;
         case graph_kind::scalar: case graph_kind::vector: case graph_kind::texcoord: return 0;
         case graph_kind::texture_sample: case graph_kind::one_minus:
         case graph_kind::saturate: case graph_kind::reroute: return 1;
-        case graph_kind::lerp: return 3;
+        case graph_kind::lerp: case graph_kind::combine: return 3;
         default: return 2;
     }
 }
@@ -41,9 +42,13 @@ int graph_outputs(graph_kind k) {
     }
 }
 const char* graph_input_name(graph_kind k, int pin) {
-    static const char* slots[] = {"Base Color", "Metallic", "Roughness", "Normal", "Opacity"};
+    static const char* slots[] = {"Base Color", "Metallic", "Roughness", "Normal", "Opacity", "Radial Roughness", "Backlit"};
     static const char* math[] = {"A", "B", "Alpha"};
+    static const char* rgb[] = {"R", "G", "B"};
+    static const char* xy[] = {"X", "Y"};
     if (k == graph_kind::output) return slots[pin];
+    if (k == graph_kind::combine) return rgb[pin];
+    if (k == graph_kind::derive_normal_z) return xy[pin];
     if (k == graph_kind::texture_sample) return "UV";
     if (graph_inputs(k) == 1) return "In";
     return math[pin];
@@ -72,6 +77,8 @@ int material_graph::add(graph_kind k, float x, float y) {
     graph_node n;
     n.id = next_id++; n.kind = k; n.x = x; n.y = y;
     if (k == graph_kind::add || k == graph_kind::subtract) n.defaults[1] = 0;
+    if (k == graph_kind::combine) n.defaults = {0, 0, 0};
+    if (k == graph_kind::derive_normal_z) n.defaults = {.5, .5, 0}; // a flat normal
     nodes.push_back(n);
     return n.id;
 }
@@ -84,7 +91,8 @@ graph_analysis::graph_analysis(const material_graph& g, const graph_link* replac
     auto fail = [&](const char* reason) { valid = false; error = reason; };
     if (count > material_graph::max_nodes) { fail("Too many graph nodes."); return; }
     indices.reserve(count);
-    sources.resize(count, {-1,-1,-1,-1,-1}); channels.resize(count); widths.resize(count,1);
+    std::array<int,graph_output_slots> unconnected; unconnected.fill(-1);
+    sources.resize(count, unconnected); channels.resize(count); widths.resize(count,1);
     output_mask.resize(count,0);
     for (int i = 0; i < count; ++i) {
         const auto& n = g.nodes[i];
@@ -115,7 +123,8 @@ graph_analysis::graph_analysis(const material_graph& g, const graph_link* replac
     for (int i = 0; i < count; ++i) if (!degree[i]) order.push_back(i);
     for (size_t at = 0; at < order.size(); ++at) {
         int i = order[at]; auto kind = g.nodes[i].kind;
-        if (kind == graph_kind::texture_sample || kind == graph_kind::vector) widths[i] = 3;
+        if (kind == graph_kind::texture_sample || kind == graph_kind::vector || kind == graph_kind::combine ||
+            kind == graph_kind::derive_normal_z) widths[i] = 3;
         else if (kind == graph_kind::texcoord) widths[i] = 2;
         else for (int p = 0; p < graph_inputs(kind); ++p)
             if (sources[i][p] >= 0 && channels[i][p] == 0) widths[i] = std::max(widths[i],widths[sources[i][p]]);
@@ -131,7 +140,12 @@ graph_analysis::graph_analysis(const material_graph& g, const graph_link* replac
             compatible = w == expected || (w == 1 && p != 3);
         } else if (kind == graph_kind::texture_sample) compatible = w == 2;
         else if (kind == graph_kind::lerp && p == 2) compatible = w == 1;
-        if (!compatible) { fail("Pin types do not match. Use R / G / B / A for scalar inputs, or UV for coordinates."); return; }
+        else if (kind == graph_kind::combine || kind == graph_kind::derive_normal_z) compatible = w == 1;
+        if (!compatible) {
+            fail("Pin types do not match. Use R / G / B / A for scalar inputs, UV for coordinates, and Combine RGB "
+                 "to build a vector from channels.");
+            return;
+        }
     }
 }
 int graph_analysis::width(int id, int pin) const {
@@ -140,7 +154,7 @@ int graph_analysis::width(int id, int pin) const {
 std::vector<bool> graph_analysis::reachable(const material_graph& g, int output_slots) const {
     std::vector<bool> used(g.nodes.size(),false);
     auto out = indices.find(g.output_id()); if (!valid || out == indices.end()) return used;
-    for (int p = 0; p < std::min(output_slots,5); ++p) if (sources[out->second][p] >= 0) used[sources[out->second][p]] = true;
+    for (int p = 0; p < std::min(output_slots,graph_output_slots); ++p) if (sources[out->second][p] >= 0) used[sources[out->second][p]] = true;
     for (auto it = order.rbegin(); it != order.rend(); ++it) if (used[*it])
         for (int source : sources[*it]) if (source >= 0) used[source] = true;
     return used;
@@ -171,7 +185,7 @@ uint64_t graph_surface_key(const material_graph& g, int output_slots) {
         }
     }
     auto out = analysis.indices.find(g.output_id());
-    if (out != analysis.indices.end()) for (int p = 0; p < std::min(output_slots,5); ++p) {
+    if (out != analysis.indices.end()) for (int p = 0; p < std::min(output_slots,graph_output_slots); ++p) {
         int source = analysis.sources[out->second][p]; hash_word(key,source < 0 ? 0 : g.nodes[source].id);
         hash_word(key,analysis.channels[out->second][p]);
     }
@@ -269,7 +283,7 @@ bool deserialize_material_graph(const std::string& text, material_graph& graph) 
     std::istringstream in(decoded);
     material_graph g; int version, count, links;
     if (!(in >> version >> g.pan_x >> g.pan_y >> g.zoom >> count >> links) || version != 1
-        || count < 0 || count > material_graph::max_nodes || links < 0 || links > count * 5
+        || count < 0 || count > material_graph::max_nodes || links < 0 || links > count * graph_output_slots
         || !std::isfinite(g.pan_x) || !std::isfinite(g.pan_y) || !std::isfinite(g.zoom)) return false;
     g.zoom = std::clamp(g.zoom, 0.35f, 1.65f);
     int outputs = 0;
@@ -298,6 +312,13 @@ bool deserialize_material_graph(const std::string& text, material_graph& graph) 
 
 namespace {
 struct graph_value { vec3 rgb; vec3 raw; double alpha = 1, mask = 1; };
+// X and Y in [0, 1] encode [-1, 1]; Z completes a unit vector, re-encoded to
+// [0, 1] as normal-map texels are. Values outside the unit disc clamp Z to 0.
+vec3 derived_normal(double x, double y) {
+    const double nx = 2 * x - 1, ny = 2 * y - 1;
+    const double z = std::sqrt(std::max(0.0, 1 - nx * nx - ny * ny));
+    return vec3(x, y, .5 * (z + 1));
+}
 struct instruction {
     graph_node node;
     std::array<int, 3> input = {-1, -1, -1};
@@ -344,6 +365,8 @@ public:
             if (kind == graph_kind::scalar) result.rgb = vec3(op.node.value.x(), op.node.value.x(), op.node.value.x());
             else if (kind == graph_kind::vector) result.rgb = op.node.value;
             else if (kind == graph_kind::texcoord) result.rgb = vec3(u * op.node.value.x(), v * op.node.value.y(), 0);
+            else if (kind == graph_kind::combine) result.rgb = vec3(args[0].rgb.x(), args[1].rgb.x(), args[2].rgb.x());
+            else if (kind == graph_kind::derive_normal_z) result.rgb = derived_normal(args[0].rgb.x(), args[1].rgb.x());
             else {
                 result.alpha = args[0].alpha;
                 if (kind == graph_kind::multiply) result.alpha *= args[1].alpha;

@@ -36,7 +36,21 @@ static ImVec2 GraphMul(ImVec2 a, float v) { return ImVec2(a.x * v, a.y * v); }
 static float GraphDistance(ImVec2 a, ImVec2 b) { ImVec2 d = GraphSub(a,b); return d.x*d.x + d.y*d.y; }
 static bool GraphContains(ImVec2 p, ImVec2 a, ImVec2 b) { return p.x >= a.x && p.y >= a.y && p.x <= b.x && p.y <= b.y; }
 static bool GraphSelected(const material_graph_editor_state& s, int id) { return std::find(s.selected.begin(), s.selected.end(), id) != s.selected.end(); }
-static int GraphActiveSlots(int index) { return g_scene.materials[index].model == scene_material_model::pbr ? 5 : 1; }
+static int GraphModelSlots(scene_material_model model) {
+    return model == scene_material_model::hair || model == scene_material_model::eye ? graph_output_slots
+         : model == scene_material_model::pbr ? 5 : 1;
+}
+static int GraphActiveSlots(int index) { return GraphModelSlots(g_scene.materials[index].model); }
+// Unreal renames pins per shading model; hair reuses Metallic and Normal.
+static const char* GraphOutputPinName(const scene_material& mat, int pin) {
+    if (mat.model == scene_material_model::diffuse_light && pin == 0) return "Emission";
+    if (mat.model == scene_material_model::hair && pin == 1) return "Specular";
+    if (mat.model == scene_material_model::hair && pin == 3) return "Tangent";
+    if (mat.model == scene_material_model::eye && pin == 1) return "Specular";
+    if (mat.model == scene_material_model::eye && pin == 5) return "Iris Mask";
+    if (mat.model == scene_material_model::eye && pin == 6) return "Iris Distance";
+    return graph_input_name(graph_kind::output, pin);
+}
 static void GraphDirty(int index, bool shading = true) {
     MarkMaterialsDirty();
     if (!shading) return;
@@ -101,7 +115,7 @@ static ImU32 GraphNodeColor(graph_kind k) {
     return IM_COL32(106, 156, 153, 255);
 }
 static int GraphInputCount(const graph_node& n, const scene_material& mat) {
-    return n.kind == graph_kind::output && mat.model != scene_material_model::pbr ? 1 : graph_inputs(n.kind);
+    return n.kind == graph_kind::output ? GraphModelSlots(mat.model) : graph_inputs(n.kind);
 }
 static ImVec2 GraphNodeSize(const graph_node& n, const scene_material& mat) {
     if (n.kind == graph_kind::reroute) return ImVec2(72, 40);
@@ -402,6 +416,7 @@ static void DrawMaterialGraphEditor(scene_material& mat, scene& scn, int materia
                 int node_index = analysis.indices.at(n.id);
                 bool connected = side ? (analysis.output_mask[node_index] & (1 << p)) != 0 : analysis.sources[node_index][p] >= 0;
                 int width = side ? analysis.width(n.id,p) : n.kind == graph_kind::texture_sample ? 2 :
+                    n.kind == graph_kind::combine || n.kind == graph_kind::derive_normal_z ? 1 :
                     n.kind == graph_kind::output ? (p == 0 || p == 3 ? 3 : 1) : analysis.width(n.id);
                 ImU32 color = GraphColor(width);
                 bool is_hot = hot_pin.node == n.id && hot_pin.slot == p && hot_pin.input == pin.input;
@@ -413,13 +428,19 @@ static void DrawMaterialGraphEditor(scene_material& mat, scene& scn, int materia
                 draw->AddCircle(ps,6*g.zoom,color,16,1.5f);
                 if (is_hot) draw->AddCircle(ps,10*g.zoom,bright,20,1.5f);
                 if (n.kind == graph_kind::reroute) continue;
-                std::string label = side ? graph_output_name(n.kind,p) : graph_input_name(n.kind,p);
-                if (!side && n.kind == graph_kind::output && p == 0 && mat.model == scene_material_model::diffuse_light) label = "Emission";
+                std::string label = side ? graph_output_name(n.kind,p)
+                    : n.kind == graph_kind::output ? GraphOutputPinName(mat,p) : graph_input_name(n.kind,p);
                 if (!side && !connected && n.kind != graph_kind::texture_sample && n.kind != graph_kind::output) {
                     char value[32]; std::snprintf(value,sizeof(value),"  %.3g",n.defaults[p]); label += value;
                 }
-                if (!side && !connected && n.kind == graph_kind::output && (p == 1 || p == 2)) {
-                    char value[32]; std::snprintf(value,sizeof(value),"  %.3g",p == 1 ? mat.metallic : mat.roughness); label += value;
+                const bool eye = mat.model == scene_material_model::eye;
+                if (!side && !connected && n.kind == graph_kind::output && eye && p >= 5) {
+                    label += p == 5 ? "  UV disc" : "  depth";
+                } else if (!side && !connected && n.kind == graph_kind::output && (p == 1 || p == 2 || p >= 5)) {
+                    const bool hair = mat.model == scene_material_model::hair;
+                    double fallback = p == 2 ? mat.roughness : p == 5 ? mat.hair_radial_roughness : p == 6 ? mat.hair_backlit
+                        : hair ? mat.hair_specular : eye ? mat.eye_specular : mat.metallic;
+                    char value[32]; std::snprintf(value,sizeof(value),"  %.3g",fallback); label += value;
                 }
                 float tx = side ? n.x+ns.x-14-ImGui::CalcTextSize(label.c_str()).x : n.x+14;
                 text(ImVec2(tx,n.y+53+p*27.0f),connected ? bright : muted,label.c_str());
@@ -442,7 +463,9 @@ static void DrawMaterialGraphEditor(scene_material& mat, scene& scn, int materia
             ImVec4 color((float)std::clamp(n.value.x(),0.0,1.0),(float)std::clamp(n.value.y(),0.0,1.0),(float)std::clamp(n.value.z(),0.0,1.0),1);
             draw->AddRectFilled(screen(ImVec2(n.x+14,n.y+60)),screen(ImVec2(n.x+110,n.y+ns.y-17)),ImGui::ColorConvertFloat4ToU32(color),2);
         } else if (n.kind == graph_kind::output) {
-            text(ImVec2(n.x+14,n.y+ns.y-25),muted,mat.model == scene_material_model::pbr ? "SURFACE  /  PBR" : "SURFACE");
+            text(ImVec2(n.x+14,n.y+ns.y-25),muted,mat.model == scene_material_model::pbr ? "SURFACE  /  PBR"
+                : mat.model == scene_material_model::hair ? "SURFACE  /  HAIR"
+                : mat.model == scene_material_model::eye ? "SURFACE  /  EYE" : "SURFACE");
         }
     }
 

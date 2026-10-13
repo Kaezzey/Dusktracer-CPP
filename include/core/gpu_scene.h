@@ -43,14 +43,18 @@ struct material_record {
     f4 parameters;  // metallic, roughness, normal strength, IOR
     f4 f0;          // RGB dielectric F0; W legacy metal fuzz
     f4 emission;    // RGB emission; W intensity
-    f4 alpha;       // cutoff, double-sided masking, provably opaque, reserved
+    f4 alpha;       // cutoff, double-sided masking, provably opaque, mode (scene_alpha_mode)
     f4 subsurface;  // Burley fraction, world-space radius, entry IOR, directional normalization
     f4 scatter_tint;// RGB override tint; W enables override
     f4 subsurface_distances; // RGB world-space diffusion distances
     f4 subsurface_colour;   // RGB Unreal Subsurface colour; W Unreal opacity
     f4 specular_lobes;      // lobe 0/1 roughness scales, lobe 1 weight; W body extinction distance (0 = none)
     f4 profile_tint;        // RGB diffusion tint multiplier; W multiplies Subsurface colour by base
-    i4 programs[5]; // start, count, result register, result channel
+    f4 hair;                // specular, radial roughness, backlit, cuticle tilt (degrees)
+    f4 hair_tangent;        // XYZ strand direction for an unconnected Tangent pin; W colouring mode
+    f4 iris;                // Eye: iris centre U, V, UV radius, limbus UV width
+    f4 eye;                 // Eye: cornea Specular, iris depth (iris radii), reserved, reserved
+    i4 programs[graph_output_slots]; // start, count, result register, result channel
 };
 struct texture_record {
     i4 data;
@@ -77,5 +81,5 @@ material_record compile_material(const scene& source, const scene_material& mate
                                  const std::function<int(int)>& texture_channels = {});
 snapshot compile_scene(const scene& source, const std::atomic<bool>* cancel = nullptr);
 static_assert(sizeof(vertex) == 80 && sizeof(instance) == 64 && sizeof(instruction) == 80 &&
-              sizeof(material_record) == 256);
+              sizeof(material_record) == 352);
 } // namespace dusk_gpu

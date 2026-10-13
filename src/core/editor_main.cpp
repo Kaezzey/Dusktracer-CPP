@@ -306,6 +306,28 @@ static void DrawInfoChip(const char* label)
     ImGui::Dummy(ImVec2(end.x - start.x, end.y - start.y));
 }
 
+// Blender-style bucket marks: corner brackets around buckets being rendered
+// (amber) and denoised (blue), mapped from render pixels to the viewport.
+static void DrawActiveBuckets(ImDrawList* draw, ImVec2 origin, ImVec2 size)
+{
+    const int width = g_render_progress.image_width.load(), height = g_render_progress.image_height.load();
+    if (width <= 0 || height <= 0) return;
+    const float sx = size.x / width, sy = size.y / height;
+    for (const auto& tile : g_render_progress.active_tiles()) {
+        const ImVec2 a(origin.x + tile.x * sx, origin.y + tile.y * sy);
+        const ImVec2 b(origin.x + (tile.x + tile.width) * sx, origin.y + (tile.y + tile.height) * sy);
+        const ImU32 colour = tile.stage == render_tile_activity::denoising ? IM_COL32(110, 190, 255, 235)
+                                                                             : IM_COL32(255, 186, 96, 235);
+        const float arm = std::max(3.0f, std::min(b.x - a.x, b.y - a.y) * 0.22f);
+        const ImVec2 corners[4] = {a, ImVec2(b.x, a.y), b, ImVec2(a.x, b.y)};
+        for (int k = 0; k < 4; ++k) {
+            const float dx = k == 0 || k == 3 ? arm : -arm, dy = k < 2 ? arm : -arm;
+            draw->AddLine(corners[k], ImVec2(corners[k].x + dx, corners[k].y), colour, 1.5f);
+            draw->AddLine(corners[k], ImVec2(corners[k].x, corners[k].y + dy), colour, 1.5f);
+        }
+    }
+}
+
 static void InvalidateRasterMaterial(int index);
 static void InvalidateAllRasterMaterials();
 #include "editor_previews.inl"
@@ -426,7 +448,6 @@ static GLuint                    g_rtTexture  = 0;
 static int                       g_rtWidth    = 0;
 static int                       g_rtHeight   = 0;
 static bool                      g_rtHasImage = false;
-static std::vector<std::uint8_t> g_rtPixels;   // RGBA8
 
 // -----------------------------------------------------------------------------
 // Rasterised preview: sphere mesh, GPU meshes, FBO
@@ -737,6 +758,8 @@ static void export_scene_as_cpp(const scene& scn, const std::string& path)
             case scene_material_model::diffuse_light: model_str = "scene_material_model::diffuse_light"; break;
             case scene_material_model::isotropic: model_str = "scene_material_model::isotropic"; break;
             case scene_material_model::pbr: model_str = "scene_material_model::pbr"; break;
+            case scene_material_model::hair: model_str = "scene_material_model::hair"; break;
+            case scene_material_model::eye: model_str = "scene_material_model::eye"; break;
         }
         out << "scn.materials.back().model = " << model_str << ";\n";
         out << "scn.materials.back().base_color = colour(" << m.base_color.x() << ", " << m.base_color.y() << ", " << m.base_color.z() << ");\n";
@@ -1605,10 +1628,14 @@ static void SaveMaterialsManifest()
         out << "|" << m.sss_opacity << "|" << m.sss_transmission_distance;
         colour_field(m.sss_surface_albedo);
         colour_field(m.sss_mfp_color);
-        out << "|" << m.sss_mfp_mm << "|" << m.sss_units_per_metre;
+        out << "|" << m.sss_mfp_distance << "|" << m.sss_units_per_metre;
         colour_field(m.sss_profile_tint);
         out << "|" << m.sss_lobe_roughness0 << "|" << m.sss_lobe_roughness1 << "|" << m.sss_lobe_mix;
-        out << "|" << (m.sss_color_from_base ? 1 : 0) << "\n";
+        out << "|" << (m.sss_color_from_base ? 1 : 0) << "|" << m.sss_world_unit_scale;
+        out << "|" << m.hair_specular << "|" << m.hair_radial_roughness << "|" << m.hair_backlit << "|" << m.hair_cuticle_tilt;
+        colour_field(m.hair_tangent);
+        out << "|" << m.hair_coloring << "|" << m.alpha_mode << "|" << m.eye_specular << "|" << m.eye_iris_u << "|"
+            << m.eye_iris_v << "|" << m.eye_iris_radius << "|" << m.eye_limbus_width << "|" << m.eye_iris_depth << "\n";
     }
 }
 
@@ -1699,7 +1726,7 @@ static void LoadMaterialsManifest()
         number_field(m.sss_transmission_distance);
         colour_field(m.sss_surface_albedo);
         colour_field(m.sss_mfp_color);
-        number_field(m.sss_mfp_mm);
+        number_field(m.sss_mfp_distance);
         number_field(m.sss_units_per_metre);
         colour_field(m.sss_profile_tint);
         number_field(m.sss_lobe_roughness0);
@@ -1707,6 +1734,20 @@ static void LoadMaterialsManifest()
         number_field(m.sss_lobe_mix);
         // Manifests without this field predate multiplying by base colour.
         m.sss_color_from_base = idx < toks.size() && std::stoi(toks[idx++]) != 0;
+        number_field(m.sss_world_unit_scale);
+        number_field(m.hair_specular);
+        number_field(m.hair_radial_roughness);
+        number_field(m.hair_backlit);
+        number_field(m.hair_cuticle_tilt);
+        colour_field(m.hair_tangent);
+        if (idx < toks.size()) m.hair_coloring = std::clamp(std::stoi(toks[idx++]), 0, 1);
+        if (idx < toks.size()) m.alpha_mode = std::clamp(std::stoi(toks[idx++]), int(alpha_opaque), int(alpha_blend));
+        number_field(m.eye_specular);
+        number_field(m.eye_iris_u);
+        number_field(m.eye_iris_v);
+        number_field(m.eye_iris_radius);
+        number_field(m.eye_limbus_width);
+        number_field(m.eye_iris_depth);
         loaded.push_back(std::move(m));
         } catch (const std::exception&) {
             std::fprintf(stderr, "Invalid material manifest; keeping the current scene materials.\n");
@@ -1785,7 +1826,20 @@ static void RenderRasterToTexture(int width, int height) {
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
     glDepthFunc(GL_LESS);
-    glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
+    // A coloured sky shows behind objects as in the render, through the same
+    // exposure and luminance Reinhard; a black sky keeps the editor's grey.
+    colour sky = g_camera.background * g_renderer.exposure;
+    double sky_luminance = .2126 * sky.x() + .7152 * sky.y() + .0722 * sky.z();
+    if (sky_luminance > 1e-6) {
+        sky /= 1 + sky_luminance;
+        auto encode = [](double c) {
+            c = std::clamp(c, 0.0, 1.0);
+            return float(c <= .0031308 ? 12.92 * c : 1.055 * std::pow(c, 1 / 2.4) - .055);
+        };
+        glClearColor(encode(sky.x()), encode(sky.y()), encode(sky.z()), 1.0f);
+    } else {
+        glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
+    }
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     float view[16];
@@ -2075,20 +2129,12 @@ static void UploadRenderToTexture(const render_result& img)
     if (width <= 0 || height <= 0 || src.empty())
         return;
 
-    g_rtWidth  = width;
-    g_rtHeight = height;
-    g_rtPixels.resize(width * height * 4);
+    if (src.size() < size_t(width) * height * 3)
+        return;
 
-    for (int i = 0; i < width * height; ++i) {
-        int src_idx = 3 * i;
-        int dst_idx = 4 * i;
-
-        g_rtPixels[dst_idx + 0] = src[src_idx + 0];
-        g_rtPixels[dst_idx + 1] = src[src_idx + 1];
-        g_rtPixels[dst_idx + 2] = src[src_idx + 2];
-        g_rtPixels[dst_idx + 3] = 255;
-    }
-
+    // Progressive updates arrive many times a second: upload the RGB pixels
+    // directly and reuse the texture's storage while the size is unchanged.
+    const bool resized = g_rtTexture == 0 || width != g_rtWidth || height != g_rtHeight;
     if (g_rtTexture == 0) {
         glGenTextures(1, &g_rtTexture);
         glBindTexture(GL_TEXTURE_2D, g_rtTexture);
@@ -2096,13 +2142,18 @@ static void UploadRenderToTexture(const render_result& img)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data());
-    } else {
-        glBindTexture(GL_TEXTURE_2D, g_rtTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, g_rtPixels.data());
     }
+    glBindTexture(GL_TEXTURE_2D, g_rtTexture);
+    GLint alignment = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (resized)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, src.data());
+    else
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, src.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    g_rtWidth  = width;
+    g_rtHeight = height;
 
     g_rtHasImage = true;
 }
@@ -2111,68 +2162,7 @@ static void UploadRenderToTexture(const render_result& img)
 // Input
 // -----------------------------------------------------------------------------
 
-static void update_editor_camera_from_input(GLFWwindow* window, double dt)
-{
-    if (!g_viewport_focused && !g_viewport_hovered)
-        return;
-
-    float move_forward = 0.0f;
-    float move_right   = 0.0f;
-    float move_up      = 0.0f;
-
-    if (!ImGui::GetIO().WantTextInput && !transform_gizmo::drag.active &&
-        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move_forward += 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move_forward -= 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move_right   += 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move_right   -= 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move_up      += 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move_up      -= 1.0f;
-    }
-
-    if (move_forward != 0.0f || move_right != 0.0f || move_up != 0.0f) {
-        g_editor_cam.move_speed = (double)g_camera_move_speed;
-        g_editor_cam.move_from_input(
-            move_forward, move_right, move_up, dt
-        );
-        // camera movement does NOT dirty the world
-    }
-
-    static bool   rotating = false;
-    static double last_x   = 0.0;
-    static double last_y   = 0.0;
-
-    if (!transform_gizmo::drag.active && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
-    {
-        double x, y;
-        glfwGetCursorPos(window, &x, &y);
-
-        if (!rotating) {
-            rotating = true;
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-            last_x = x;
-            last_y = y;
-            return;
-        }
-
-        double dx = x - last_x;
-        double dy = y - last_y;
-        last_x = x;
-        last_y = y;
-
-        double yaw_delta   =  dx * g_camera_look_sens;
-        double pitch_delta = -dy * g_camera_look_sens;
-
-        g_editor_cam.look(yaw_delta, pitch_delta);
-    }
-    else
-    {
-        if (rotating) {
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-        }
-        rotating = false;
-    }
-}
+#include "editor_viewport_nav.inl"
 
 // Start a separate GLFW window thread that displays progressive render updates.
 static void start_progress_window_thread()
@@ -2355,6 +2345,7 @@ static void stop_progress_window_thread()
 // Material inspector helper
 // -----------------------------------------------------------------------------
 
+static void GraphCommit(int index, const material_graph& before, const char* label, bool shading);
 static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index, bool include_texture_bindings = true)
 {
     // Snapshot original material so we can detect changes and invalidate thumbnails
@@ -2410,6 +2401,8 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         case scene_material_model::diffuse_light: model_label = "Diffuse Light"; break;
         case scene_material_model::isotropic:     model_label = "Isotropic";     break;
         case scene_material_model::pbr:           model_label = "PBR";           break;
+        case scene_material_model::hair:          model_label = "Hair";          break;
+        case scene_material_model::eye:           model_label = "Eye";           break;
         default:                                  model_label = "Unknown";       break;
     }
 
@@ -2422,11 +2415,18 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             { "Diffuse Light",  scene_material_model::diffuse_light },
             { "Isotropic",      scene_material_model::isotropic },
             { "PBR GGX",        scene_material_model::pbr },
+            { "Hair",           scene_material_model::hair },
+            { "Eye",            scene_material_model::eye },
         };
 
         for (const auto& opt : opts) {
             bool selected = (mat.model == opt.model);
             if (ImGui::Selectable(opt.label, selected)) {
+                // An eye starts with a wet cornea over the aqueous humour.
+                if (opt.model == scene_material_model::eye && mat.model != opt.model) {
+                    if (mat.ior == scene_material_parameters{}.ior) mat.ior = 1.336;
+                    mat.roughness = std::min(mat.roughness, .1);
+                }
                 mat.model = opt.model;
                 g_world_dirty = true;
             }
@@ -2538,6 +2538,7 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
             if (mat.use_sss && mat.sss_strength <= 0 && mat.sss_shading == sss_shading_burley) {
                 mat.sss_shading = sss_shading_unreal_profile;
                 mat.sss_strength = 1;
+                mat.sss_eta = 1.55; // Unreal's profile IOR
                 if (mat.sss_model == SSS_NONE) mat.sss_model = SSS_DIPOLE_BURLEY;
             }
             g_world_dirty = true;
@@ -2583,19 +2584,21 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
                     scene_material_parameters defaults;
                     mat.sss_surface_albedo = defaults.sss_surface_albedo;
                     mat.sss_mfp_color = defaults.sss_mfp_color;
-                    mat.sss_mfp_mm = defaults.sss_mfp_mm;
+                    mat.sss_mfp_distance = defaults.sss_mfp_distance;
+                    mat.sss_world_unit_scale = defaults.sss_world_unit_scale;
                     mat.sss_profile_tint = defaults.sss_profile_tint;
                     mat.sss_lobe_roughness0 = defaults.sss_lobe_roughness0;
                     mat.sss_lobe_roughness1 = defaults.sss_lobe_roughness1;
                     mat.sss_lobe_mix = defaults.sss_lobe_mix;
-                    mat.sss_eta = 1.4;
+                    mat.sss_eta = 1.55; // Unreal's profile IOR
                     mat.sss_strength = 1;
                     g_world_dirty = true;
                 }
                 slider("Subsurface Mask", mat.sss_strength, 0.0f, 1.0f);
                 colour_edit("Surface Albedo", mat.sss_surface_albedo);
                 colour_edit("Mean Free Path Color", mat.sss_mfp_color);
-                slider("Mean Free Path (mm)", mat.sss_mfp_mm, 0.001f, 100.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                slider("Mean Free Path Distance", mat.sss_mfp_distance, 0.001f, 1000.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                slider("World Unit Scale (cm)", mat.sss_world_unit_scale, 0.001f, 10.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
                 slider("Scene Units per Metre", mat.sss_units_per_metre, 0.001f, 1000.0f, "%.3f",
                        ImGuiSliderFlags_Logarithmic);
                 colour_edit("Tint", mat.sss_profile_tint);
@@ -2707,9 +2710,104 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         }
     } break;
 
+    case scene_material_model::hair:
+    {
+        ImGui::TextDisabled("Hair: Unreal-style fibre shading for strands and hair cards.");
+        auto slide = [&](const char* label, double& value, float lo, float hi, const char* tip) {
+            float v = (float)value;
+            if (ImGui::SliderFloat(label, &v, lo, hi)) { value = v; g_world_dirty = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        slide("Specular", mat.hair_specular, 0.0f, 1.0f,
+              "Primary white highlight. 0.5 is physically based, as in Unreal.");
+        slide("Roughness", mat.roughness, 0.02f, 1.0f,
+              "Longitudinal roughness: how far highlights spread along the strands.");
+        slide("Radial Roughness", mat.hair_radial_roughness, 0.02f, 1.0f,
+              "Around the strand: low values glint, high values look soft.");
+        slide("Backlit", mat.hair_backlit, 0.0f, 1.0f,
+              "Light passing through the strands: the glow against a back light.");
+        slide("Cuticle Tilt", mat.hair_cuticle_tilt, 0.0f, 10.0f,
+              "Degrees. Separates the white and coloured highlights along the strands.");
+        slide("IOR", mat.ior, 1.3f, 2.0f, "Fibre index of refraction; human hair is about 1.55.");
+        const char* colorings[] = {"Strand (Unreal, cards)", "Volume (Cycles, strands)"};
+        if (ImGui::Combo("Base Color Is", &mat.hair_coloring, colorings, IM_ARRAYSIZE(colorings))) g_world_dirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Strand: Base Color is one strand's colour, as in Unreal. Best for hair cards.\n"
+                              "Volume: Base Color is the colour of a thick lock of many strands, as in\n"
+                              "Cycles. Best for real strand geometry; cards look paler.");
+        float tangent[3] = {(float)mat.hair_tangent.x(), (float)mat.hair_tangent.y(), (float)mat.hair_tangent.z()};
+        if (ImGui::DragFloat3("Strand Tangent", tangent, 0.01f, -1.0f, 1.0f, "%.2f")) {
+            mat.hair_tangent = vec3(tangent[0], tangent[1], tangent[2]);
+            g_world_dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Strand direction in tangent space when the Tangent pin is unconnected.\n"
+                              "(0,1,0) follows the card's V texture axis, as in Unreal; use (1,0,0) for cards laid\n"
+                              "out along U, or negate it to swap root and tip.");
+        ImGui::TextDisabled("Base Color is the fibre colour. Textures and flow maps connect in the Material Graph.");
+        // PBR's Normal pin is Hair's Tangent: a migrated normal map would point
+        // the strands out of the card.
+        if (mat.graph.output_id() && mat.graph.incoming(mat.graph.output_id(), 3)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                               "Tangent is connected. For PBR this pin was Normal; a normal map here\n"
+                               "points the strands out of the card.");
+            if (ImGui::Button("Disconnect Tangent")) {
+                material_graph before = mat.graph;
+                mat.graph.disconnect(mat.graph.output_id(), 3, true);
+                GraphCommit(mat_index, before, "Disconnect hair tangent", true);
+            }
+        }
+    } break;
+
+    case scene_material_model::eye:
+    {
+        ImGui::TextDisabled("Eye: Unreal-style wet cornea over a refracting iris.");
+        auto slide = [&](const char* label, double& value, float lo, float hi, const char* tip) {
+            float v = (float)value;
+            if (ImGui::SliderFloat(label, &v, lo, hi)) { value = v; g_world_dirty = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        slide("Specular", mat.eye_specular, 0.0f, 1.0f,
+              "Cornea reflectance, as in Unreal: F0 = 0.08 x Specular. 0.31 matches a real cornea.");
+        slide("Roughness", mat.roughness, 0.02f, 1.0f, "Cornea roughness. A wet eye is about 0.05 to 0.1.");
+        slide("Normal Strength", mat.normal_strength, 0.0f, 4.0f, "Strength of a normal map on the Normal pin.");
+        float centre[2] = {(float)mat.eye_iris_u, (float)mat.eye_iris_v};
+        if (ImGui::DragFloat2("Iris Centre (UV)", centre, 0.002f, 0.0f, 1.0f, "%.3f")) {
+            mat.eye_iris_u = centre[0];
+            mat.eye_iris_v = centre[1];
+            g_world_dirty = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the pupil sits in the eye texture.");
+        slide("Iris Radius (UV)", mat.eye_iris_radius, 0.01f, 0.5f,
+              "Iris radius in texture space, Unreal's Iris UV Radius. Match the coloured disc of the eye texture.");
+        slide("Limbus Width (UV)", mat.eye_limbus_width, 0.0f, 0.2f,
+              "Softness of the iris edge where it meets the white of the eye.");
+        slide("Iris Depth", mat.eye_iris_depth, 0.0f, 1.5f,
+              "How far the iris sits below the cornea, in iris radii (a real eye is about 0.5).\n"
+              "Deeper irises refract more as the view turns and catch a stronger caustic.");
+        slide("IOR", mat.ior, 1.0f, 1.6f, "Refraction into the eye; the aqueous humour is 1.336.");
+        ImGui::TextDisabled("Graph pins: Specular, Iris Mask and Iris Distance override these.");
+    } break;
+
     default:
         ImGui::TextDisabled("Unknown material model.");
         break;
+    }
+
+    if (mat.model == scene_material_model::pbr || mat.model == scene_material_model::hair ||
+        mat.model == scene_material_model::eye) {
+        DrawSectionLabel("Opacity");
+        const char* modes[] = {"Opaque", "Clip", "Blend"};
+        if (ImGui::Combo("Alpha Mode", &mat.alpha_mode, modes, IM_ARRAYSIZE(modes))) g_world_dirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How Opacity (or the base colour's alpha) hides the surface.\n"
+                              "Opaque: ignore alpha.\n"
+                              "Clip: alpha at or above the threshold is solid, the rest is cut away (Unreal Masked).\n"
+                              "Blend: alpha is see-through in proportion, so soft edges stay soft (Cycles, Unreal Translucent).");
+        if (mat.alpha_mode == alpha_clip) {
+            float cutoff = (float)mat.alpha_cutoff;
+            if (ImGui::SliderFloat("Clip Threshold", &cutoff, 0.0f, 1.0f)) { mat.alpha_cutoff = cutoff; g_world_dirty = true; }
+        }
     }
 
     // Detect material edits by comparing important fields to the snapshot
@@ -2742,8 +2840,8 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
         (orig.sss_subsurface_color-mat.sss_subsurface_color).length_squared()>1e-12 ||
         orig.sss_opacity!=mat.sss_opacity || orig.sss_transmission_distance!=mat.sss_transmission_distance ||
         (orig.sss_surface_albedo-mat.sss_surface_albedo).length_squared()>1e-12 ||
-        (orig.sss_mfp_color-mat.sss_mfp_color).length_squared()>1e-12 || orig.sss_mfp_mm!=mat.sss_mfp_mm ||
-        orig.sss_units_per_metre!=mat.sss_units_per_metre ||
+        (orig.sss_mfp_color-mat.sss_mfp_color).length_squared()>1e-12 || orig.sss_mfp_distance!=mat.sss_mfp_distance ||
+        orig.sss_units_per_metre!=mat.sss_units_per_metre || orig.sss_world_unit_scale!=mat.sss_world_unit_scale ||
         (orig.sss_profile_tint-mat.sss_profile_tint).length_squared()>1e-12 ||
         orig.sss_lobe_roughness0!=mat.sss_lobe_roughness0 || orig.sss_lobe_roughness1!=mat.sss_lobe_roughness1 ||
         orig.sss_lobe_mix!=mat.sss_lobe_mix) material_changed=true;
@@ -2753,6 +2851,15 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
     if (orig.normal_tex != mat.normal_tex) material_changed = true;
     if (orig.alpha_tex != mat.alpha_tex) material_changed = true;
     if (orig.unreal_pbr != mat.unreal_pbr) material_changed = true;
+    if (orig.hair_specular != mat.hair_specular || orig.hair_radial_roughness != mat.hair_radial_roughness ||
+        orig.hair_backlit != mat.hair_backlit || orig.hair_cuticle_tilt != mat.hair_cuticle_tilt ||
+        (orig.hair_tangent - mat.hair_tangent).length_squared() > 0 || orig.alpha_cutoff != mat.alpha_cutoff ||
+        orig.hair_coloring != mat.hair_coloring)
+        material_changed = true;
+    if (orig.alpha_mode != mat.alpha_mode || orig.eye_specular != mat.eye_specular || orig.eye_iris_u != mat.eye_iris_u ||
+        orig.eye_iris_v != mat.eye_iris_v || orig.eye_iris_radius != mat.eye_iris_radius ||
+        orig.eye_limbus_width != mat.eye_limbus_width || orig.eye_iris_depth != mat.eye_iris_depth)
+        material_changed = true;
 
     if (material_changed) {
         InvalidateMaterialThumbnail(mat_index);
@@ -2766,6 +2873,54 @@ static void DrawMaterialInspector(scene_material& mat, scene& scn, int mat_index
 
 #include "material_graph_editor.inl"
 #include "editor_projects.inl"
+
+// A status bar along the bottom of the editor, as in other DCC tools: the
+// project, selection and camera on the left; render progress and frame rate
+// on the right.
+static void DrawStatusBar() {
+    const float height = ImGui::GetFrameHeight() + 4.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 2.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.085f, 0.10f, 1.0f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking;
+    if (ImGui::BeginViewportSideBar("##StatusBar", ImGui::GetMainViewport(), ImGuiDir_Down, height, flags)) {
+        ImGui::AlignTextToFramePadding();
+        const std::string project = project_ui::file.empty() ? "Untitled" : project_ui::file.filename().u8string();
+        ImGui::TextUnformatted(project.c_str());
+        if (project_ui::dirty) {
+            ImGui::SameLine(0, 6);
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1.0f), "Unsaved changes");
+        }
+        ImGui::SameLine(0, 24);
+        if (g_selected_object >= 0 && g_selected_object < (int)g_scene.objects.size())
+            ImGui::Text("Selected: %s", g_scene.objects[g_selected_object].name.c_str());
+        else
+            ImGui::TextDisabled("Nothing selected");
+        ImGui::SameLine(0, 24);
+        ImGui::TextDisabled(viewport_nav::navigating() ? "Navigating   speed %.2f" : "Camera speed %.2f",
+                            g_camera_move_speed);
+
+        char right[160];
+        if (g_render_in_progress) {
+            const bool tiles = g_render_progress.total_tiles > 0;
+            const int done = tiles ? g_render_progress.completed_tiles.load() : g_render_progress.completed_scanlines.load();
+            const int total = tiles ? g_render_progress.total_tiles : g_render_progress.total_scanlines;
+            const int left = int(g_render_progress.eta_seconds.load());
+            std::snprintf(right, sizeof(right), "Rendering %d%%   %d:%02d left      %.0f fps  %.1f ms",
+                          total > 0 ? 100 * done / total : 0, left / 60, left % 60, ImGui::GetIO().Framerate,
+                          1000.0f / std::max(ImGui::GetIO().Framerate, 1.0f));
+        } else {
+            std::snprintf(right, sizeof(right), "%.0f fps  %.1f ms", ImGui::GetIO().Framerate,
+                          1000.0f / std::max(ImGui::GetIO().Framerate, 1.0f));
+        }
+        const float width = ImGui::CalcTextSize(right).x;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 24, ImGui::GetWindowContentRegionMax().x - width));
+        ImGui::TextDisabled("%s", right);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
 
 // -----------------------------------------------------------------------------
 // File-drop
@@ -2980,6 +3135,9 @@ int main(int argc, char** argv)
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
     glfwSetDropCallback(window, glfw_drop_callback);
+    // Installed before ImGui's backend, which chains to it: the viewport
+    // reads the wheel even while ImGui ignores the mouse during a drag.
+    glfwSetScrollCallback(window, viewport_nav::scroll_callback);
 
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
@@ -2997,6 +3155,13 @@ int main(int argc, char** argv)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Panels move by their title bars only, so dragging inside one (a graph,
+    // a slider's margin) never drags the window. Floating panels are tool
+    // windows of the editor: no taskbar entries of their own.
+    io.ConfigWindowsMoveFromTitleBarOnly = true;
+    io.ConfigViewportsNoTaskBarIcon = true;
+    // Click a number to type it; drag it to scrub, as in Unreal and Blender.
+    io.ConfigDragClickToInputText = true;
 
     SetupEditorFonts(io);
     ImGui::StyleColorsDark();
@@ -3038,7 +3203,7 @@ int main(int argc, char** argv)
         double dt = current_time - last_time;
         last_time = current_time;
 
-        update_editor_camera_from_input(window, dt);
+        viewport_nav::update(window, dt);
 
         // If render thread produced a partial or final result, upload texture.
         if (g_render_has_result) {
@@ -3090,9 +3255,17 @@ int main(int argc, char** argv)
             }
         }
 
+        // Minimised: nothing is visible, so wait for events instead of drawing
+        // frames (renders keep running and finish as usual).
+        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+            glfwWaitEventsTimeout(.05);
+            continue;
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        viewport_nav::after_new_frame();
         if (transform_gizmo::drag.active && ImGui::IsKeyPressed(ImGuiKey_Escape,false)) transform_gizmo::finish(true);
         if (transform_gizmo::drag.active && !ImGui::IsMouseDown(0)) {
             transform_gizmo::update(io.MousePos,transform_gizmo::snapping || io.KeyCtrl);
@@ -3100,6 +3273,7 @@ int main(int argc, char** argv)
         }
         ProjectShortcuts();
         DrawProjectDialogs(window);
+        DrawStatusBar();
 
         // Ctrl+Z / Ctrl+Y handling (undo/redo) using GLFW key state; debounce on key transition
         static bool s_prev_ctrlz = false;
@@ -3200,13 +3374,15 @@ int main(int argc, char** argv)
             ImGui::PopStyleVar(2);
 
             ImGuiID dockspace_id = ImGui::GetID("DusktracerDockSpace");
+            // The layout saved in imgui.ini is kept between sessions; the
+            // default is built on first run and by View > Reset Layout.
+            static bool s_reset_layout = false;
+            const bool build_layout = s_reset_layout || ImGui::DockBuilderGetNode(dockspace_id) == nullptr;
             ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f));
 
-                // --- One-time dock layout setup ---
-            static bool s_dockspace_built = false;
-            if (!s_dockspace_built)
+            if (build_layout)
             {
-                s_dockspace_built = true;
+                s_reset_layout = false;
 
                 // Clear any previous layout for this dockspace ID
                 ImGui::DockBuilderRemoveNode(dockspace_id);
@@ -3253,6 +3429,9 @@ int main(int argc, char** argv)
                     if (ImGui::MenuItem("Content Drawer", "Ctrl+Space", &s_content_drawer_open)) {
                         s_focus_content_drawer = s_content_drawer_open;
                     }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Frame Selection", "F")) viewport_nav::frame_selection();
+                    if (ImGui::MenuItem("Reset Layout")) s_reset_layout = true;
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Edit"))
@@ -3809,9 +3988,28 @@ int main(int argc, char** argv)
                 g_renderer.denoiser_strength = ds;
             }
             ImGui::TextDisabled("Final image blend: 0 = raw, 1 = fully denoised.");
+            ImGui::BeginDisabled(!g_renderer.use_denoiser);
+            ImGui::Checkbox("Denoise Buckets While Rendering", &g_renderer.progressive_denoise);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Each finished bucket is denoised in the viewport once its neighbours are done.\n"
+                                  "The saved image is always denoised as one frame.");
 #else
             ImGui::TextDisabled("OpenImageDenoise not available in this build.");
 #endif
+            DrawSectionLabel("Buckets");
+            const char* orders[] = {"Spiral", "Hilbert", "Rows"};
+            ImGui::Combo("Bucket Order", &g_renderer.bucket_order, orders, IM_ARRAYSIZE(orders));
+            ImGui::SliderInt("CPU Bucket Size", &g_renderer.bucket_size, 16, 256, "%d px");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Each CPU thread renders one bucket at full sample count. GPU buckets are 256 px.");
+            int gpu_mode = g_renderer.gpu_buckets ? 1 : 0;
+            const char* gpu_modes[] = {"Progressive", "Buckets"};
+            if (ImGui::Combo("GPU Mode", &gpu_mode, gpu_modes, IM_ARRAYSIZE(gpu_modes)))
+                g_renderer.gpu_buckets = gpu_mode == 1;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Progressive refines the whole frame at once.\n"
+                                  "Buckets finishes a few 256 px buckets at a time, like Cycles' GPU tiles.");
             // Adaptive sampling controls
             DrawSectionLabel("Adaptive Sampling");
             bool adapt = g_renderer.adaptive_sampling;
@@ -4884,6 +5082,7 @@ int main(int argc, char** argv)
                 g_render_progress.completed_scanlines.store(0);
                 g_render_progress.total_tiles = 0;
                 g_render_progress.completed_tiles.store(0);
+                g_render_progress.clear_tiles();
                 g_render_progress.eta_seconds.store(0.0);
                 g_render_progress.elapsed_seconds.store(0.0);
 
@@ -5051,7 +5250,18 @@ int main(int argc, char** argv)
                 g_progress_popup_pending = false;
             }
         } else {
-            ImGui::TextDisabled("RMB + WASD fly | W/E/R transform");
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("Controls");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Right drag          look; W A S D move, Q / E down / up\n"
+                                  "  + Shift           fly 3x faster\n"
+                                  "  + wheel           change fly speed\n"
+                                  "Middle drag         pan\n"
+                                  "Alt + left drag     orbit\n"
+                                  "Alt + right drag    dolly\n"
+                                  "Wheel               zoom toward the view centre\n"
+                                  "F                   frame selection (or the scene)\n"
+                                  "Q / W / E / R       select, move, rotate, scale");
         }
 
         ImGui::SameLine();
@@ -5107,10 +5317,14 @@ int main(int argc, char** argv)
             ImGui::Text("Elapsed: %.0fs | Remaining: %d:%02d", el, rem_min, rem_sec);
         }
 
-        transform_gizmo::shortcuts();
+        if (!viewport_nav::navigating()) transform_gizmo::shortcuts();
         transform_gizmo::toolbar();
         ImGui::Separator();
         ImVec2 vp_size = ImGui::GetContentRegionAvail();
+        {
+            const ImVec2 area = ImGui::GetCursorScreenPos();
+            viewport_nav::set_area(area, ImVec2(area.x + vp_size.x, area.y + vp_size.y));
+        }
         if (request_render) {
             start_viewport_render(vp_size);
         }
@@ -5128,6 +5342,8 @@ int main(int argc, char** argv)
                     ImVec2(0, 0),
                     ImVec2(1, 1)
                 );
+                if (g_render_in_progress)
+                    DrawActiveBuckets(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), layout.size);
             } else {
                 ImGui::Text("No render yet. Click 'Render Current View'.");
             }
@@ -5196,6 +5412,7 @@ int main(int argc, char** argv)
                 ImGui::Text("Viewport too small.");
             }
         }
+        viewport_nav::draw_overlay(ImGui::GetWindowDrawList());
 
         ImGui::End();
 
@@ -5219,6 +5436,18 @@ int main(int argc, char** argv)
             ImGui::UpdatePlatformWindows();
             for (auto* viewport : ImGui::GetPlatformIO().Viewports)
                 if (viewport->PlatformHandle) glfwSetDropCallback(static_cast<GLFWwindow*>(viewport->PlatformHandle), glfw_drop_callback);
+#ifdef _WIN32
+            // Panels dragged out of the editor (the Material Editor, say) are
+            // owned by the editor window, as tool windows are: they stay above
+            // it when it is clicked and minimise with it.
+            const HWND owner = glfwGetWin32Window(window);
+            for (auto* viewport : ImGui::GetPlatformIO().Viewports) {
+                if (viewport == ImGui::GetMainViewport() || !viewport->PlatformHandleRaw) continue;
+                const HWND panel = static_cast<HWND>(viewport->PlatformHandleRaw);
+                if (reinterpret_cast<HWND>(::GetWindowLongPtrW(panel, GWLP_HWNDPARENT)) != owner)
+                    ::SetWindowLongPtrW(panel, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
+            }
+#endif
             ImGui::RenderPlatformWindowsDefault();
             glfwMakeContextCurrent(backup_current_context);
         }

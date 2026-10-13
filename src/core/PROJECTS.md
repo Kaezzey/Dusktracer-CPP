@@ -38,7 +38,12 @@ diffusion distances. Version 1 and 2 scenes remain readable with neutral RGB
 distances; version 1 enables firefly suppression by default. Version 4 adds the
 SSS shading model and Unreal Subsurface/Subsurface Profile parameters; older
 scenes load as legacy Burley diffusion. Version 5 adds Multiply by Base Color
-for Unreal Subsurface; earlier scenes load with it off. New saves use version 5.
+for Unreal Subsurface; earlier scenes load with it off. Version 6 adds the
+profile's World Unit Scale; earlier scenes use 0.1 cm, which keeps their mean
+free paths in millimetres. Version 7 adds bucket rendering and hair settings.
+Version 8 adds each material's Alpha Mode and the eye settings; earlier scenes
+load with Blend, so alpha below the old cutoff now shows partly instead of
+vanishing (choose Clip to restore the cutout). New saves use version 8.
 
 ```text
 Studio/

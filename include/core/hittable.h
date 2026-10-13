@@ -24,9 +24,21 @@ class hit_record{
         vec3 tangent;
         vec3 bitangent;
 
+        // From p to the smooth surface the vertex normals describe (Hanika
+        // 2021, "Hacking the Shadow Terminator"), on the outward side. Shadow
+        // rays leaving that side start there, so a coarse smooth-shaded mesh
+        // is lit and shadowed as the smooth surface rather than as facets.
+        // Zero for flat and analytic surfaces.
+        vec3 smooth_offset;
+        // The primitive hit, kept through instance transforms. A shadow ray
+        // that starts above the smooth surface may cross its own triangle.
+        const void* primitive = nullptr;
+
         inline void set_face_normal(const ray& r, const vec3& outward_normal) {
             front_face = dot(r.direction(), outward_normal) < 0;
             normal = geometric_normal = front_face ? outward_normal : -outward_normal;
+            smooth_offset = vec3(0, 0, 0);
+            primitive = nullptr;
         }
         vec3 geometry_normal() const {
             return geometric_normal.near_zero() ? normal : geometric_normal;

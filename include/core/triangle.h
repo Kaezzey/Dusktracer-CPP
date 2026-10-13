@@ -13,6 +13,16 @@
 #include "embree_accel.h"
 #endif
 
+// Hanika (2021): lift p onto each vertex's tangent plane when it lies below
+// it, then blend with the barycentric weights. The result lies on the smooth
+// surface implied by the (outward) vertex normals; returned as an offset from p.
+inline vec3 smooth_surface_offset(const point3& p, const point3& a, const point3& b, const point3& c,
+                                  const vec3& na, const vec3& nb, const vec3& nc,
+                                  double wa, double wb, double wc) {
+    auto lift = [&](const point3& vertex, const vec3& n) { return p - std::min(0.0, dot(p - vertex, n)) * n; };
+    return wa * lift(a, na) + wb * lift(b, nb) + wc * lift(c, nc) - p;
+}
+
 inline void compute_triangle_tangent_bitangent(
     const point3& p0, const point3& p1, const point3& p2,
     double u0, double v0,
@@ -194,6 +204,8 @@ public:
         interpN = unit_vector(interpN);
         rec.set_face_normal(r, safe_unit_vector(cross(edge1,edge2)));
         rec.set_shading_normal(interpN);
+        rec.smooth_offset = smooth_surface_offset(rec.p, v0, v1, v2, n0, n1, n2, w, u, v);
+        rec.primitive = this;
 
         // Alpha Mask: previously we sometimes discarded hits here to
         // implement stochastic transparency. For visibility/shadow rays we

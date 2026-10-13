@@ -185,7 +185,7 @@ static void check_gpu_unreal_subsurface(const std::string& device,const std::fil
     save("unreal-subsurface-gpu.png",unreal);
 
     auto& profile=source.materials[0];
-    profile.sss_shading=sss_shading_unreal_profile; profile.sss_strength=1; profile.sss_units_per_metre=100;
+    profile.sss_shading=sss_shading_unreal_profile; profile.sss_strength=1; profile.sss_units_per_metre=45;
     profile.sss_eta=1.4;
     cam.sun_dir=safe_unit_vector(vec3(-.7,.5,.5));
     compare_render(source,cam,device,"GPU Subsurface Profile skin diffusion",3);

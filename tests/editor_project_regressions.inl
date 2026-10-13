@@ -56,13 +56,18 @@ static int run_project_checks() {
     m.sss_color_override_color = vec3(.1, .2, .3);
     m.sss_shading = sss_shading_unreal_profile;
     m.sss_subsurface_color = vec3(.9, .3, .2); m.sss_opacity = .27; m.sss_transmission_distance = .013;
-    m.sss_surface_albedo = vec3(.8, .5, .3); m.sss_mfp_color = vec3(1, .4, .1); m.sss_mfp_mm = 2.5;
-    m.sss_units_per_metre = 100; m.sss_profile_tint = vec3(.9, .8, .7);
+    m.sss_surface_albedo = vec3(.8, .5, .3); m.sss_mfp_color = vec3(1, .4, .1); m.sss_mfp_distance = 2.5;
+    m.sss_units_per_metre = 100; m.sss_world_unit_scale = .25; m.sss_profile_tint = vec3(.9, .8, .7);
     m.sss_lobe_roughness0 = .6; m.sss_lobe_roughness1 = 1.4; m.sss_lobe_mix = .2;
     m.unreal_pbr = true;
     m.normal_strength = .75;
     m.alpha_double_sided = false;
     m.alpha_cutoff = .31;
+    m.hair_specular = .65; m.hair_radial_roughness = .45; m.hair_backlit = .8;
+    m.hair_cuticle_tilt = 3.5; m.hair_tangent = vec3(1, 0, 0); m.hair_coloring = 1;
+    m.alpha_mode = alpha_clip;
+    m.eye_specular = .42; m.eye_iris_u = .48; m.eye_iris_v = .53; m.eye_iris_radius = .26;
+    m.eye_limbus_width = .05; m.eye_iris_depth = .7;
     m.albedo_tex = m.metallic_tex = m.roughness_tex = m.normal_tex = m.alpha_tex = 0;
     initialize_material_graph(m, doc.world.textures);
     int node = m.graph.add(graph_kind::texture_sample, -123.25f, 248.5f);
@@ -135,6 +140,9 @@ static int run_project_checks() {
     r.adaptive_check_interval = 23;
     r.adaptive_rel_threshold = .043;
     r.adaptive_abs_threshold = .00013;
+    r.bucket_size = 96;
+    r.bucket_order = 1;
+    r.gpu_buckets = false;
     doc.viewport.position = vec3(2, 3, 5);
     doc.viewport.yaw = .41;
     doc.viewport.pitch = .27;
@@ -170,13 +178,52 @@ static int run_project_checks() {
         check(p.sss_shading == m.sss_shading && same(p.sss_subsurface_color, m.sss_subsurface_color) &&
               p.sss_opacity == m.sss_opacity && p.sss_transmission_distance == m.sss_transmission_distance &&
               same(p.sss_surface_albedo, m.sss_surface_albedo) && same(p.sss_mfp_color, m.sss_mfp_color) &&
-              p.sss_mfp_mm == m.sss_mfp_mm && p.sss_units_per_metre == m.sss_units_per_metre &&
+              p.sss_mfp_distance == m.sss_mfp_distance && p.sss_units_per_metre == m.sss_units_per_metre &&
               same(p.sss_profile_tint, m.sss_profile_tint) && p.sss_lobe_roughness0 == m.sss_lobe_roughness0 &&
               p.sss_lobe_roughness1 == m.sss_lobe_roughness1 && p.sss_lobe_mix == m.sss_lobe_mix &&
-              p.sss_color_from_base == m.sss_color_from_base,
+              p.sss_color_from_base == m.sss_color_from_base && p.sss_world_unit_scale == m.sss_world_unit_scale,
               "persist Unreal Subsurface and Subsurface Profile settings");
     }
+    {
+        const auto& p = loaded.world.materials[0];
+        check(p.alpha_mode == alpha_clip && p.eye_specular == .42 && p.eye_iris_u == .48 && p.eye_iris_v == .53 &&
+              p.eye_iris_radius == .26 && p.eye_limbus_width == .05 && p.eye_iris_depth == .7,
+              "persist alpha mode and eye settings");
+    }
     auto legacy=before;
+    legacy.replace(legacy.find("DUSK_SCENE 8"),12,"DUSK_SCENE 7");
+    for(const char* record : {"\nalpha_mode ","\neye "})
+        for(auto at=legacy.find(record);at!=std::string::npos;at=legacy.find(record))
+            legacy.erase(at+1,legacy.find('\n',at+1)-at);
+    write(first / "VersionSeven.dusk",legacy);
+    {
+        const auto seven = load(first / "VersionSeven.dusk").world.materials[0];
+        check(seven.alpha_mode == alpha_blend && seven.alpha_cutoff == .31,
+              "version-seven materials blend alpha and keep their cutoff for Clip");
+        check(seven.eye_specular == .5 && seven.eye_iris_radius == .15 && seven.eye_iris_depth == .5,
+              "version-seven materials load default eye settings");
+    }
+    legacy.replace(legacy.find("DUSK_SCENE 7"),12,"DUSK_SCENE 6");
+    for(const char* record : {"\nbuckets ","\nhair "})
+        for(auto at=legacy.find(record);at!=std::string::npos;at=legacy.find(record))
+            legacy.erase(at+1,legacy.find('\n',at+1)-at);
+    write(first / "VersionSix.dusk",legacy);
+    {
+        auto six=load(first / "VersionSix.dusk");
+        check(six.render_settings.bucket_size==64 && six.render_settings.bucket_order==0 && six.render_settings.gpu_buckets,
+              "version-six scenes render with default buckets");
+        const auto& hair = six.world.materials[0];
+        check(hair.hair_specular==.5 && hair.hair_radial_roughness==.3 && hair.hair_backlit==1 &&
+              hair.hair_cuticle_tilt==2 && (hair.hair_tangent-vec3(0,1,0)).length_squared()==0 &&
+              hair.hair_coloring==0,
+              "version-six materials load default hair settings");
+    }
+    legacy.replace(legacy.find("DUSK_SCENE 6"),12,"DUSK_SCENE 5");
+    for(auto at=legacy.find("sss_world_unit_scale ");at!=std::string::npos;at=legacy.find("sss_world_unit_scale "))
+        legacy.erase(at,legacy.find('\n',at)-at+1);
+    write(first / "VersionFive.dusk",legacy);
+    check(load(first / "VersionFive.dusk").world.materials[0].sss_world_unit_scale==.1,
+          "version-five profiles keep millimetre mean free paths");
     legacy.replace(legacy.find("DUSK_SCENE 5"),12,"DUSK_SCENE 4");
     for(auto at=legacy.find("sss_base_color ");at!=std::string::npos;at=legacy.find("sss_base_color "))
         legacy.erase(at,legacy.find('\n',at)-at+1);

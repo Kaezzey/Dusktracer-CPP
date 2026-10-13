@@ -94,43 +94,36 @@ class image_texture : public texture {
         //no texture data, then return solid cyan as a debugging aid
         if (image->height() <= 0) return colour(0,1,1);
 
-        int i = 0, j = 0;
-        resolve_texel(u, v, i, j);
-
-        double r = 0.0;
-        double g = 0.0;
-        double b = 0.0;
-
         int ch = image->channels();
         if (ch <= 0) {
             return colour(0,1,1);
         }
-        if (ch == 1 || ch == 2) {
-            r = g = b = image->channel_value(i, j, 0);
-        } else {
-            r = image->channel_value(i, j, 0);
-            g = image->channel_value(i, j, 1);
-            b = image->channel_value(i, j, 2);
-        }
-
-        if (sample_space == texture_sample_space::srgb_color && !image->is_hdr()) {
-            r = srgb_to_linear(r);
-            g = srgb_to_linear(g);
-            b = srgb_to_linear(b);
-        }
-
-        return colour(r, g, b);
+        // Texels are decoded before filtering, so sRGB blends in linear light.
+        return filter(u, v, [&](int i, int j) {
+            double r, g, b;
+            if (ch == 1 || ch == 2) {
+                r = g = b = image->channel_value(i, j, 0);
+            } else {
+                r = image->channel_value(i, j, 0);
+                g = image->channel_value(i, j, 1);
+                b = image->channel_value(i, j, 2);
+            }
+            if (sample_space == texture_sample_space::srgb_color && !image->is_hdr()) {
+                r = srgb_to_linear(r);
+                g = srgb_to_linear(g);
+                b = srgb_to_linear(b);
+            }
+            return colour(r, g, b);
+        });
     }
 
       double alpha_at(double u, double v, const point3& p) const override {
         if (image->height() <= 0) return 1.0;
 
-        int i = 0, j = 0;
-        resolve_texel(u, v, i, j);
-
         // If the image has an explicit alpha channel, use it.
         if (image->has_alpha()) {
-          return std::clamp(image->channel_value(i, j, image->channels() == 2 ? 1 : 3), 0.0, 1.0);
+          const int channel = image->channels() == 2 ? 1 : 3;
+          return std::clamp(filter(u, v, [&](int i, int j) { return image->channel_value(i, j, channel); }), 0.0, 1.0);
         }
 
         // No explicit alpha channel: only treat true mask images as alpha.
@@ -142,11 +135,10 @@ class image_texture : public texture {
         //    Return fully opaque so PBR fallback doesn't accidentally mask geometry.
         int ch = image->channels();
         if (ch <= 0) return 1.0;
-        if (ch == 1) {
-          return std::clamp(image->channel_value(i, j, 0), 0.0, 1.0);
-        } else if (ch == 2) {
-          // gray + alpha (second channel is alpha)
-          return std::clamp(image->channel_value(i, j, 1), 0.0, 1.0);
+        if (ch == 1 || ch == 2) {
+          // A grey mask, or grey + alpha whose second channel is alpha.
+          const int channel = ch - 1;
+          return std::clamp(filter(u, v, [&](int i, int j) { return image->channel_value(i, j, channel); }), 0.0, 1.0);
         } else {
           // 3 or more channels but no explicit alpha -> treat as opaque
           return 1.0;
@@ -160,23 +152,15 @@ class image_texture : public texture {
       double mask_alpha_at(double u, double v, const point3& p) const override {
         if (image->height() <= 0) return 1.0;
 
-        int i = 0, j = 0;
-        resolve_texel(u, v, i, j);
-
-        if (image->has_alpha()) {
-            return std::clamp(image->channel_value(i, j, image->channels() == 2 ? 1 : 3), 0.0, 1.0);
-        }
-
         int ch = image->channels();
         if (ch <= 0) return 1.0;
-        if (ch == 1) return std::clamp(image->channel_value(i, j, 0), 0.0, 1.0);
-        if (ch == 2) return std::clamp(image->channel_value(i, j, 1), 0.0, 1.0);
-
-        // RGB or larger: compute perceived luminance as mask value.
-        double r = image->channel_value(i, j, 0);
-        double g = image->channel_value(i, j, 1);
-        double b = image->channel_value(i, j, 2);
-        return std::clamp(0.2126 * r + 0.7152 * g + 0.0722 * b, 0.0, 1.0);
+        // Image alpha where present, a grey mask, or RGB luminance.
+        const int channel = image->has_alpha() ? (ch == 2 ? 1 : 3) : ch <= 2 ? ch - 1 : -1;
+        return std::clamp(filter(u, v, [&](int i, int j) {
+            if (channel >= 0) return image->channel_value(i, j, channel);
+            return 0.2126 * image->channel_value(i, j, 0) + 0.7152 * image->channel_value(i, j, 1) +
+                   0.0722 * image->channel_value(i, j, 2);
+        }), 0.0, 1.0);
       }
 
   private:
@@ -186,11 +170,20 @@ class image_texture : public texture {
         return std::pow((c + 0.055) / 1.055, 2.4);
     }
 
-    void resolve_texel(double u, double v, int& i, int& j) const {
-        u = interval(0,1).clamp(u);
-        v = 1.0 - interval(0,1).clamp(v);
-        i = int(u * image->width());
-        j = int(v * image->height());
+    // Bilinear filtering between texel centres, clamped to the edge texels,
+    // as the Vulkan tracer and the raster viewport sample. Without it, a
+    // texture magnified across many pixels shows each texel as a block:
+    // alpha-tested hair cards break their strands into jagged chunks.
+    template <class F> auto filter(double u, double v, F texel) const {
+        const int w = image->width(), h = image->height();
+        const double x = interval(0,1).clamp(u) * w - .5, y = (1.0 - interval(0,1).clamp(v)) * h - .5;
+        int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+        const double fx = x - x0, fy = y - y0;
+        const int x1 = std::clamp(x0 + 1, 0, w - 1), y1 = std::clamp(y0 + 1, 0, h - 1);
+        x0 = std::clamp(x0, 0, w - 1);
+        y0 = std::clamp(y0, 0, h - 1);
+        return (texel(x0, y0) * (1 - fx) + texel(x1, y0) * fx) * (1 - fy) +
+               (texel(x0, y1) * (1 - fx) + texel(x1, y1) * fx) * fy;
     }
 
     std::shared_ptr<rtw_image> image;

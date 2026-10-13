@@ -210,7 +210,6 @@ static void InstallProject(prepared_project& project, const std::filesystem::pat
     g_world_dirty = true;
     g_materials_dirty = false;
     g_rtHasImage = false;
-    std::vector<std::uint8_t>().swap(g_rtPixels);
     glDeleteTextures(1, &g_rtTexture);
     g_rtTexture = 0;
     g_rtWidth = g_rtHeight = 0;
@@ -463,7 +462,11 @@ static void DrawProjectDialogs(GLFWwindow* window) {
         last_check = now;
         const auto title = (file.empty() ? std::string("Untitled") : file.filename().u8string()) +
                            (dirty ? " *" : "") + " - Dusktracer";
-        glfwSetWindowTitle(window, title.c_str());
+        static std::string shown_title;
+        if (title != shown_title) {
+            glfwSetWindowTitle(window, title.c_str());
+            shown_title = title;
+        }
     }
 }
 

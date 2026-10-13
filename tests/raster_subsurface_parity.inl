@@ -176,9 +176,9 @@ static scene_material skin_material(int shading) {
     m.sss_subsurface_color = vec3(.9, .35, .25);
     m.sss_opacity = .35;
     m.sss_transmission_distance = .6;
-    // Unreal Subsurface Profile: default skin scaled up so diffusion spans
-    // many shadow-map texels on this unit sphere.
-    m.sss_units_per_metre = 100;
+    // Unreal Subsurface Profile: default skin scaled up so red diffusion
+    // (about 0.13) spans many shadow-map texels yet stays within the spheres.
+    m.sss_units_per_metre = 45;
     return m;
 }
 static void sun(const vec3& toward_light, double strength) {
@@ -232,7 +232,7 @@ static void timing() {
 }
 
 static void run() {
-    if (std::getenv("DUSK_SSS_SHOWCASE")) {
+    if (std::getenv("DUSK_SSS_SHOWCASE") || std::getenv("DUSK_SSS_PROJECT")) {
         ::subsurface_showcase_entry::run();
         return;
     }
@@ -258,7 +258,7 @@ static void run() {
     // Unreal default skin at real scale: millimetre diffusion on a metre sphere.
     g_scene.materials[0].sss_units_per_metre = 1;
     compare("profile-real-scale", 512, .9);
-    g_scene.materials[0].sss_units_per_metre = 100;
+    g_scene.materials[0].sss_units_per_metre = 45;
     g_scene.lights.clear();
     point(point3(-2, 1.5, 2), 30);
     compare("profile-point", 512, .9);

@@ -473,12 +473,14 @@ class camera {
         double previous_pdf = 0;
         int previous_samples = 0, previous_sun_samples = 0, null_events = 0;
         bool previous_delta = true, first_intersection = true;
+        double ray_tmin = .001; // past() after a transparent hit
         point3 lens_origin; vec3 lens_direction;
         double lens_pdf=0,lens_jacobian=0,lens_transmission=0;
         const hittable* lens_object=nullptr;
         int lens_stage=0;
         // Light reached by an ambient-only sample was counted by light sampling.
         bool previous_indirect_only = false;
+        colour previous_direct_scale(1,1,1); // see bsdf_sample::direct_scale
         auto hit_weight = [&](double light_pdf, int samples) {
             if (previous_indirect_only) return 0.0;
             if (previous_delta || samples == 0 || light_pdf <= 0) return 1.0;
@@ -488,7 +490,7 @@ class camera {
             hit_record rec;
             bool did_hit;
             if (prehit && first_intersection) { rec = *prehit; did_hit = true; }
-            else did_hit = world.hit(current_ray,interval(.001,infinity),rec);
+            else did_hit = world.hit(current_ray,interval(ray_tmin,infinity),rec);
             first_intersection = false;
             if (!did_hit) {
                 result += throughput*background;
@@ -496,7 +498,7 @@ class camera {
                 if (pdf > 0) {
                     double mis=lens_stage==2 && lens_jacobian>0 ? power_weight(lens_pdf*lens_transmission,
                         std::min(2,previous_sun_samples)*lens_jacobian*pdf) : hit_weight(pdf,previous_sun_samples);
-                    result += throughput*sun_radiance*(pdf*mis);
+                    result += throughput*sun_radiance*previous_direct_scale*(pdf*mis);
                 }
                 break;
             }
@@ -504,8 +506,9 @@ class camera {
             bsdf_sample sample;
             bool scattered = rec.mat->sample_bsdf(current_ray,rec,sample);
             if (scattered && sample.passthrough) {
+                // Continue the same ray just past the transparent hit.
                 if (++null_events > 1024) break;
-                current_ray = sample.scattered; --depth; continue;
+                ray_tmin = past(rec.t); --depth; continue;
             }
             if (depth == 0) {
                 if (out_albedo) *out_albedo = rec.mat->albedo(rec);
@@ -514,7 +517,7 @@ class camera {
             colour emitted = rec.mat->emitted(rec.u,rec.v,rec.p);
             if (emitted.length_squared() > 0) {
                 double pdf = previous_delta || previous_samples == 0 ? 0 : emitter_pdf(previous_point,rec,current_ray.time());
-                result += throughput*emitted*hit_weight(pdf,previous_samples);
+                result += throughput*emitted*previous_direct_scale*hit_weight(pdf,previous_samples);
             }
             if (depth == max_depth || (!scattered && emitted.length_squared() > 0)) break;
 
@@ -522,20 +525,31 @@ class camera {
             int count = std::max(0,direct_light_samples);
             auto direct_lighting = [&](const hit_record& rec, const vec3& view, bool subsurface) {
                 colour lighting;
+                // Subsurface entries are lit through the smooth normal; their
+                // continuation only samples directions leaving the triangle.
                 auto direction_pdf = [&](const vec3& direction) {
-                    return subsurface ? std::max(0.0,dot(rec.geometry_normal(),direction))/pi
+                    return subsurface ? dot(rec.geometry_normal(),direction) > 0 ? std::max(0.0,dot(rec.normal,direction))/pi : 0.0
                         : rec.mat->bsdf_pdf(rec,view,direction);
                 };
                 auto add_light = [&](const vec3& direction, const colour& radiance, double max_distance,
                                      double weight, double surface_mis) {
-                    vec3 origin = rec.p+rec.geometry_normal()*(dot(direction,rec.geometry_normal()) >= 0 ? .001 : -.001);
+                    // Shadow rays leave from the smooth surface (Hanika 2021). Near
+                    // the terminator the smooth surface can face a light that its
+                    // flat triangle faces away from: the ray then starts above the
+                    // smooth surface and ignores crossing its own triangle, as in
+                    // Cycles, instead of starting inside the mesh.
+                    const vec3 g = rec.geometry_normal();
+                    const vec3 lift = dot(rec.smooth_offset,g) > 0 ? rec.smooth_offset : vec3(0,0,0);
+                    const bool above = dot(direction,g) >= 0;
+                    const bool terminator = !above && dot(direction,rec.normal) > 0 && !lift.near_zero();
+                    vec3 origin = above || terminator ? rec.p+lift+.001*g : rec.p-.001*g;
                     ray shadow(origin,direction,current_ray.time());
                     double body = subsurface ? 0 : rec.mat->body_transmission_distance();
-                    double visibility = body > 0 && dot(direction,rec.geometry_normal()) < 0
+                    double visibility = body > 0 && !above && !terminator
                         ? body_transmittance(shadow,max_distance,world,rec,body)
-                        : compute_transmittance(shadow,max_distance,world);
+                        : compute_transmittance(shadow,max_distance,world,terminator ? rec.primitive : nullptr);
                     if (visibility <= 0) return;
-                    double cosine = std::max(0.0,dot(rec.geometry_normal(),direction));
+                    double cosine = std::max(0.0,dot(rec.normal,direction));
                     colour direct = subsurface
                         ? radiance*(cosine*rec.mat->subsurface_directional(cosine)*visibility)
                         : rec.mat->shade_direct(rec,view,direction,radiance,world,visibility);
@@ -594,7 +608,7 @@ class camera {
                                     double light_pdf=path.jacobian/omega,bsdf_pdf=direction_pdf(path.direction)*path.transmission;
                                     colour energy=sun_radiance*entry.mat->transmission_tint(entry)*exit.mat->transmission_tint(exit)*
                                         (path.transmission*visible*power_weight(caustic_samples*light_pdf,bsdf_pdf)/(caustic_samples*path.jacobian));
-                                    double cosine=std::max(0.0,dot(rec.geometry_normal(),path.direction));
+                                    double cosine=std::max(0.0,dot(rec.normal,path.direction));
                                     lighting += subsurface ? energy*(cosine*rec.mat->subsurface_directional(cosine)) :
                                         rec.mat->shade_direct(rec,view,path.direction,energy,world,1);
                                 }
@@ -641,9 +655,10 @@ class camera {
                 throughput = throughput*sample.weight*spatial_weight;
                 rec = entry;
                 result += throughput*direct_lighting(rec,rec.geometry_normal(),true);
-                pbr::frame frame(safe_unit_vector(rec.geometry_normal()));
+                pbr::frame frame(safe_unit_vector(rec.normal,rec.geometry_normal()));
                 vec3 direction = frame.world(sample_cosine_hemisphere(random_double(),random_double()));
-                double cosine = std::max(0.0,dot(rec.geometry_normal(),direction));
+                if (dot(rec.geometry_normal(),direction) <= 0) break; // would start inside the mesh
+                double cosine = std::max(0.0,dot(rec.normal,direction));
                 sample.pdf = cosine/pi;
                 sample.weight = colour(1,1,1)*(pi*rec.mat->subsurface_directional(cosine));
                 sample.delta = false;
@@ -677,9 +692,11 @@ class camera {
             } else {lens_stage=-1; lens_pdf=0;}
             previous_delta = sample.delta; previous_samples = count;
             previous_indirect_only = sample.indirect_only;
+            previous_direct_scale = sample.direct_scale;
             previous_sun_samples = count > 0 ? std::max(1,sun_shadow_samples) : 0;
             throughput = throughput*sample.weight;
             current_ray = sample.scattered;
+            ray_tmin = .001;
             if (!sample.passthrough) {
                 vec3 direction = safe_unit_vector(current_ray.direction());
                 double side = dot(direction,rec.geometry_normal()) >= 0 ? 1 : -1;
@@ -699,6 +716,12 @@ class camera {
         photon_map caustics;
         double     caustics_radius = 0.08; // gather radius
 
+    // Just past a hit along the same ray: a few single-precision steps, the
+    // resolution of Embree's hit distances. A surface right behind a
+    // transparent one (an eyeball under its occlusion shell) is still found;
+    // a fixed .001 step jumped over anything within a millimetre.
+    static double past(double t) { return t + std::max(1e-6, std::abs(t) * 4.7683716e-7); }
+
     // Visibility for light reaching a back-facing direction through the
     // receiver's own body: its surfaces bound a thickness with extinction
     // exp(-thickness/distance), measured to the surface nearest the light.
@@ -713,7 +736,7 @@ class camera {
                 other *= rec.mat ? 1.0 - clamp01(rec.mat->opacity_at(rec)) : 0.0;
                 if (other <= 1e-6) return 0.0;
             }
-            tmin = rec.t + 0.001;
+            tmin = past(rec.t);
         }
         return other*std::exp(-thickness/distance);
     }
@@ -721,13 +744,20 @@ class camera {
     // Compute deterministic transmittance along a ray up to max_t by
     // accumulating per-hit material opacity (alpha). Returns value in
     // [0,1], where 0 = fully blocked, 1 = fully clear.
-    double compute_transmittance(const ray& r, double max_t, const hittable& world) const {
+    // skip: a primitive the ray may cross without being blocked (a shadow
+    // ray starting above the smooth surface over its own triangle).
+    double compute_transmittance(const ray& r, double max_t, const hittable& world,
+                                 const void* skip = nullptr) const {
         double T = 1.0;
         double tmin = 0.001;
         double tmax = max_t;
         hit_record rec;
 
         while (tmin < tmax && world.hit(r, interval(tmin, tmax), rec)) {
+            if (skip && rec.primitive == skip) {
+                tmin = past(rec.t);
+                continue;
+            }
             double opacity = 1.0;
             if (rec.mat) opacity = rec.mat->opacity_at(rec);
 
@@ -741,7 +771,7 @@ class camera {
             if (T <= 1e-6) return 0.0;
 
             // Advance min t to just beyond this hit and continue
-            tmin = rec.t + 0.001;
+            tmin = past(rec.t);
         }
 
         return T;

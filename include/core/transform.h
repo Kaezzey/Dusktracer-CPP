@@ -65,9 +65,14 @@ class transform : public hittable {
         vec3 outward_n = rec.front_face ? rec.normal : -rec.normal;
         vec3 outward_g = rec.front_face ? rec.geometry_normal() : -rec.geometry_normal();
         vec3 t_world = apply(M, rec.tangent), b_world = apply(M, rec.bitangent);
+        // A displacement maps with M; its side of the surface is preserved.
+        const vec3 smooth_offset = apply(M, rec.smooth_offset);
+        const void* primitive = rec.primitive;
         rec.set_face_normal(r_in, safe_unit_vector(apply_transpose(M_inv, outward_g)));
         rec.set_shading_normal(safe_unit_vector(apply_transpose(M_inv, outward_n)));
         rec.set_tangent_frame(t_world, b_world);
+        rec.smooth_offset = smooth_offset;
+        rec.primitive = primitive;
 
         return true;
     }

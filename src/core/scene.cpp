@@ -8,6 +8,7 @@
 #include "../../include/core/hittable_list.h"
 #include "../../include/core/sphere.h"
 #include "../../include/core/materials/material.h"
+#include "../../include/core/materials/hair.h"
 #include "../../include/core/mesh_loader.h"
 #include "../../include/core/BVH.h"
 #include "../../include/core/triangle.h"
@@ -52,7 +53,8 @@ subsurface_lowered lower_subsurface(const scene_material_parameters& m) {
     s.strength = std::clamp(m.sss_strength, 0.0, 1.0);
     if (m.sss_shading == sss_shading_unreal_profile) {
         vec3 albedo = unit(m.sss_surface_albedo);
-        double metres = std::max(0.0, m.sss_mfp_mm)*1e-3*std::max(0.0, m.sss_units_per_metre);
+        double metres = std::max(0.0, m.sss_mfp_distance)*std::max(0.0, m.sss_world_unit_scale)*.01*
+                        std::max(0.0, m.sss_units_per_metre);
         for (int c = 0; c < 3; ++c)
             s.distances[c] = std::max(1e-6, metres*std::max(0.0, m.sss_mfp_color[c])/sss::burley_mfp_scaling(albedo[c]));
         s.tint_scale = unit(m.sss_profile_tint);
@@ -194,16 +196,19 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
     }
 
     case scene_material_model::pbr:
+    case scene_material_model::eye:
     {
+        const bool eye = m.model == scene_material_model::eye;
         // Base albedo
         auto base_tex_loaded = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
         std::shared_ptr<texture> base_tex =
             base_tex_loaded ? base_tex_loaded : make_base_colour(m.base_color);
 
-        // Metallic scalar -> greyscale texture if no texture bound
-        auto metal_tex_loaded = input_texture(1, m.metallic_tex, texture_sample_space::linear_data);
+        // Metallic scalar -> greyscale texture if no texture bound. The
+        // eye's second pin is its cornea Specular instead.
+        auto metal_tex_loaded = eye ? nullptr : input_texture(1, m.metallic_tex, texture_sample_space::linear_data);
         std::shared_ptr<texture> metallic_tex =
-            metal_tex_loaded ? metal_tex_loaded : make_grey(m.metallic);
+            metal_tex_loaded ? metal_tex_loaded : make_grey(eye ? 0 : m.metallic);
 
         // Roughness scalar -> greyscale texture if no texture bound
         auto rough_tex_loaded = input_texture(2, m.roughness_tex, texture_sample_space::linear_data);
@@ -242,6 +247,19 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
             effective_double_sided,
             m.alpha_cutoff
         );
+        mat->alpha_mode = m.alpha_mode;
+        if (eye) {
+            auto graph_input = [&](int slot) -> std::shared_ptr<texture> {
+                return m.graph.nodes.empty() ? nullptr : compile_material_graph(m.graph, slot, graph_loader);
+            };
+            mat->eye = true;
+            mat->iris = {m.eye_iris_u, m.eye_iris_v, m.eye_iris_radius, m.eye_limbus_width, m.eye_iris_depth,
+                         std::max(1.0, m.ior)};
+            mat->eye_specular = m.eye_specular;
+            mat->specular_tex = graph_input(1);
+            mat->iris_mask_tex = graph_input(5);
+            mat->iris_depth_tex = graph_input(6);
+        }
 
         // Propagate subsurface scattering (SSS) settings from editor material
         // Only apply SSS if use_sss is enabled
@@ -281,6 +299,34 @@ std::shared_ptr<material> build_rt_material(const scene& scn,
         std::shared_ptr<texture> base_tex =
             tex ? tex : make_base_colour(m.base_color);
         return std::make_shared<isotropic>(base_tex);
+    }
+
+    case scene_material_model::hair:
+    {
+        // Specular, Tangent, Radial Roughness and Backlit exist only as graph pins.
+        auto graph_input = [&](int slot) -> std::shared_ptr<texture> {
+            return m.graph.nodes.empty() ? nullptr : compile_material_graph(m.graph, slot, graph_loader);
+        };
+        auto mat = std::make_shared<hair_material>();
+        mat->base_tex = input_texture(0, m.albedo_tex, texture_sample_space::srgb_color);
+        mat->base_color = m.base_color;
+        mat->specular_tex = graph_input(1);
+        mat->roughness_tex = input_texture(2, m.roughness_tex, texture_sample_space::linear_data);
+        mat->tangent_tex = graph_input(3);
+        mat->alpha_tex = input_texture(4, m.alpha_tex, texture_sample_space::linear_data);
+        mat->radial_tex = graph_input(5);
+        mat->backlit_tex = graph_input(6);
+        mat->specular = m.hair_specular;
+        mat->roughness = m.roughness;
+        mat->radial_roughness = m.hair_radial_roughness;
+        mat->backlit = m.hair_backlit;
+        mat->ior = m.ior;
+        mat->cuticle_tilt = m.hair_cuticle_tilt;
+        mat->alpha_cutoff = m.alpha_cutoff;
+        mat->alpha_mode = m.alpha_mode;
+        mat->tangent = m.hair_tangent;
+        mat->coloring = m.hair_coloring;
+        return mat;
     }
     }
 

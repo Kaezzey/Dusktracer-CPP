@@ -127,6 +127,8 @@ int main(int argc,char** argv) {
     }
     if (argc >= 3 && std::string(argv[2]) == "--layout") return run_layout_smoke();
     if (argc >= 3 && std::string(argv[2]) == "--raster") return run_raster_checks(argc >= 4 ? argv[3] : nullptr);
+    if (argc >= 4 && std::string(argv[2]) == "--raster-bench")
+        return run_raster_benchmark(argv[3], argc >= 5 ? std::atoi(argv[4]) : 1600, argc >= 6 ? std::atoi(argv[5]) : 900);
     check(glfwInit() != 0,"GLFW init"); glfwWindowHint(GLFW_VISIBLE,GLFW_FALSE);
     auto window = glfwCreateWindow(1440,960,"Graph integration test",nullptr,nullptr);
     check(window != nullptr,"hidden preview window"); glfwMakeContextCurrent(window); glewInit();

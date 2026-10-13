@@ -113,5 +113,72 @@ static void run() {
     render("side-unreal", device);
     subsurface_parity::compare("showcase-side-unreal-direct", 256, 0);
 }
+// Renders a saved project through the viewport and the GPU tracer, using its
+// viewport camera, lights and Sky / Background colour, as the editor does.
+static void render_project(const char* file) {
+    std::string device;
+    for (const auto& candidate : enumerate_render_devices().devices) {
+        if (candidate.compatible) { device = candidate.id; break; }
+    }
+    auto doc = dusk_project::load(file);
+    raster_reset();
+    g_scene = doc.world;
+    g_editor_cam = doc.viewport;
+    g_camera.background = doc.camera_settings.background;
+    g_renderer.exposure = doc.render_settings.exposure;
+    InvalidateAllRasterMaterials();
+    raster_wait_textures();
+    auto pixels = raster_image(720);
+    raster_save("project-raster.png", pixels, 720);
+#ifdef DUSK_ENABLE_VULKAN_RT
+    if (device.empty()) return;
+    camera cam = doc.camera_settings;
+    to_shirley_camera(doc.viewport, cam);
+    cam.image_width = cam.image_height = 720;
+    cam.aspect_ratio = 1;
+    cam.use_sun = false;
+    cam.point_lights.clear();
+    for (const auto& light : doc.world.lights) {
+        if (light.type == scene_light_type::directional) {
+            cam.use_sun = true;
+            cam.sun_dir = -light.direction;
+            cam.sun_radiance = light.radiance;
+            cam.sun_angular_radius = light.angular_radius_deg;
+        }
+    }
+    renderer settings = doc.render_settings;
+    settings.use_denoiser = false;
+    settings.adaptive_sampling = false;
+    auto trace = [&](const char* name) {
+        auto image = dusk_gpu::render(dusk_gpu::compile_scene(g_scene), cam, settings, device, nullptr, nullptr, {});
+        stbi_flip_vertically_on_write(0);
+        check(stbi_write_png(name, image.width, image.height, 3, image.pixels.data(), image.width * 3) != 0,
+              "save traced project");
+    };
+    trace("project-traced.png");
+    // Optional breakdown: the same render without normal maps, then without SSS.
+    if (std::getenv("DUSK_SSS_BREAKDOWN")) {
+        auto saved = g_scene.materials;
+        for (auto& m : g_scene.materials) {
+            m.normal_tex = -1;
+            m.graph.links.erase(std::remove_if(m.graph.links.begin(), m.graph.links.end(),
+                [&](const graph_link& l) { return l.to == m.graph.output_id() && l.input == 3; }), m.graph.links.end());
+        }
+        trace("project-traced-no-normal.png");
+        g_scene.materials = saved;
+        for (auto& m : g_scene.materials) m.use_sss = false;
+        trace("project-traced-no-sss.png");
+        g_scene.materials = saved;
+        for (auto& m : g_scene.materials) m.sss_mfp_color = vec3(1, .5, .3);
+        trace("project-traced-softer-colour.png");
+        g_scene.materials = saved;
+    }
+#endif
+}
 } // namespace subsurface_showcase
-namespace subsurface_showcase_entry { void run() { subsurface_showcase::run(); } }
+namespace subsurface_showcase_entry {
+void run() {
+    if (const char* project = std::getenv("DUSK_SSS_PROJECT")) subsurface_showcase::render_project(project);
+    else subsurface_showcase::run();
+}
+}

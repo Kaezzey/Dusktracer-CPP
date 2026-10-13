@@ -307,3 +307,25 @@ static void check_unreal_subsurface_transport() {
     mat->sss_transmission = false;
     near(trace_mean(cam,world,center,1,4000),0,1e-12,"without the Unreal model, a backlit opaque sphere stays dark");
 }
+
+// A normal map can tilt the shading normal away from a grazing viewer. Such
+// surfaces must still scatter and receive light instead of rendering black.
+static void check_normal_map_silhouette() {
+    // Tangent-space (0.9, 0) tilts the shading normal about 74 degrees toward +x.
+    auto tilted = std::make_shared<solid_colour>(colour(.95,.5,.6));
+    auto mat = std::make_shared<pbr_material>(colour(.8,.6,.5),0,.5,tilted);
+    mat->sss_model = SSS_DIPOLE_BURLEY; mat->sss_strength = 1; mat->sss_radius = .01;
+    hittable_list empty; auto hit = surface();
+    vec3 v = unit_vector(vec3(-1,0,.4));
+    ray view(point3(0,0,0)+v,-v,.5);
+    int scattered = 0, subsurface = 0;
+    for (int i = 0; i < 1000; ++i) {
+        bsdf_sample sample;
+        if (mat->sample_surface(view,hit,sequence(i,2),sequence(i,3),sequence(i,5),sample)) {
+            ++scattered; subsurface += sample.subsurface;
+        }
+    }
+    require(scattered > 900 && subsurface > 0,"normal-mapped surfaces facing away from the viewer still scatter");
+    require(mat->shade_direct(hit,v,unit_vector(vec3(-.3,0,1)),colour(1,1,1),empty).x() > 0,
+            "normal-mapped surfaces facing away from the viewer still receive light");
+}

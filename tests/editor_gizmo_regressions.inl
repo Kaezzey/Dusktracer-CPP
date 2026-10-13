@@ -1,3 +1,4 @@
+#include "editor_navigation_regressions.inl"
 namespace gizmo_checks {
 using namespace transform_gizmo;
 static editor_camera_state camera_fixture() {
@@ -134,6 +135,7 @@ static int run() {
             check(glGetError()==GL_NO_ERROR,"gizmo overlay renders without GL errors");
         }
     }
+    navigation_checks::run();
     ImGui_ImplOpenGL3_Shutdown(); ImGui::DestroyContext(); StopRasterPreview(); glfwDestroyWindow(window); glfwTerminate();
     std::printf("%d transform gizmo checks passed\n",checks); return 0;
 }

@@ -111,6 +111,29 @@ static void check_raster_graph() {
     InvalidateRasterMaterial(0);
     auto cutout = raster_image();
     check(cutout[(128 * 256 + 128) * 4] < 20, "opacity graph cuts out raster geometry");
+    // Vectors from texture channels: Combine RGB (R, G, A), Derive Normal Z (A, G).
+    for (auto kind : {graph_kind::combine, graph_kind::derive_normal_z}) {
+        graph = {};
+        output = graph.add(graph_kind::output, 0, 0);
+        int texture = graph.add(graph_kind::texture_sample, 0, 0), op = graph.add(kind, 0, 0);
+        graph.find(texture)->texture_index = 0;
+        graph.find(texture)->space = graph_space::linear;
+        const int channels[] = {kind == graph_kind::combine ? 1 : 4, 2, 4};
+        for (int p = 0; p < graph_inputs(kind); ++p) graph.connect({texture, channels[p], op, p});
+        graph.connect({op, 0, output, 0});
+        int opaque = graph.add(graph_kind::scalar, 0, 0);
+        graph.find(opaque)->value = vec3(1, 0, 0);
+        graph.connect({opaque, 0, output, 4});
+        InvalidateRasterMaterial(0);
+        auto pixels = raster_image();
+        auto expected = compile_material_graph(graph, 0, [](const graph_node&, bool srgb) {
+            return std::make_shared<image_texture>("material.png", srgb ? texture_sample_space::srgb_color
+                                                                        : texture_sample_space::linear_data);
+        })->value(.5, .5, point3());
+        for (int c = 0; c < 3; ++c)
+            check(std::abs(int(pixels[(128 * 256 + 128) * 4 + c]) - int(std::lround(std::clamp(expected[c], 0., 1.) * 255))) <= 1,
+                  "raster Combine RGB and Derive Normal Z match CPU");
+    }
 }
 // Inspector texture slots without a node graph: scalar maps must reach the
 // viewport and the Vulkan compiler, as they reach the CPU material.
@@ -346,7 +369,216 @@ static void raster_production_scene(const char* root) {
     std::printf("RASTER warm 1024x1024: mean %.3f ms, p95 %.3f ms (30 completed GPU frames)\n",
                 total / times.size(), times[28]);
 }
+// Hair cards in the viewport: anisotropic strand highlights that follow the
+// Tangent pin, light through the card from behind, and graph cutouts.
+static void check_raster_hair() {
+    raster_reset();
+    scene_material strands;
+    strands.model = scene_material_model::hair;
+    strands.base_color = vec3(.8, .55, .3);
+    strands.roughness = .3;
+    g_scene.materials.push_back(strands);
+    scene_object card;
+    card.type = scene_object_type::cube;
+    card.material_index = 0;
+    card.scale = vec3(2.5, 2.5, .02);
+    g_scene.objects.push_back(card);
+    scene_light sun;
+    sun.type = scene_light_type::directional;
+    sun.direction = unit_vector(vec3(.2, -.5, -1));
+    sun.radiance = vec3(4, 4, 4);
+    g_scene.lights.push_back(sun);
+    auto pixel = [](const std::vector<unsigned char>& image, int x, int y) {
+        size_t p = size_t(y * 256 + x) * 4;
+        return vec3(image[p], image[p + 1], image[p + 2]);
+    };
+    auto along_v = raster_image();
+    vec3 centre = pixel(along_v, 128, 128);
+    check(centre.x() > 20 && centre.x() >= centre.z() && centre.length_squared() < 3 * 255.0 * 255.0,
+          "hair renders lit, warm and finite in the viewport");
+    g_scene.materials[0].hair_tangent = vec3(1, 0, 0);
+    InvalidateRasterMaterial(0);
+    auto along_u = raster_image();
+    check(along_u != along_v, "the hair highlight follows the strand tangent");
+    raster_save("hair-raster.png", along_v);
+    // A light behind the card, shining toward the camera. The test card is a
+    // thin box whose back face would shadow its front, so isolate shading.
+    raster_preview::shadows_enabled = false;
+    g_scene.lights[0].direction = unit_vector(vec3(0, -.2, 1));
+    g_scene.materials[0].hair_tangent = vec3(0, 1, 0);
+    g_scene.materials[0].hair_backlit = 0;
+    InvalidateRasterMaterial(0);
+    auto unlit_back = raster_image();
+    g_scene.materials[0].hair_backlit = 1;
+    InvalidateRasterMaterial(0);
+    auto backlit = raster_image();
+    check(pixel(backlit, 128, 128).x() > pixel(unlit_back, 128, 128).x(), "Backlit transmits light through hair cards");
+    raster_preview::shadows_enabled = true;
+    auto& graph = g_scene.materials[0].graph;
+    int output = graph.add(graph_kind::output, 0, 0), opacity = graph.add(graph_kind::scalar, 0, 0);
+    graph.find(opacity)->value = vec3(0, 0, 0);
+    graph.connect({opacity, 0, output, 4});
+    InvalidateRasterMaterial(0);
+    check(pixel(raster_image(), 128, 128).x() < 20, "hair opacity pin cuts out cards");
+}
+static void check_raster_alpha_and_eye() {
+    // A black card with 40% opacity in front of a white emitter.
+    raster_reset();
+    scene_material card, glow;
+    card.model = scene_material_model::pbr;
+    card.base_color = vec3(0, 0, 0);
+    card.dielectric_F0 = vec3(0, 0, 0);
+    glow.model = scene_material_model::diffuse_light;
+    glow.emission = vec3(1, 1, 1);
+    g_scene.materials = {card, glow};
+    scene_object front, back;
+    front.type = back.type = scene_object_type::cube;
+    front.material_index = 0;
+    front.scale = vec3(2, 2, .02);
+    back.material_index = 1;
+    back.center = point3(0, 0, -1);
+    back.scale = vec3(6, 6, .02);
+    g_scene.objects = {front, back};
+    auto& graph = g_scene.materials[0].graph;
+    int output = graph.add(graph_kind::output, 0, 0), opacity = graph.add(graph_kind::scalar, 0, 0);
+    graph.find(opacity)->value = vec3(.4, 0, 0);
+    graph.connect({opacity, 0, output, 4});
+    auto centre = [](const std::vector<unsigned char>& image) { return int(image[size_t(128 * 256 + 128) * 4]); };
+    auto shade = [&](int mode, double cutoff) {
+        g_scene.materials[0].alpha_mode = mode;
+        g_scene.materials[0].alpha_cutoff = cutoff;
+        InvalidateRasterMaterial(0);
+        return centre(raster_image());
+    };
+    const int blended = shade(alpha_blend, .5), clipped = shade(alpha_clip, .5), solid = shade(alpha_clip, .3);
+    const int opaque = shade(alpha_opaque, .5);
+    std::printf("Raster alpha: blend %d, clipped away %d, clipped solid %d, opaque %d\n", blended, clipped, solid,
+                opaque);
+    check(clipped > 150 && solid < 30 && opaque == solid, "Clip and Opaque are all or nothing in the viewport");
+    // The card is a thin box: light behind crosses two faces, each showing
+    // 1 - alpha of what lies behind it, as in the tracers.
+    check(std::abs(blended - (.36 * clipped + .64 * solid)) < 8, "Blend shows 1 - alpha of what is behind");
+
+    // The eye: a UV-coloured sphere refracts its iris and lights it by Unreal's iris term.
+    raster_reset();
+    scene_material eye;
+    eye.model = scene_material_model::eye;
+    eye.eye_iris_u = .25;
+    eye.eye_iris_radius = .12;
+    eye.roughness = .2;
+    eye.ior = 1.336;
+    initialize_material_graph(eye, {});
+    int uv = eye.graph.add(graph_kind::texcoord, 0, 0), rgb = eye.graph.add(graph_kind::combine, 0, 0);
+    eye.graph.connect({uv, 1, rgb, 0});
+    eye.graph.connect({uv, 2, rgb, 1});
+    eye.graph.connect({rgb, 0, eye.graph.output_id(), 0});
+    g_scene.materials.push_back(eye);
+    scene_object ball;
+    ball.material_index = 0;
+    ball.radius = 1;
+    g_scene.objects.push_back(ball);
+    scene_light sun;
+    sun.type = scene_light_type::directional;
+    sun.direction = unit_vector(vec3(-.5, -.3, -1));
+    sun.radiance = vec3(3, 3, 3);
+    g_scene.lights.push_back(sun);
+    g_editor_cam.set_from_lookat(point3(1.6, .4, 3.6), point3());
+    auto shallow = raster_image();
+    g_scene.materials[0].eye_iris_depth = 1.2;
+    InvalidateRasterMaterial(0);
+    auto deep = raster_image();
+    check(deep != shallow, "the viewport refracts the iris by its depth");
+    auto& pins = g_scene.materials[0].graph;
+    int zero = pins.add(graph_kind::scalar, 0, 0);
+    pins.find(zero)->value = vec3(0, 0, 0);
+    pins.connect({zero, 0, pins.output_id(), 5});
+    InvalidateRasterMaterial(0);
+    check(raster_image() != deep, "the viewport honours the Iris Mask pin");
+    raster_save("eye-raster.png", deep);
+}
 #include "raster_subsurface_parity.inl"
+// Times the viewport on a saved project at a typical editor size:
+// DuskGraphIntegrationTests <folder> --raster-bench <Scene.dusk> [width] [height]
+static int run_raster_benchmark(const char* scene, int width, int height) {
+    check(glfwInit() != 0, "raster GLFW init");
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    auto* window = glfwCreateWindow(640, 640, "Raster benchmark", nullptr, nullptr);
+    check(window != nullptr, "hidden raster context");
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0);
+    glewInit();
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    BuildRasterShader();
+    BuildUnitSphereMesh();
+    BuildUnitCubeMesh();
+    check(OpenProjectFile(scene), "open the benchmark project");
+    auto timed = [&] {
+        auto start = std::chrono::steady_clock::now();
+        RenderRasterToTexture(width, height);
+        glFinish();
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    const double cold = timed();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    bool ready = false;
+    while (!ready && std::chrono::steady_clock::now() < deadline) {
+        timed();
+        ready = true;
+        for (const auto& entry : raster_preview::textures) ready &= entry.second.loaded;
+    }
+    std::vector<double> times;
+    const auto shadow_before = raster_preview::shadow_updates;
+    for (int i = 0; i < 120; ++i) times.push_back(timed());
+    std::printf("  shadow map rebuilds in 120 still frames: %llu\n",
+                (unsigned long long)(raster_preview::shadow_updates - shadow_before));
+    // Orbit the camera so shadow maps stay valid but the view changes.
+    const auto home = g_editor_cam;
+    std::vector<double> moving;
+    for (int i = 0; i < 120; ++i) {
+        g_editor_cam.look(.01, 0);
+        moving.push_back(timed());
+    }
+    auto report = [](const char* label, std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        double total = 0;
+        for (double t : v) total += t;
+        std::printf("%s: mean %.2f ms, median %.2f ms, p95 %.2f ms\n", label, total / v.size(), v[v.size() / 2],
+                    v[v.size() * 95 / 100]);
+    };
+    std::printf("Raster benchmark %dx%d, %zu objects, %zu materials, first frame %.1f ms\n", width, height,
+                g_scene.objects.size(), g_scene.materials.size(), cold);
+    report("  still", times);
+    report("  orbiting", moving);
+    // Cost breakdown: switch one feature off at a time, from the saved view.
+    g_editor_cam = home;
+    auto variant = [&](const char* label, auto&& change) {
+        const scene saved = g_scene;
+        const int saved_debug = raster_preview::debug_view;
+        const bool saved_shadows = raster_preview::shadows_enabled;
+        change();
+        InvalidateAllRasterMaterials();
+        raster_preview::shadow_key = 0;
+        timed();
+        std::vector<double> v;
+        for (int i = 0; i < 60; ++i) v.push_back(timed());
+        report(label, v);
+        g_scene = saved;
+        raster_preview::debug_view = saved_debug;
+        raster_preview::shadows_enabled = saved_shadows;
+        InvalidateAllRasterMaterials();
+        raster_preview::shadow_key = 0;
+    };
+    variant("  unchanged", [] {});
+    variant("  base colour only", [] { raster_preview::debug_view = 1; });
+    variant("  no shadow maps", [] { raster_preview::shadows_enabled = false; });
+    variant("  alpha Clip everywhere", [] { for (auto& m : g_scene.materials) m.alpha_mode = alpha_clip; });
+    variant("  no subsurface", [] { for (auto& m : g_scene.materials) m.use_sss = false; });
+    StopRasterPreview();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
 static int run_raster_checks(const char* project) {
     check(glfwInit() != 0, "raster GLFW init");
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
@@ -368,6 +600,8 @@ static int run_raster_checks(const char* project) {
     check_raster_legacy_scalar_textures();
     check_raster_mesh_slots();
     check_raster_shadows();
+    check_raster_hair();
+    check_raster_alpha_and_eye();
     subsurface_parity::run();
     if (project) {
         raster_production_scene(project);
