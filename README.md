@@ -14,10 +14,11 @@ Dusktracer is a compact hybrid renderer built off Peter Shirley's teachings, fea
 ---
 
 ## Active Editor
-<img width="2560" height="1398" alt="image" src="https://github.com/user-attachments/assets/b87b3cf7-e91c-4a48-943e-139c0af728b7" />
-<img width="2560" height="1440" alt="CornellBoxHero" src="https://github.com/user-attachments/assets/1d30c475-d0f5-4bd1-8490-e4351e90b866" />
-<img width="2559" height="1402" alt="Editor" src="https://github.com/user-attachments/assets/9c08ebba-d8ae-4c32-bd47-36482468dcb3" />
 <img width="1920" height="1080" alt="CloudStrife" src="https://github.com/user-attachments/assets/1988fb52-275e-4238-be09-8364d7c86e5a" />
+<img width="2560" height="1440" alt="CornellBoxHero" src="https://github.com/user-attachments/assets/1d30c475-d0f5-4bd1-8490-e4351e90b866" />
+<img width="2560" height="1398" alt="image" src="https://github.com/user-attachments/assets/b87b3cf7-e91c-4a48-943e-139c0af728b7" />
+<img width="2559" height="1402" alt="Editor" src="https://github.com/user-attachments/assets/9c08ebba-d8ae-4c32-bd47-36482468dcb3" />
+
 
 ---
 
